@@ -1,0 +1,21 @@
+{application, cbroker, [
+    {description, "FIXME"},
+    {vsn, git},
+    {registered, []},
+    {mod, {cbroker_app, []}},
+    {applications, [
+        % stdlib deps
+        kernel,
+        stdlib
+        % external deps
+    ]},
+    {modules, []},
+
+    {env, []},
+
+    {licenses, ["MIT"]},
+    {links, [
+        {"GitHub", "https://github.com/g-andrade/cbroker"},
+        {"GitLab", "https://gitlab.com/g-andrade/cbroker"}
+    ]}
+]}.

@@ -1,0 +1,32 @@
+.rebar3
+_build
+_*
+ebin
+deps
+erl_crash.dump
+log
+logs
+rebar3.crashdump
+.erlang.cookie
+*.beam
+*.plt
+/doc/
+/tmp/
+
+# c
+*.o
+/priv/
+# generated from CFLAGS by c_src/Makefile; holds machine-specific include paths
+/c_src/compile_flags.txt
+
+# editors
+*.swp
+*.swo
+.idea
+*.iml
+
+# asdf
+.tool-versions
+
+# claude code
+/.claude/settings.local.json
