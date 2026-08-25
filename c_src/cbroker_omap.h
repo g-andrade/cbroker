@@ -79,4 +79,6 @@ bool cbroker_omap_next(const cbroker_omap_t* map,
                        uint64_t* key_out,
                        void** value_out);
 
+void** cbroker_omap_values(const cbroker_omap_t* map);
+
 #endif /* CBROKER_OMAP_H */

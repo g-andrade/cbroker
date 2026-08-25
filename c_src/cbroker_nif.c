@@ -13,10 +13,11 @@
 #define ATOM_LIST \
     X(_await,                "await") \
     X(_badarg,               "badarg") \
+    X(_batch_consumed,       "batch_consumed") \
+    X(_batch_full,           "batch_full")  \
     X(_cancelled,            "cancelled") \
     X(_delayed_match,        "delayed_match") \
     X(_empty,                "empty")  \
-    X(_full,                 "full")  \
     X(_instant_match_first,  "instant_match_first") \
     X(_instant_match_second, "instant_match_second") \
     X(_left,                 "left")  \
@@ -106,6 +107,13 @@ typedef struct {
     cell_t cells[];
 } batch_t;
  
+//
+
+typedef struct {
+    batch_t* batch;
+    bool found_locally;
+} batch_handle_t;
+
 //
 
 typedef struct {
@@ -407,6 +415,33 @@ static ERL_NIF_TERM batch_offset_ask(ask_ctx_t* ctx, batch_t* batch, offset_t of
 
 ////
 
+static bool batch_lookup(broker_t* broker, local_state_t* local_state, batch_id_t batch_id, batch_handle_t* out_handle) {
+    batch_t* batch = NULL;
+
+    if (cbroker_omap_lookup(local_state->batches, batch_id, (void**) &batch)) {
+        out_handle->batch = batch;
+        out_handle->found_locally = true;
+        return true;
+    } 
+    else {
+        global_state_t* global_state = &broker->global_state;
+        enif_mutex_lock(broker->global_lock);
+        if (cbroker_omap_lookup(global_state->batches, batch_id, (void**) &batch)) {
+            atomic_fetch_add_explicit(&batch->ref_count, 1, memory_order_relaxed);
+            enif_mutex_unlock(broker->global_lock);
+            out_handle->batch = batch;
+            out_handle->found_locally = false;
+            return true;
+        }
+        else {
+            enif_mutex_unlock(broker->global_lock);
+            return false;
+        }
+    }
+}
+
+////
+
 static ERL_NIF_TERM batch_ask(ask_ctx_t* ctx, batch_t* batch, ask_out_t* out) {
     offset_t offset = 0;
 
@@ -417,7 +452,10 @@ static ERL_NIF_TERM batch_ask(ask_ctx_t* ctx, batch_t* batch, ask_out_t* out) {
     );
 
     if (offset >= batch->nr_of_cells) {
-        return Atoms._full;
+        if (atomic_load(&batch->consumed_count) >= batch->nr_of_cells) {
+            return Atoms._batch_consumed;
+        }
+        return Atoms._batch_full;
     }
     else {
         ERL_NIF_TERM match_res = batch_offset_ask(ctx, batch, offset, out);
@@ -451,9 +489,12 @@ static batch_t* get_next_batch(ask_ctx_t* ctx, const batch_id_t prev_batch_id) {
                 cbroker_omap_insert(global_state->batches, next_batch_id, next_batch)
                 == CBROKER_OMAP_OK
             );
+            atomic_fetch_add_explicit(&next_batch->ref_count, 2, memory_order_relaxed);
+        }
+        else {
+            atomic_fetch_add_explicit(&next_batch->ref_count, 1, memory_order_relaxed);
         }
 
-        atomic_fetch_add_explicit(&next_batch->ref_count, 1, memory_order_relaxed);
         enif_mutex_unlock(broker->global_lock);
 
         assert(
@@ -469,6 +510,41 @@ static batch_t* get_next_batch(ask_ctx_t* ctx, const batch_id_t prev_batch_id) {
     }
 
     return next_batch;
+}
+
+///////////////////////////
+
+static void batch_lower_ref_count(broker_t* broker, local_state_t* local_state, batch_handle_t* handle) {
+    batch_t* batch = handle->batch;
+    assert(batch != NULL);
+
+    batch_id_t batch_id = batch->id;
+    size_t ref_count = atomic_fetch_sub_explicit(&batch->ref_count, 1, memory_order_relaxed) - 1;
+    assert(ref_count >= 1);
+
+    if (ref_count == 1) {
+        if (handle->found_locally) {
+            cbroker_omap_delete_and_next(local_state->batches, batch_id, NULL, NULL, NULL);
+        }
+
+        global_state_t* global_state = &broker->global_state;
+        enif_mutex_lock(broker->global_lock);
+
+        if (cbroker_omap_lookup(global_state->batches, batch_id, (void**) &batch)) {
+            ref_count = atomic_load(&batch->ref_count);
+            assert(ref_count >= 1);
+
+            if (ref_count == 1) {
+                cbroker_omap_delete_and_next(global_state->batches, batch_id, NULL, NULL, NULL);
+                LOG("CONSUME: batch %u deleted", batch_id);
+                enif_free(batch);
+            }
+        }
+
+        enif_mutex_unlock(broker->global_lock);
+    } 
+
+    handle->batch = NULL;
 }
 
 ////
@@ -490,11 +566,21 @@ static ERL_NIF_TERM ask(ask_ctx_t* ctx, ask_out_t* out) {
         if (batch != NULL) {
             ERL_NIF_TERM match_res = batch_ask(ctx, batch, out);
 
-            if (match_res == Atoms._full) {
+            if (match_res == Atoms._batch_full) {
                 batch = NULL;
-            } else if (match_res == Atoms._cancelled) {
+            } 
+            else if (match_res == Atoms._batch_consumed) {
+                batch_handle_t handle;
+                memset(&handle, 0, sizeof(batch_handle_t));
+                handle.batch = batch;
+                handle.found_locally = true;
+                batch_lower_ref_count(ctx->broker, ctx->local_state, &handle);
+                batch = NULL;
+            }
+            else if (match_res == Atoms._cancelled) {
                 continue;
-            } else {
+            } 
+            else {
                 out->batch = batch;
                 return match_res;
             }
@@ -506,50 +592,26 @@ static ERL_NIF_TERM ask(ask_ctx_t* ctx, ask_out_t* out) {
     return Atoms._retry;
 }
 
-///////////////////////////
 
-static void lower_refcount_and_remove_from_global_if_needed(broker_t* broker, batch_t* batch) {
-    batch_id_t batch_id = batch->id;
-    size_t ref_count = atomic_fetch_sub_explicit(&batch->ref_count, 1, memory_order_relaxed) - 1;
-    assert(ref_count >= 1);
-
-    if (ref_count == 1) {
-        global_state_t* global_state = &broker->global_state;
-        enif_mutex_lock(broker->global_lock);
-
-        if (cbroker_omap_lookup(global_state->batches, batch_id, (void**) &batch)) {
-            ref_count = atomic_load(&batch->ref_count);
-            assert(ref_count >= 1);
-
-            if (ref_count == 1) {
-                cbroker_omap_delete_and_next(global_state->batches, batch_id, NULL, NULL, NULL);
-                LOG("CONSUME: batch %u deleted", batch_id);
-                enif_free(batch);
-            }
-        }
-
-        enif_mutex_unlock(broker->global_lock);
-    } 
-}
-
-
-static bool consume_batch_slot(broker_t* broker, local_state_t* local_state, batch_t* batch, bool present_in_local) {
+static void consume_batch_slot(broker_t* broker, local_state_t* local_state, batch_handle_t* handle) {
+    batch_t* batch = handle->batch;
     size_t consumed_count = 1 + atomic_fetch_add_explicit(&batch->consumed_count, 1, memory_order_relaxed);
 
     if (consumed_count < batch->nr_of_cells) {
-        return false;
-    }
-    else {
+        return;
+    } else {
         assert(consumed_count == batch->nr_of_cells);
-
-        if (present_in_local) {
-            assert(cbroker_omap_delete_and_next(local_state->batches, batch->id, NULL, NULL, NULL));
-        }
-
-        lower_refcount_and_remove_from_global_if_needed(broker, batch);
-
-        return true;
+        batch_lower_ref_count(broker, local_state, handle);
     }
+}
+
+static void consume_local_batch_slot(broker_t* broker, local_state_t* local_state, batch_t* batch) {
+    batch_handle_t handle;
+    memset(&handle, 0, sizeof(batch_handle_t));
+
+    handle.batch = batch;
+    handle.found_locally = true;
+    consume_batch_slot(broker, local_state, &handle);
 }
 
 /*********************************************************************/
@@ -573,8 +635,8 @@ niff_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
 
     broker->nr_of_schedulers = nr_of_schedulers;
 
-    //broker->nr_of_cells_per_batch = 4 * nr_of_schedulers;
-    broker->nr_of_cells_per_batch = 1; // FIXME
+    broker->nr_of_cells_per_batch = 4 * nr_of_schedulers;
+    //broker->nr_of_cells_per_batch = 1; // FIXME
 
     broker->global_lock = enif_mutex_create("cbroker.mutex");
 
@@ -663,7 +725,7 @@ niff_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
         batch_id_t batch_id = success.batch->id;
 
         notify_other_of_match(&ctx, &success);
-        consume_batch_slot(ctx.broker, ctx.local_state, success.batch, true);
+        consume_local_batch_slot(ctx.broker, ctx.local_state, success.batch);
 
         ERL_NIF_TERM ticket = make_ticket(&ctx, batch_id, success.offset);
         return make_await(env, ticket);
@@ -686,7 +748,7 @@ niff_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
         notify_other_of_match(&ctx, &success);
 
         LOG("dmatch: about to consume slot %s", "");
-        consume_batch_slot(ctx.broker, ctx.local_state, success.batch, true);
+        consume_local_batch_slot(ctx.broker, ctx.local_state, success.batch);
 
         //
         LOG("dmatch: about to create ticket %s", "");
@@ -749,56 +811,95 @@ niff_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
 
     //
 
-    batch_t* batch = NULL;
-    bool present_in_local = false;
-    bool was_consumed = false;
+    batch_handle_t handle;
+    memset(&handle, 0, sizeof(batch_handle_t));
 
-    LOG("cancel: looking up batch %u in local state", batch_id);
-    present_in_local = cbroker_omap_lookup(local_state->batches, batch_id, (void**) &batch);
+    if (! batch_lookup(broker, local_state, batch_id, &handle)) {
+        return Atoms._too_late;
+    }
+    
+    batch_t* batch = handle.batch;
 
-    if (! present_in_local) {
-        LOG("cancel: looking up batch %u in global state", batch_id);
-        global_state_t* global_state = &broker->global_state;
-        enif_mutex_lock(broker->global_lock);
-        if (cbroker_omap_lookup(global_state->batches, batch_id, (void**) &batch)) {
-            atomic_fetch_add_explicit(&batch->ref_count, 1, memory_order_relaxed);
-        }
-        enif_mutex_unlock(broker->global_lock);
+    LOG("cancel: batch %u found, cell at offset %u", batch_id, offset);
+    cell_t* cell = &batch->cells[offset];
+
+    ERL_NIF_TERM status = self_term;
+    ERL_NIF_TERM cancel_res;
+
+    if (atomic_compare_exchange_strong(&cell->status, &status, Atoms._cancelled)) {
+        match_t* match = atomic_exchange(&cell->match, NULL);
+        assert(match != NULL);
+        match_cancel_and_free(env, match);
+
+        consume_batch_slot(broker, local_state, &handle);
+        cancel_res = Atoms._cancelled;
+    } 
+    else if (status == Atoms._cancelled) {
+        cancel_res = Atoms._cancelled;
+    } 
+    else {
+        cancel_res = Atoms._too_late;
     }
 
-    if (batch != NULL) {
-        LOG("cancel: batch %u found, cell at offset %u", batch_id, offset);
-        cell_t* cell = &batch->cells[offset];
+    //
 
-        ERL_NIF_TERM status = self_term;
-        ERL_NIF_TERM cancel_res;
+    if (!handle.found_locally && handle.batch != NULL) {
+        batch_lower_ref_count(broker, local_state, &handle);
+    }
+    return cancel_res;
+}
 
-        if (atomic_compare_exchange_strong(&cell->status, &status, Atoms._cancelled)) {
-            match_t* match = atomic_exchange(&cell->match, NULL);
-            assert(match != NULL);
-            match_cancel_and_free(env, match);
+//
 
-            was_consumed = consume_batch_slot(broker, local_state, batch, present_in_local);
-            cancel_res = Atoms._cancelled;
-        } 
-        else if (status == Atoms._cancelled) {
-            cancel_res = Atoms._cancelled;
-        } 
-        else {
-            cancel_res = Atoms._too_late;
-        }
+static ERL_NIF_TERM
+niff_to_list(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    broker_t* broker = NULL;
 
-        if (!was_consumed && !present_in_local) {
-            lower_refcount_and_remove_from_global_if_needed(broker, batch);
-        }
-
-        return cancel_res;
+    if (! get_broker(env, argv[0], &broker)) {
+        return make_badarg(env, argv[0]);
     }
 
-    return Atoms._too_late;
+    global_state_t* global_state = &broker->global_state;
+    enif_mutex_lock(broker->global_lock);
 
+    size_t nr_of_batches = cbroker_omap_size(global_state->batches);
+    ERL_NIF_TERM batch_terms[nr_of_batches];
+
+    void** batches = cbroker_omap_values(global_state->batches);
+    ERL_NIF_TERM empty_atom = enif_make_atom(env, "");
+    ERL_NIF_TERM set_atom = enif_make_atom(env, "!!");
+    ERL_NIF_TERM id_atom = enif_make_atom(env, "batch_id");
+    ERL_NIF_TERM ref_count_atom = enif_make_atom(env, "ref_count");
+    ERL_NIF_TERM consumed_atom = enif_make_atom(env, "consumed_count");
+    ERL_NIF_TERM cells_atom = enif_make_atom(env, "cells");
+
+    for (size_t i = 0; i < nr_of_batches; i++) {
+        batch_terms[i] = Atoms._todo;
+        batch_t* batch = (batch_t*) batches[i];
+        ERL_NIF_TERM cell_terms[batch->nr_of_cells];
+
+        for (size_t j = 0; j < batch->nr_of_cells; j++) {
+            cell_t* cell = &batch->cells[j];
+
+            ERL_NIF_TERM status_term = atomic_load(&cell->status);
+            ERL_NIF_TERM match_term = (atomic_load(&cell->match) == NULL ? empty_atom : set_atom);
+            cell_terms[j] = enif_make_tuple2(env, status_term, match_term);
+        }
+
+        ERL_NIF_TERM batch_kvlist[5];
         
+        batch_kvlist[0] = enif_make_tuple2(env, id_atom, enif_make_uint64(env, batch->id));
+        batch_kvlist[1] = enif_make_tuple2(env, ref_count_atom, enif_make_uint64(env, atomic_load(&batch->ref_count)));
+        batch_kvlist[2] = enif_make_tuple2(env, consumed_atom, enif_make_uint64(env, atomic_load(&batch->consumed_count)));
+        batch_kvlist[3] = enif_make_tuple2(env, cells_atom, enif_make_list_from_array(env, cell_terms, batch->nr_of_cells));
+        batch_kvlist[4] = enif_make_atom(env, "------------------------");
 
+        batch_terms[i] = enif_make_list_from_array(env, batch_kvlist, 5);
+    }
+    
+    enif_mutex_unlock(broker->global_lock);
+
+    return enif_make_list_from_array(env, batch_terms, nr_of_batches);
 }
 
 //
@@ -807,7 +908,8 @@ static ErlNifFunc nif_funcs[] = {
     {"new", 0, niff_new},
     {"ask", 3, niff_ask},
     {"ask", 4, niff_ask},
-    {"cancel", 2, niff_cancel}
+    {"cancel", 2, niff_cancel},
+    {"to_list", 1, niff_to_list}
 };
 
 /*********************************************************************/
@@ -859,27 +961,22 @@ static void cmonitor_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlN
     LOG("cdown: thread id=%u", thread_id);
     local_state_t* local_state = &broker->local_states[thread_id];
 
-    batch_t* batch = NULL;
-    bool present_in_local = false;
+    //
 
-    LOG("cdown: looking up batch %u", batch_id);
-    if (cbroker_omap_lookup(local_state->batches, batch_id, (void**) &batch)) {
-        present_in_local = true;
-    } else {
-        LOG("cdown: looking up batch %u in global state", batch_id);
-        global_state_t* global_state = &broker->global_state;
-        enif_mutex_lock(broker->global_lock);
-        if (cbroker_omap_lookup(global_state->batches, batch_id, (void**) &batch)) {
-            atomic_fetch_add_explicit(&batch->ref_count, 1, memory_order_relaxed);
-        }
-        enif_mutex_unlock(broker->global_lock);
+    batch_handle_t handle;
+    memset(&handle, 0, sizeof(batch_handle_t));
+
+    if (! batch_lookup(broker, local_state, batch_id, &handle)) {
+        // too late
+        return;
     }
+
+    batch_t* batch = handle.batch;
 
     LOG("cdown: cell offset is %u", offset);
     cell_t* cell = &batch->cells[offset];
     ERL_NIF_TERM status = enif_make_pid(caller_env, pid);
     ERL_NIF_TERM pid_term = enif_make_pid(caller_env, pid);
-    bool was_consumed = false;
 
     if (atomic_compare_exchange_strong(&cell->status, &status, Atoms._cancelled)) {
         LOG("cdown: cancelled %s", "");
@@ -890,11 +987,11 @@ static void cmonitor_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlN
         void *match = NULL;
         atomic_compare_exchange_strong(&cell->match, &match, (match_t *)pid_term);
 
-        was_consumed = consume_batch_slot(broker, local_state, batch, present_in_local);
+        consume_batch_slot(broker, local_state, &handle);
     }
 
-    if (!was_consumed && !present_in_local) {
-        lower_refcount_and_remove_from_global_if_needed(broker, batch);
+    if (!handle.found_locally && handle.batch != NULL) {
+        batch_lower_ref_count(broker, local_state, &handle);
     }
 
     //

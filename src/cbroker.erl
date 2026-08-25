@@ -41,7 +41,9 @@
     async_ask/1,
     async_ask/2,
     async_ask_r/1,
-    async_ask_r/2
+    async_ask_r/2,
+    %
+    to_list/1
 ]).
 
 %% ------------------------------------------------------------------
@@ -106,6 +108,12 @@ async_ask_r(Name) ->
 
 async_ask_r(Name, Value) ->
     async_ask_side(Name, right, Value).
+
+to_list(Name) ->
+    case cbroker_serv:get_shared_state(Name) of
+        #shared_state{broker = Broker} ->
+            cbroker_nif:to_list(Broker)
+    end.
 
 %% ------------------------------------------------------------------
 %% Internal Function Definitions

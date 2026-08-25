@@ -354,3 +354,7 @@ bool cbroker_omap_next(const cbroker_omap_t* map,
     }
     return true;
 }
+
+void** cbroker_omap_values(const cbroker_omap_t* map) {
+    return &map->values[map->head];
+}

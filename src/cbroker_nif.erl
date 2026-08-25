@@ -4,7 +4,8 @@
     new/0,
     ask/3,
     ask/4,
-    cancel/2
+    cancel/2,
+    to_list/1
 ]).
 
 -on_load(init/0).
@@ -24,6 +25,9 @@ ask(_Broker, _Side, _Value, _IsFullyAsync) ->
     not_loaded(?LINE).
 
 cancel(_Broker, _Ticket) ->
+    not_loaded(?LINE).
+
+to_list(_Broker) ->
     not_loaded(?LINE).
 
 %%
