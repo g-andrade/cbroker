@@ -24,11 +24,31 @@
 -moduledoc "FIXME: one-line summary of the `cbroker` public API.".
 -endif.
 
+-include("src/cbroker_shared_state.hrl").
+
 %% ------------------------------------------------------------------
 %% API Function Exports
 %% ------------------------------------------------------------------
 
--export([]).
+-export([
+    ask/1,
+    ask/2,
+    ask/3,
+    ask_r/1,
+    ask_r/2,
+    ask_r/3,
+    %
+    async_ask/1,
+    async_ask/2,
+    async_ask_r/1,
+    async_ask_r/2
+]).
+
+%% ------------------------------------------------------------------
+%% Macro Definitions
+%% ------------------------------------------------------------------
+
+-define(DEFAULT_TIMEOUT, 5_000).
 
 %% ------------------------------------------------------------------
 %% Type Definitions
@@ -55,6 +75,90 @@
 %     add(A, B) ->
 %         A + B.
 
+ask(Name) ->
+    ask(Name, self()).
+
+ask(Name, Value) ->
+    ask(Name, Value, ?DEFAULT_TIMEOUT).
+
+ask(Name, Value, Timeout) ->
+    ask_side(Name, left, Value, Timeout).
+
+ask_r(Name) ->
+    ask_r(Name, self()).
+
+ask_r(Name, Value) ->
+    ask_r(Name, Value, ?DEFAULT_TIMEOUT).
+
+ask_r(Name, Value, Timeout) ->
+    ask_side(Name, right, Value, Timeout).
+
+%%
+
+async_ask(Name) ->
+    async_ask(Name, self()).
+
+async_ask(Name, Value) ->
+    async_ask_side(Name, left, Value).
+
+async_ask_r(Name) ->
+    async_ask_r(Name, self()).
+
+async_ask_r(Name, Value) ->
+    async_ask_side(Name, right, Value).
+
 %% ------------------------------------------------------------------
 %% Internal Function Definitions
 %% ------------------------------------------------------------------
+
+ask_side(Name, Side, Value, Timeout) ->
+    case cbroker_serv:get_shared_state(Name) of
+        #shared_state{broker = Broker} ->
+            %
+            case cbroker_nif:ask(Broker, Side, Value) of
+                {await, Ticket} ->
+                    await_after_ask(Broker, Ticket, Timeout);
+                %
+                {match, _, _} = Match ->
+                    Match;
+                %
+                retry ->
+                    ask_side(Name, Side, Value, Timeout)
+            end;
+        %
+        none ->
+            not_running
+    end.
+
+await_after_ask(Broker, Ticket, Timeout) ->
+    receive
+        {T, Result} when T =:= Ticket ->
+            Result
+    after
+        Timeout ->
+            case cbroker_nif:cancel(Broker, Ticket) of
+                cancelled ->
+                    timeout;
+                %
+                too_late ->
+                    receive
+                        {T, Result} when T =:= Ticket ->
+                            Result
+                    end
+            end
+    end.
+
+async_ask_side(Name, Side, Value) ->
+    case cbroker_serv:get_shared_state(Name) of
+        #shared_state{broker = Broker} ->
+            case cbroker_nif:ask(Broker, Side, Value, true) of
+                retry ->
+                    async_ask_side(Name, Side, Value);
+                %
+                Result ->
+                    Result
+            end;
+        %
+        none ->
+            not_running
+    end.

@@ -2,34 +2,43 @@
 
 #include <assert.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+
+#include "cbroker_omap.h"
 
 /*********************************************************************/
 
 #define ATOM_LIST \
-    X(_await,          "await") \
-    X(_badarg,         "badarg") \
-    X(_cancelled,      "cancelled") \
-    X(_delayed_match,  "delayed_match") \
-    X(_empty,          "empty")  \
-    X(_instant_match,  "instant_match") \
-    X(_left,           "left")  \
-    X(_match,          "match") \
-    X(_matched,        "matched") \
-    X(_none,           "none") \
-    X(_ok,             "ok")  \
-    X(_retry,          "retry") \
-    X(_right,          "right") \
-    X(_todo,           "todo") \
-    X(_true,           "true")
+    X(_await,                "await") \
+    X(_badarg,               "badarg") \
+    X(_cancelled,            "cancelled") \
+    X(_delayed_match,        "delayed_match") \
+    X(_empty,                "empty")  \
+    X(_full,                 "full")  \
+    X(_instant_match_first,  "instant_match_first") \
+    X(_instant_match_second, "instant_match_second") \
+    X(_left,                 "left")  \
+    X(_match,                "match") \
+    X(_matched,              "matched") \
+    X(_none,                 "none") \
+    X(_ok,                   "ok")  \
+    X(_retry,                "retry") \
+    X(_right,                "right") \
+    X(_todo,                 "todo") \
+    X(_too_late,             "too_late") \
+    X(_true,                 "true")
 
 
-#define BATCH_NR_OF_CELLS 128
+//#define BATCH_NR_OF_CELLS 128
 
-#define MAX(a, b), ((a) >= (b) ? (a) : B)
+#define MAX(a, b) ((a) >= (b) ? (a) : (b))
+#define MIN(a, b) ((a) <= (b) ? (a) : (b))
 
-#define BATCH_ARRAY_INITIAL_CAPACITY 8
+//#define BATCH_ARRAY_INITIAL_CAPACITY 8
+
+#define LOG(fmt, ...) enif_fprintf(stderr, fmt "\n\r", __VA_ARGS__); fflush(stderr)
 
 /*********************************************************************/
 
@@ -46,25 +55,27 @@ static struct {
 
 static struct {
     ErlNifResourceType* broker;
+    ErlNifResourceType* cmonitor;
 } ResourceTypes;
 
-typedef uint_fast64_t thread_id_t;
-static _Atomic(thread_id_t) next_thread_id = 1;
-static _Thread_local thread_id_t my_thread_id = 0;
+typedef ssize_t thread_id_t;
+static _Atomic(thread_id_t) next_thread_id = 0;
+static _Thread_local thread_id_t my_thread_id = -1;
 
 //
 
 typedef uint_fast64_t offset_t;
 typedef _Atomic(offset_t) atomic_offset_t;
 
+typedef offset_t batch_id_t;
+
 //
 
 typedef struct {
     ErlNifEnv* env;
+    ERL_NIF_TERM cmonitor_term;
     ERL_NIF_TERM exchange_value;
 } match_t;
-
-static match_t* second_match;
 
 //
 
@@ -76,8 +87,21 @@ typedef struct {
 //
 
 typedef struct {
+    ErlNifMonitor mon;
+    ErlNifEnv* env;
+    ERL_NIF_TERM broker_term;
+    batch_id_t batch_id;
     offset_t offset;
+} cmonitor_t;
+
+//
+
+typedef struct {
+    batch_id_t id;
     atomic_size_t ref_count;
+    atomic_size_t consumed_count;
+    atomic_offset_t left_count;
+    atomic_offset_t right_count;
     size_t nr_of_cells;
     cell_t cells[];
 } batch_t;
@@ -85,281 +109,210 @@ typedef struct {
 //
 
 typedef struct {
-//    ErlNifMutex* mutex;
-//    batch_id_t batch_counter;
-    ErlNifEnv* env;
-    batch_t** batches;
-    size_t capacity;
-    size_t size;
-} batch_array_t;
+    cbroker_omap_t* batches;
+    // batch_id_t min_id;
+} global_state_t;
 
 //
 
 typedef struct {
-    ErlNifMonitor owner_mon;
+    cbroker_omap_t* batches;
+    batch_id_t left_id;
+    batch_id_t right_id;
+} local_state_t;
+
+//
+
+typedef struct {
     size_t nr_of_schedulers;
-    atomic_offset_t left_counter;
-    atomic_offset_t right_counter;
-    batch_array_t* batch_arrays; // 1 + nr_of_schedulers; index 0 is shared
-    ErlNifMutex* mutex;
+    size_t nr_of_cells_per_batch;
+    //
+    ErlNifMutex* global_lock;
+    global_state_t global_state;
+    //
+    local_state_t local_states[];
 } broker_t;
+
+//
+
+typedef struct {
+    ErlNifEnv* env;
+    ERL_NIF_TERM broker_term;
+    broker_t* broker;
+    ERL_NIF_TERM side;
+    bool is_left;
+    local_state_t* local_state;
+    //
+    ErlNifPid self;
+    ERL_NIF_TERM self_term;
+    ERL_NIF_TERM exchange_value;
+} ask_ctx_t;
+
+//
+
+typedef struct {
+    batch_t* batch;
+    offset_t offset;
+    ErlNifPid other_pid;
+    match_t* first_match;
+    match_t* second_match;
+} ask_out_t;
 
 /*********************************************************************/
 
-static thread_id_t get_or_assign_thread_id(void) {
-    if (my_thread_id == 0) {
+static const thread_id_t get_or_assign_thread_id() {
+    if (my_thread_id == -1) {
         my_thread_id = atomic_fetch_add_explicit(&next_thread_id, 1, memory_order_relaxed);
     }
-    assert(my_thread_id > 0);
+    assert(my_thread_id >= 0);
     return my_thread_id;
+}
 
-    /*
-     * Ask requirements:
-     * - get next batch for current side
-     */
+static size_t sizeof_broker(size_t nr_of_schedulers) {
+    assert(nr_of_schedulers > 0);
+    return sizeof(broker_t) + (nr_of_schedulers * sizeof(local_state_t));
 }
 
 /*********************************************************************/
 
-static ERL_NIF_TERM nif_make_badarg2(ErlNifEnv* env, ERL_NIF_TERM term) {
+static ERL_NIF_TERM make_badarg(ErlNifEnv* env, ERL_NIF_TERM term) {
     ERL_NIF_TERM reason = enif_make_tuple2(env, Atoms._badarg, term);
     return enif_raise_exception(env, reason);
 }
 
-static int nif_get_broker(ErlNifEnv* env, ERL_NIF_TERM term, broker_t** out) {
+static int get_broker(ErlNifEnv* env, ERL_NIF_TERM term, broker_t** out) {
     return enif_get_resource(env, term, ResourceTypes.broker, (void**) out);
 }
 
-static ERL_NIF_TERM nif_make_ticket(ErlNifEnv* env, 
-                                    ERL_NIF_TERM broker_term,
-                                    ERL_NIF_TERM side,
-                                    const offset_t offset) {
+static int get_cmonitor(ErlNifEnv* env, ERL_NIF_TERM term, cmonitor_t** out) {
+    return enif_get_resource(env, term, ResourceTypes.cmonitor, (void**) out);
+}
+
+static ERL_NIF_TERM make_ticket_simple(ErlNifEnv* env, ERL_NIF_TERM side, 
+                                       batch_id_t batch_id, offset_t offset)
+{
     return enif_make_tuple3(
-        env, 
-        broker_term, 
+        env,
         side,
+        enif_make_uint64(env, batch_id),
         enif_make_uint64(env, offset)
     );
 }
 
-static ERL_NIF_TERM nif_make_await(ErlNifEnv* env, ERL_NIF_TERM ticket) {
+static ERL_NIF_TERM make_ticket(ask_ctx_t* ctx, batch_id_t batch_id, offset_t offset) {
+    return make_ticket_simple(
+        ctx->env, 
+        ctx->side,
+        batch_id,
+        offset
+    );
+}
+
+static int get_ticket(ErlNifEnv* env, ERL_NIF_TERM term, 
+                      ERL_NIF_TERM* out_side,
+                      batch_id_t* out_batch_id, offset_t* out_offset)
+{
+    int arity = -1;
+    const ERL_NIF_TERM* elements = NULL;
+    batch_id_t batch_id;
+    offset_t offset;
+
+    LOG("ehhh %s", "");
+
+    if (enif_get_tuple(env, term, &arity, &elements)
+        && arity == 3
+        && (elements[0] == Atoms._left || elements[0] == Atoms._right)
+        && enif_get_uint64(env, elements[1], &batch_id)
+        && enif_get_uint64(env, elements[2], &offset)
+    ) {
+        *out_side = elements[0];
+        *out_batch_id = batch_id;
+        *out_offset = offset;
+        return 1;
+    }
+    else {
+        return 0;
+    }
+}
+
+static ERL_NIF_TERM make_await(ErlNifEnv* env, ERL_NIF_TERM ticket) {
     return enif_make_tuple2(env, Atoms._await, ticket);
 }
 
-static ERL_NIF_TERM nif_make_match_msg(ErlNifEnv* env, ERL_NIF_TERM ticket, ERL_NIF_TERM exchange_value) {
+static ERL_NIF_TERM make_match_msg(ErlNifEnv* env, ERL_NIF_TERM ticket, ERL_NIF_TERM exchange_value) {
     return enif_make_tuple2(env, ticket, enif_make_tuple2(env, Atoms._match, exchange_value));
 }
 
-//static int nif_get_batch(ErlNifEnv* env, ERL_NIF_TERM term, batch_t** out) {
+//static int get_batch(ErlNifEnv* env, ERL_NIF_TERM term, batch_t** out) {
 //    return enif_get_resource(env, term, ResourceTypes.batch, (void**) out);
 //}
 
 /*********************************************************************/
 
-static int batch_array_search(batch_array_t* array, const offset_t target_offset, size_t* out_idx, batch_t** out_batch) {
-    size_t low = 0, high = array->size - 1;
-    batch_t** batches = array->batches;
 
-    while (low <= high) {
-        int mid = low + (high - low) / 2;
-        batch_t* mid_batch = batches[mid];
-        offset_t mid_offset = mid_batch->offset;
+static match_t* match_new(ask_ctx_t* ctx, batch_id_t batch_id, offset_t offset) {
+    cmonitor_t* cmonitor = (cmonitor_t*) enif_alloc_resource(ResourceTypes.cmonitor, sizeof(cmonitor_t));
+    memset(cmonitor, 0, sizeof(cmonitor_t));
 
-        if (mid_offset == target_offset) {
-            *out_idx = mid;
-            *out_batch = mid_batch;
-            return 1;
-        } else if (mid_offset < target_offset) {
-            low = mid + 1;
-        } else {
-            high = mid - 1;
-        }
+    cmonitor->env = enif_alloc_env();
+    cmonitor->broker_term = enif_make_copy(cmonitor->env, ctx->broker_term);
+    cmonitor->batch_id = batch_id;
+    cmonitor->offset = offset;
+
+    if (enif_monitor_process(ctx->env, cmonitor, &ctx->self, &cmonitor->mon)) {
+        enif_free_env(cmonitor->env);
+        cmonitor->env = NULL;
+        enif_release_resource(cmonitor);
+        return NULL;
     }
-
-    *out_idx = low;
-    return 0;
-}
-
-static void batch_array_insert(batch_array_t* array, size_t idx, batch_t* batch) {
-    assert(idx <= array->size);
-
-    if (array->size == array->capacity) {
-        size_t new_cap = (array->capacity == 0) ? 4 : (array->capacity * 2);
-        array->batches = enif_realloc(array->batches, new_cap);
-        assert(array->batches != NULL);
-        array->capacity = new_cap;
-    } else {
-        assert(array->size < array->capacity);
-    }
-
-    size_t moved_size = (array->size - idx) * sizeof(batch_t*);
-    if (moved_size != 0) {
-        memmove(&array->batches[idx + 1], &array->batches[idx], moved_size);
-    }
-
-    array->batches[idx] = batch;
-    array->size++;
-}
-
-static batch_t* new_batch(offset_t offset) {
-    size_t struct_size = sizeof(batch_t) + (BATCH_NR_OF_CELLS * sizeof(cell_t));
-    batch_t* batch = enif_alloc(struct_size);
-    memset(batch, 0, struct_size);
-    batch->offset = offset;
-    batch->nr_of_cells = BATCH_NR_OF_CELLS;
-    return batch;
-}
-
-static batch_t* broker_get_batch(broker_t* broker, const offset_t offset) {
-    const thread_id_t thread_id = get_or_assign_thread_id();
-    assert(thread_id <= broker->nr_of_schedulers);
-    batch_array_t* local_batch_array = &broker->batch_arrays[thread_id];
-
-    offset_t batch_offset = offset / BATCH_NR_OF_CELLS;
-    batch_t* batch = NULL;
-    size_t local_batch_idx = 0;
-    if (batch_array_search(local_batch_array, batch_offset, &local_batch_idx, &batch)) {
-        return batch;
-    }
-
-    //
-
-    batch_array_t* shared_batch_array = &broker->batch_arrays[0];
-    size_t shared_batch_idx = 0;
-
-    enif_mutex_lock(broker->mutex);
-    if (batch_array_search(shared_batch_array, batch_offset, &shared_batch_idx, &batch)) {
-        atomic_fetch_add(&batch->ref_count, +1);
-        enif_mutex_unlock(broker->mutex);
-        batch_array_insert(local_batch_array, local_batch_idx, batch);
-    } else {
-        batch_t* batch = new_batch(batch_offset);
-        atomic_fetch_add(&batch->ref_count, +2);
-        batch_array_insert(shared_batch_array, shared_batch_idx, batch);
-        enif_mutex_unlock(broker->mutex);
-        batch_array_insert(local_batch_array, local_batch_idx, batch);
-    }
-    return batch;
-}
-
-static match_t* match_new_pending(ERL_NIF_TERM exchange_value) {
-    // TODO optimize: don't allocate env for immediate terms
 
     match_t* match = enif_alloc(sizeof(match_t));
     memset(match, 0, sizeof(match_t));
 
-    ErlNifEnv* new_env = enif_alloc_env();
-    match->env = new_env;
-    match->exchange_value = enif_make_copy(new_env, exchange_value);
+    ErlNifEnv* match_env = enif_alloc_env();
+    match->env = match_env;
+    match->cmonitor_term = enif_make_resource(match_env, cmonitor);
+    match->exchange_value = enif_make_copy(match_env, ctx->exchange_value);
+
+    enif_release_resource(cmonitor);
 
     return match;
 }
 
-static void match_free(match_t* match) {
-    if (match->env != NULL) {
-        enif_free_env(match->env);
-    }
+static void match_cancel_and_free(ErlNifEnv* caller_env, match_t* match) {
+    cmonitor_t* cmonitor = NULL;
+    assert(get_cmonitor(caller_env, match->cmonitor_term, &cmonitor));
+    enif_demonitor_process(caller_env, cmonitor, &cmonitor->mon);
+
+    enif_free_env(match->env);
     enif_free(match);
 }
 
-static ERL_NIF_TERM do_ask(
-    ErlNifEnv* env, broker_t* broker, atomic_offset_t* head_counter, 
-    ErlNifPid self, ERL_NIF_TERM exchange_value,
-    //
-    offset_t* out_offset, ErlNifPid* out_other_pid, match_t** out_first_match
-) {
-    batch_t* batch = NULL;
-    ERL_NIF_TERM self_term = enif_make_pid(env, &self);
-
-    int attempts_left = 5;
-
-    while (attempts_left-- > 0) {
-        const offset_t offset = atomic_fetch_add(head_counter, +1) - 1;
-
-        if (batch == NULL || offset > batch->offset + batch->nr_of_cells) {
-            batch = broker_get_batch(broker, offset);
-        }
-
-        const size_t cell_idx = offset - batch->offset;
-        cell_t* cell = &batch->cells[cell_idx];
-
-        ERL_NIF_TERM status = Atoms._empty;
-        ErlNifPid other_pid;
-        
-        if (atomic_compare_exchange_strong(&cell->status, &status, self_term)) {
-            void* match = NULL;
-            match_t* pending_match = match_new_pending(exchange_value);
-
-            if (atomic_compare_exchange_strong(&cell->match, &match, pending_match)) {
-                // Enqueued
-                *out_offset = offset;
-                return Atoms._await;
-            } else {
-                // Instant match - the other party will message us.
-                *out_offset = offset;
-                assert(enif_get_local_pid(env, (ERL_NIF_TERM) match, out_other_pid));
-                *out_first_match = pending_match;
-                return Atoms._instant_match;
-            }
-        } 
-        else if (
-            enif_get_local_pid(env, status, &other_pid)
-            && atomic_compare_exchange_strong(&cell->status, &status, Atoms._matched)
-        ) {
-            void* desired_match = (void*) self_term;
-            void* match = atomic_exchange(&cell->match, desired_match);
-
-            if (match == NULL) {
-                // Instant match - the other party will message us.
-                *out_offset = offset;
-                *out_other_pid = other_pid;
-                *out_first_match = NULL;
-                return Atoms._instant_match;
-            }
-            else {
-                /* Delayed Match
-                     * 1) message `other_pid` with our exchange term
-                     * 2) return the first exchange term
-                     */
-                *out_offset = offset;
-                *out_first_match = (match_t*) match;
-                return Atoms._delayed_match;
-            }
-        } 
-
-        assert(status == Atoms._cancelled);
-    }
-    return Atoms._retry;
-}
-
-static void notify_other_of_match(ErlNifEnv* env,
-                                  ERL_NIF_TERM broker_term, 
-                                  ERL_NIF_TERM side, 
-                                  ERL_NIF_TERM exchange_value,
-                                  offset_t offset, 
-                                  ErlNifPid* other_pid,
-                                  match_t* first_match) 
-{
-    ERL_NIF_TERM other_side = (side == Atoms._left ? Atoms._right : Atoms._left);
+static void notify_other_of_match(ask_ctx_t* ctx, ask_out_t* success) {
+    ERL_NIF_TERM other_side = (ctx->is_left ? Atoms._right : Atoms._left);
     ErlNifEnv* other_env = NULL;
     ERL_NIF_TERM copied_exchange_value;
 
+    match_t* first_match = success->first_match;
+
     if (first_match == NULL) {
         other_env = enif_alloc_env();
-        copied_exchange_value = enif_make_copy(other_env, exchange_value);
-    } else if (first_match->env == NULL) {
-        other_env = enif_alloc_env();
-        copied_exchange_value = first_match->exchange_value;
+        copied_exchange_value = enif_make_copy(other_env, ctx->exchange_value);
     } else {
         // We can reuse the env in first_match
         other_env = first_match->env;
         copied_exchange_value = first_match->exchange_value;
+
+        cmonitor_t* cmonitor = NULL;
+        assert(get_cmonitor(ctx->env, first_match->cmonitor_term, &cmonitor));
+        enif_demonitor_process(ctx->env, cmonitor, &cmonitor->mon);
     }
 
-    ERL_NIF_TERM other_broker = enif_make_copy(other_env, broker_term);
-    ERL_NIF_TERM other_ticket = nif_make_ticket(other_env, other_broker, other_side, offset);
-    ERL_NIF_TERM other_msg = nif_make_match_msg(other_env, other_ticket, copied_exchange_value);
-    enif_send(env, other_pid, other_env, other_msg);
+    ERL_NIF_TERM other_ticket = make_ticket_simple(other_env, other_side, 
+                                                   success->batch->id, success->offset);
+
+    ERL_NIF_TERM other_msg = make_match_msg(other_env, other_ticket, copied_exchange_value);
+    enif_send(ctx->env, &success->other_pid, other_env, other_msg);
     enif_free_env(other_env);
 
     if (first_match != NULL) {
@@ -367,82 +320,237 @@ static void notify_other_of_match(ErlNifEnv* env,
     }
 }
 
-/*********************************************************************/
+static batch_t* batch_new(const batch_id_t id, const size_t nr_of_cells) {
+    const size_t size = sizeof(batch_t) + (nr_of_cells * sizeof(cell_t));
 
-//static matcher_t *ensure_matcher(broker_t* broker, uint_fast64_t entry_pos) {
-//    matcher_t *arr = broker->matchers;
-//    size_t n = broker->matchers_count;
-//    size_t lo = 0, hi = n;
-//
-//    // Binary search: ranges are [start, start + MATCHER_CELL_COUNT)
-//    while (lo < hi) {
-//        size_t mid = lo + (hi - lo) / 2;
-//        uint_fast64_t mid_start = arr[mid].start;
-//
-//        if (entry_pos < mid_start) {
-//            hi = mid;
-//        } else if (entry_pos >= mid_start + MATCHER_CELL_COUNT) {
-//            lo = mid + 1;
-//        } else {
-//            return &arr[mid];  // entry_pos falls within this matcher's range
-//        }
-//    }
-//
-//    // Not found — lo is the correct insertion index to keep the array sorted
-//    if (n == broker->matchers_capacity) {
-//        size_t new_cap = (broker->matchers_capacity == 0) ? 4 : (broker->matchers_capacity * 2);
-//        matcher_t *resized = enif_realloc(arr, new_cap * sizeof(matcher_t));
-//        if (!resized) {
-//            return NULL;  // caller must handle allocation failure
-//        }
-//        arr = resized;
-//        broker->matchers = arr;
-//        broker->matchers_capacity = new_cap;
-//    }
-//
-//    // Shift everything from lo onward to the right by one
-//    if (lo < n) {
-//        memmove(&arr[lo + 1], &arr[lo], (n - lo) * sizeof(matcher_t));
-//    }
-//
-//    // Align the new matcher's start to a MATCHER_CELL_COUNT boundary
-//    uint_fast64_t new_start = (entry_pos / MATCHER_CELL_COUNT) * MATCHER_CELL_COUNT;
-//
-//    arr[lo].start = new_start;
-//
-//    ErlNifEnv* matcher_env = enif_alloc_env();
-//    arr[lo].env = matcher_env;
-//
-//    batch_t* batch = enif_alloc_resource(ResourceTypes.batch, sizeof(batch_t));
-//    memset(batch, 0, sizeof(batch_t));
-//    arr[lo].batch_term = enif_make_resource(matcher_env, batch);
-//
-//    broker->matchers_count = n + 1;
-//    return &arr[lo];
-//}
+    batch_t* batch = enif_alloc(size);
+    assert(batch != NULL);
+    memset(batch, 0, size);
 
-// TODO destroy matcher
+    batch->id = id;
+    batch->nr_of_cells = nr_of_cells;
+    
+    // TODO optimize initialization
+    for (int i=0; i<nr_of_cells; i++) {
+        cell_t* cell = &batch->cells[i];
+        cell->status = Atoms._empty;
+    }
 
-/*********************************************************************/
+    return batch;
+}
 
-//static entry_t* entry_new(ErlNifPid pid) {
-//    entry_t* entry = enif_alloc(sizeof(entry_t));
-//    memset(entry, 0, sizeof(entry_t));
-//    entry->pid = pid;
-//    return entry;
-//}
+///////////////////////////
 
-//static cell_t* cell_new(ErlNifPid pid, ERL_NIF_TERM exchange_value) {
-//    cell_t* cell = enif_alloc(sizeof(cell_t));
-//    memset(cell, 0, sizeof(cell_t));
-//
-//    // TODO optimize immediate terms?
-//    cell->pid = pid;
-//    cell->env = enif_alloc_env();
-//    cell->exchange_value = enif_make_copy(cell->env, term);
-//    return cell;
-//}
+static ERL_NIF_TERM batch_offset_ask(ask_ctx_t* ctx, batch_t* batch, offset_t offset, ask_out_t* out) {
+    size_t cell_offset = offset % batch->nr_of_cells;
+    
+    cell_t* cell = &batch->cells[cell_offset];
 
+    ERL_NIF_TERM status = Atoms._empty;
+    ErlNifPid other_pid;
+
+    if (atomic_compare_exchange_strong(&cell->status, &status, ctx->self_term)) {
+        void* match = NULL;
+        match_t* pending_match = match_new(ctx, batch->id, offset);
+        LOG("match value is: %p", pending_match);
+
+        if (pending_match == NULL) {
+            // Caller stopped in the mean time
+            return Atoms._cancelled;
+        }
+        else if (atomic_compare_exchange_strong(&cell->match, &match, pending_match)) {
+            // Enqueued
+            LOG("enqueued!! %s", "");
+            return Atoms._await;
+        } 
+        else {
+            assert(enif_get_local_pid(ctx->env, (ERL_NIF_TERM) match, &other_pid));
+
+            if (enif_compare_pids(&other_pid, &ctx->self) == 0) {
+                // Monitor triggered concurrently, we're cancelled
+                match_cancel_and_free(ctx->env, pending_match);
+                return Atoms._cancelled;
+            } else {
+                // Second in instant match - the other party will message us
+                out->other_pid = other_pid;
+                out->first_match = pending_match;
+                return Atoms._instant_match_second;
+            }
+        }
+    } else if (
+        enif_get_local_pid(ctx->env, status, &other_pid)
+        && atomic_compare_exchange_strong(&cell->status, &status, Atoms._matched)
+    ) {
+        LOG("matched with: %T", enif_make_pid(ctx->env, &other_pid));
+        void* desired_match = (void*) ctx->self_term; // FIXME: this is highly questionable
+        void* match = atomic_exchange(&cell->match, desired_match);
+        LOG("match value is: %p", match);
+
+        if (match == NULL) {
+            // First in instant match - the other party will message us
+            out->other_pid = other_pid;
+            return Atoms._instant_match_first;
+        } else {
+            /* Delayed Match
+             * 1) message `other_pid` with our exchange term
+             * 2) return the first exchange term
+             */
+            out->other_pid = other_pid;
+            out->second_match = (match_t*) match;
+            return Atoms._delayed_match;
+        }
+    }
+
+    assert(status == Atoms._cancelled);
+    return Atoms._cancelled;
+}
+
+////
+
+static ERL_NIF_TERM batch_ask(ask_ctx_t* ctx, batch_t* batch, ask_out_t* out) {
+    offset_t offset = 0;
+
+    offset = (
+        ctx->is_left ?
+        atomic_fetch_add_explicit(&batch->left_count, 1, memory_order_relaxed)
+        : atomic_fetch_add_explicit(&batch->right_count, 1, memory_order_relaxed)
+    );
+
+    if (offset >= batch->nr_of_cells) {
+        return Atoms._full;
+    }
+    else {
+        ERL_NIF_TERM match_res = batch_offset_ask(ctx, batch, offset, out);
+
+        if (match_res == Atoms._cancelled) {
+            return match_res;
+        } else {
+            out->offset = offset;
+            return match_res;
+        }
+    }
+}
+
+////
+
+static batch_t* get_next_batch(ask_ctx_t* ctx, const batch_id_t prev_batch_id) {
+    local_state_t* local_state = ctx->local_state;
+
+    batch_id_t next_batch_id = 0;
+    batch_t* next_batch = NULL;
+
+    if (! cbroker_omap_next(local_state->batches, prev_batch_id, &next_batch_id, (void**) &next_batch)) {
+        broker_t* broker = ctx->broker;
+        global_state_t* global_state = &broker->global_state;
+        enif_mutex_lock(broker->global_lock);
+
+        if (! cbroker_omap_next(global_state->batches, prev_batch_id, &next_batch_id, (void**) &next_batch)) {
+            next_batch_id = prev_batch_id + 1;
+            next_batch = batch_new(next_batch_id, broker->nr_of_cells_per_batch);
+            assert(
+                cbroker_omap_insert(global_state->batches, next_batch_id, next_batch)
+                == CBROKER_OMAP_OK
+            );
+        }
+
+        atomic_fetch_add_explicit(&next_batch->ref_count, 1, memory_order_relaxed);
+        enif_mutex_unlock(broker->global_lock);
+
+        assert(
+            cbroker_omap_insert(local_state->batches, next_batch_id, next_batch)
+            == CBROKER_OMAP_OK
+        );
+    }
+
+    if (ctx->is_left) {
+        local_state->left_id = next_batch_id;
+    } else {
+        local_state->right_id = next_batch_id;
+    }
+
+    return next_batch;
+}
+
+////
+
+static ERL_NIF_TERM ask(ask_ctx_t* ctx, ask_out_t* out) {
+    local_state_t* local_state = ctx->local_state;
+    batch_id_t batch_id = (ctx->is_left ? local_state->left_id : local_state->right_id);
+    batch_t* batch = NULL;
+
+    ////
+
+    const int max_attempts = MIN(100, MAX(5, ctx->broker->nr_of_cells_per_batch / 2));
+
+    for (int attempt_nr = 0; attempt_nr < max_attempts; attempt_nr++) {
+        if (batch == NULL) {
+            cbroker_omap_lookup(local_state->batches, batch_id, (void**) &batch);
+        }
+
+        if (batch != NULL) {
+            ERL_NIF_TERM match_res = batch_ask(ctx, batch, out);
+
+            if (match_res == Atoms._full) {
+                batch = NULL;
+            } else if (match_res == Atoms._cancelled) {
+                continue;
+            } else {
+                out->batch = batch;
+                return match_res;
+            }
+        }
+
+        batch = get_next_batch(ctx, batch_id);
+    } 
+
+    return Atoms._retry;
+}
+
+///////////////////////////
+
+static void lower_refcount_and_remove_from_global_if_needed(broker_t* broker, batch_t* batch) {
+    batch_id_t batch_id = batch->id;
+    size_t ref_count = atomic_fetch_sub_explicit(&batch->ref_count, 1, memory_order_relaxed) - 1;
+    assert(ref_count >= 1);
+
+    if (ref_count == 1) {
+        global_state_t* global_state = &broker->global_state;
+        enif_mutex_lock(broker->global_lock);
+
+        if (cbroker_omap_lookup(global_state->batches, batch_id, (void**) &batch)) {
+            ref_count = atomic_load(&batch->ref_count);
+            assert(ref_count >= 1);
+
+            if (ref_count == 1) {
+                cbroker_omap_delete_and_next(global_state->batches, batch_id, NULL, NULL, NULL);
+                LOG("CONSUME: batch %u deleted", batch_id);
+                enif_free(batch);
+            }
+        }
+
+        enif_mutex_unlock(broker->global_lock);
+    } 
+}
+
+
+static bool consume_batch_slot(broker_t* broker, local_state_t* local_state, batch_t* batch, bool present_in_local) {
+    size_t consumed_count = 1 + atomic_fetch_add_explicit(&batch->consumed_count, 1, memory_order_relaxed);
+
+    if (consumed_count < batch->nr_of_cells) {
+        return false;
+    }
+    else {
+        assert(consumed_count == batch->nr_of_cells);
+
+        if (present_in_local) {
+            assert(cbroker_omap_delete_and_next(local_state->batches, batch->id, NULL, NULL, NULL));
+        }
+
+        lower_refcount_and_remove_from_global_if_needed(broker, batch);
+
+        return true;
+    }
+}
 
 /*********************************************************************/
 
@@ -453,29 +561,51 @@ niff_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
         return enif_make_badarg(env);
     }
 
-    broker_t* broker = enif_alloc_resource(ResourceTypes.broker, sizeof(broker_t));
-    memset(broker, 0, sizeof(broker_t));
-
-    if (! enif_monitor_process(env, broker, &self, &broker->owner_mon)) {
-        enif_release_resource(broker);
-    }
-
     ErlNifSysInfo sys_info;
     enif_system_info(&sys_info, sizeof(sys_info));
     size_t nr_of_schedulers = sys_info.scheduler_threads;
     assert(nr_of_schedulers > 0);
+
+    const size_t broker_size = sizeof_broker(nr_of_schedulers);
+    broker_t* broker = enif_alloc_resource(ResourceTypes.broker, broker_size);
+    assert(broker != NULL);
+    memset(broker, 0, sizeof(broker_t));
+
     broker->nr_of_schedulers = nr_of_schedulers;
 
-    size_t nr_of_batch_arrays = 1 + nr_of_schedulers;
-    broker->batch_arrays = malloc(nr_of_batch_arrays * sizeof(batch_array_t));
-    memset(broker->batch_arrays, 0, nr_of_batch_arrays * sizeof(batch_array_t));
+    //broker->nr_of_cells_per_batch = 4 * nr_of_schedulers;
+    broker->nr_of_cells_per_batch = 1; // FIXME
 
-    for (size_t i=0; i <= nr_of_batch_arrays; i++) {
-        batch_array_t* batch_array = &broker->batch_arrays[i];
-        batch_array->env = enif_alloc_env();
+    broker->global_lock = enif_mutex_create("cbroker.mutex");
+
+    broker->global_state.batches = cbroker_omap_new();
+    assert(broker->global_state.batches != NULL);
+
+    const batch_id_t first_batch_id = 1;
+    batch_t* first_batch = batch_new(first_batch_id, broker->nr_of_cells_per_batch);
+
+    assert(
+        cbroker_omap_insert(broker->global_state.batches, first_batch_id, first_batch)
+        == CBROKER_OMAP_OK
+    );
+    atomic_fetch_add(&first_batch->ref_count, 1);
+
+    
+    for (size_t i=0; i < nr_of_schedulers; i++) {
+        // TODO only initialize local state for the amount of _online_ schedulers.
+        local_state_t* local_state = &broker->local_states[i];
+        local_state->batches = cbroker_omap_new();
+        assert(local_state->batches != NULL);
+
+        assert(
+            cbroker_omap_insert(local_state->batches, first_batch_id, first_batch)
+            == CBROKER_OMAP_OK
+        );
+        atomic_fetch_add(&first_batch->ref_count, 1);
+
+        local_state->left_id = first_batch_id;
+        local_state->right_id = first_batch_id;
     }
-
-    broker->mutex = enif_mutex_create("cbroker.mutex");
 
     return enif_make_resource(env, broker);
 }
@@ -484,129 +614,294 @@ niff_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
 
 static ERL_NIF_TERM
 niff_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
-    broker_t* broker = NULL;
-    ErlNifPid self;
-    atomic_offset_t* head_counter = NULL;
-    int is_fully_async = 0;
+    ask_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ask_ctx_t));
 
-    const ERL_NIF_TERM broker_term = argv[0];
-    const ERL_NIF_TERM side = argv[1];
-    const ERL_NIF_TERM exchange_value = argv[2];
+    ctx.env = env;
+    bool is_fully_async = false;
 
-    if (! nif_get_broker(env, broker_term, &broker)) {
-        return nif_make_badarg2(env, broker_term);
+    ctx.broker_term = argv[0];
+    ctx.side = argv[1];
+    ctx.exchange_value = argv[2];
+
+    if (! get_broker(env, ctx.broker_term, &ctx.broker)) {
+        return make_badarg(env, ctx.broker_term);
     }
 
-    if (! enif_self(env, &self)) {
+    if (enif_self(env, &ctx.self)) {
+        ctx.self_term = enif_make_pid(env, &ctx.self);
+    } else {
         return enif_make_badarg(env);
     }
         
-    if (side == Atoms._left) {
-        head_counter = &broker->left_counter;
-    } else if (side == Atoms._right) {
-        head_counter = &broker->right_counter;
-    } else {
-        return nif_make_badarg2(env, side);
+    if (ctx.side == Atoms._left) {
+        ctx.is_left = true;
+    } else if (ctx.side != Atoms._right) {
+        return make_badarg(env, ctx.side);
     }
     
     is_fully_async = (argc >= 4 && argv[3] == Atoms._true);
 
-    ///
+    ////////////////////////////
 
-    offset_t offset = 0;
-    ErlNifPid other_pid;
-    match_t* first_match = NULL;
+    thread_id_t thread_id = get_or_assign_thread_id();
+    ctx.local_state = &ctx.broker->local_states[thread_id];
 
-    ERL_NIF_TERM res = do_ask(env, broker, head_counter, self, exchange_value, &offset, &other_pid, &first_match);
+    ask_out_t success;
+    memset(&success, 0, sizeof(ask_out_t));
 
-    if (res == Atoms._await) 
-    {
-        ERL_NIF_TERM ticket = nif_make_ticket(env, broker_term, side, offset);
-        return nif_make_await(env, ticket);
-    } 
-    else if (res == Atoms._instant_match) 
-    {
-        // Other party will message us
-        notify_other_of_match(env, broker_term, side, exchange_value, offset, &other_pid, first_match);
+    ERL_NIF_TERM match_res = ask(&ctx, &success);
+
+    ////
+
+    if (match_res == Atoms._await) {
+        ERL_NIF_TERM ticket = make_ticket(&ctx, success.batch->id, success.offset);
+        return make_await(env, ticket);
+    }
+    else if (match_res == Atoms._instant_match_first) {
+        // The other party will message us
+        batch_id_t batch_id = success.batch->id;
+
+        notify_other_of_match(&ctx, &success);
+        consume_batch_slot(ctx.broker, ctx.local_state, success.batch, true);
+
+        ERL_NIF_TERM ticket = make_ticket(&ctx, batch_id, success.offset);
+        return make_await(env, ticket);
+    }
+    else if (match_res == Atoms._instant_match_second) {
+        // The other party will message us
+        batch_id_t batch_id = success.batch->id;
+
+        notify_other_of_match(&ctx, &success);
+
+        ERL_NIF_TERM ticket = make_ticket(&ctx, batch_id, success.offset);
+        return make_await(env, ticket);
+    }
+    else if (match_res == Atoms._delayed_match) {
+        batch_id_t batch_id = success.batch->id;
+        match_t* second_match = success.second_match;
+        assert(second_match != NULL);
+
+        LOG("dmatch: about to notify other %s", "");
+        notify_other_of_match(&ctx, &success);
+
+        LOG("dmatch: about to consume slot %s", "");
+        consume_batch_slot(ctx.broker, ctx.local_state, success.batch, true);
+
         //
-        ERL_NIF_TERM ticket = nif_make_ticket(env, broker_term, side, offset);
-        return nif_make_await(env, ticket);
-    } 
-    else if (res == Atoms._delayed_match) 
-    {
-        assert(first_match != NULL);
-        notify_other_of_match(env, broker_term, side, exchange_value, offset, &other_pid, NULL);
-        //
-        ERL_NIF_TERM ticket = nif_make_ticket(env, broker_term, side, offset);
-        ERL_NIF_TERM copied_exchange_value = enif_make_copy(env, first_match->exchange_value);
+        LOG("dmatch: about to create ticket %s", "");
+        ERL_NIF_TERM ticket = make_ticket(&ctx, batch_id, success.offset);
+        LOG("dmatch: about to copy exchange value from %p", second_match);
+        ERL_NIF_TERM copied_exchange_value = enif_make_copy(env, second_match->exchange_value);
 
-        if (first_match->env != NULL) {
-            enif_free_env(first_match->env);
+        if (second_match->env != NULL) {
+            LOG("dmatch: about to free second_match env %s", "");
+            enif_free_env(second_match->env);
         }
-        enif_free(first_match);
+        LOG("dmatch: about to free second_match %s", "");
+        enif_free(second_match);
 
         if (is_fully_async) {
-            ERL_NIF_TERM self_msg = nif_make_match_msg(env, ticket, copied_exchange_value);
-            enif_send(env, &self, NULL, self_msg);
-            return nif_make_await(env, ticket);
+            LOG("dmatch: about to send msg to self %s", "");
+            ERL_NIF_TERM self_msg = make_match_msg(env, ticket, copied_exchange_value);
+            enif_send(env, &ctx.self, NULL, self_msg);
+            return make_await(env, ticket);
         }
         else {
             return enif_make_tuple3(env, Atoms._match, ticket, copied_exchange_value);
         }
-    } 
-    else {
-        assert (res == Atoms._retry);
-        // TODO
     }
+
+    return match_res;
 }
 
+//
+
+static ERL_NIF_TERM
+niff_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    broker_t* broker = NULL;
+    ERL_NIF_TERM side;
+    batch_id_t batch_id;
+    offset_t offset;
+    ErlNifPid self;
+    ERL_NIF_TERM self_term;
+
+    LOG("cancel: get broker %s", "");
+    if (! get_broker(env, argv[0], &broker)) {
+        return make_badarg(env, argv[0]);
+    }
+
+    LOG("cancel: get ticket %s", "");
+    if (! get_ticket(env, argv[1], &side, &batch_id, &offset)) {
+        return make_badarg(env, argv[1]);
+    }
+
+    LOG("cancel: get self %s", "");
+    if (enif_self(env, &self)) {
+        self_term = enif_make_pid(env, &self);
+    } else {
+        return enif_make_badarg(env);
+    }
+
+    thread_id_t thread_id = get_or_assign_thread_id();
+    LOG("cancel: thread id=%u", thread_id);
+    local_state_t* local_state = &broker->local_states[thread_id];
+
+    //
+
+    batch_t* batch = NULL;
+    bool present_in_local = false;
+    bool was_consumed = false;
+
+    LOG("cancel: looking up batch %u in local state", batch_id);
+    present_in_local = cbroker_omap_lookup(local_state->batches, batch_id, (void**) &batch);
+
+    if (! present_in_local) {
+        LOG("cancel: looking up batch %u in global state", batch_id);
+        global_state_t* global_state = &broker->global_state;
+        enif_mutex_lock(broker->global_lock);
+        if (cbroker_omap_lookup(global_state->batches, batch_id, (void**) &batch)) {
+            atomic_fetch_add_explicit(&batch->ref_count, 1, memory_order_relaxed);
+        }
+        enif_mutex_unlock(broker->global_lock);
+    }
+
+    if (batch != NULL) {
+        LOG("cancel: batch %u found, cell at offset %u", batch_id, offset);
+        cell_t* cell = &batch->cells[offset];
+
+        ERL_NIF_TERM status = self_term;
+        ERL_NIF_TERM cancel_res;
+
+        if (atomic_compare_exchange_strong(&cell->status, &status, Atoms._cancelled)) {
+            match_t* match = atomic_exchange(&cell->match, NULL);
+            assert(match != NULL);
+            match_cancel_and_free(env, match);
+
+            was_consumed = consume_batch_slot(broker, local_state, batch, present_in_local);
+            cancel_res = Atoms._cancelled;
+        } 
+        else if (status == Atoms._cancelled) {
+            cancel_res = Atoms._cancelled;
+        } 
+        else {
+            cancel_res = Atoms._too_late;
+        }
+
+        if (!was_consumed && !present_in_local) {
+            lower_refcount_and_remove_from_global_if_needed(broker, batch);
+        }
+
+        return cancel_res;
+    }
+
+    return Atoms._too_late;
+
+        
+
+}
 
 //
 
 static ErlNifFunc nif_funcs[] = {
     {"new", 0, niff_new},
     {"ask", 3, niff_ask},
-    {"ask", 4, niff_ask}
+    {"ask", 4, niff_ask},
+    {"cancel", 2, niff_cancel}
 };
 
 /*********************************************************************/
 
+static void broker_stop(broker_t* broker) {
+    global_state_t* global_state = &broker->global_state;
+}
+
 static void broker_dtor(ErlNifEnv* caller_env, void* obj) {
     broker_t* broker = (broker_t*) obj;
+    broker_stop(broker);
+
+    //enif_mutex_lock(broker->global_lock);
+
     //memset(obj, 0, sizeof(broker_t));
 }
 
 static void broker_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon) {
     broker_t* broker = (broker_t*) obj;
+    broker_stop(broker);
 
-    enif_mutex_lock(broker->mutex);
-    batch_array_t* batch_array = &broker->batch_arrays[0];
+//void cbroker_omap_destroy(cbroker_omap_t* map,
+//                          void (*free_value)(uint64_t key, void* value, void* ctx),
+//                          void* ctx);
 
-    for (size_t i = 0; i < batch_array->size; i++) {
-        batch_t* batch = batch_array->batches[i];
-        for (offset_t j = 0; j < batch->nr_of_cells; j++) {
-            cell_t* cell = &batch->cells[j];
+}
 
-            const ERL_NIF_TERM desired_status = Atoms._cancelled;
-            ERL_NIF_TERM expected_status = Atoms._empty;
-            ERL_NIF_TERM status = atomic_compare_exchange_strong(&cell->status, &expected_status, desired_status);
+/*********************************************************************/
 
-            if (enif_is_pid(caller_env, status)) {
-                expected_status = status;
-                status = atomic_compare_exchange_strong(&cell->status, &expected_status, desired_status);
+static void cmonitor_dtor(ErlNifEnv* caller_env, void* obj) {
+    cmonitor_t* cmonitor = (cmonitor_t*) obj;
 
-                if (status !== desired_status) {
-                    // in the mean time, matched or cancelled somewhere else
-                    continue;
-                }
-            }
-            else if (status != desired_status) {
-                // too late to cancel
-                continue;
-            }
+    if (cmonitor->env != NULL) {
+        enif_free_env(cmonitor->env);
+    }
+}
 
-            // TODO send message
+static void cmonitor_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon) {
+    LOG("cdown: cmonitor=%p", obj);
+    cmonitor_t* cmonitor = (cmonitor_t*) obj;
+    batch_id_t batch_id = cmonitor->batch_id;
+    offset_t offset = cmonitor->offset;
+
+    LOG("cdown: get broker %llu", cmonitor->broker_term);
+    broker_t* broker = NULL;
+    assert(get_broker(cmonitor->env, cmonitor->broker_term, &broker));
+
+    thread_id_t thread_id = get_or_assign_thread_id();
+    LOG("cdown: thread id=%u", thread_id);
+    local_state_t* local_state = &broker->local_states[thread_id];
+
+    batch_t* batch = NULL;
+    bool present_in_local = false;
+
+    LOG("cdown: looking up batch %u", batch_id);
+    if (cbroker_omap_lookup(local_state->batches, batch_id, (void**) &batch)) {
+        present_in_local = true;
+    } else {
+        LOG("cdown: looking up batch %u in global state", batch_id);
+        global_state_t* global_state = &broker->global_state;
+        enif_mutex_lock(broker->global_lock);
+        if (cbroker_omap_lookup(global_state->batches, batch_id, (void**) &batch)) {
+            atomic_fetch_add_explicit(&batch->ref_count, 1, memory_order_relaxed);
         }
+        enif_mutex_unlock(broker->global_lock);
+    }
+
+    LOG("cdown: cell offset is %u", offset);
+    cell_t* cell = &batch->cells[offset];
+    ERL_NIF_TERM status = enif_make_pid(caller_env, pid);
+    ERL_NIF_TERM pid_term = enif_make_pid(caller_env, pid);
+    bool was_consumed = false;
+
+    if (atomic_compare_exchange_strong(&cell->status, &status, Atoms._cancelled)) {
+        LOG("cdown: cancelled %s", "");
+        /* We set the match to self in case the enqueuing NIF call still hasn't
+         * written `match_t` to status; this will signal it that it needs to free
+         * the match.
+         */
+        void *match = NULL;
+        atomic_compare_exchange_strong(&cell->match, &match, (match_t *)pid_term);
+
+        was_consumed = consume_batch_slot(broker, local_state, batch, present_in_local);
+    }
+
+    if (!was_consumed && !present_in_local) {
+        lower_refcount_and_remove_from_global_if_needed(broker, batch);
+    }
+
+    //
+
+    if (cmonitor->env != NULL) {
+        enif_free_env(cmonitor->env);
+        cmonitor->env = NULL;
     }
 }
 
@@ -635,11 +930,26 @@ static void broker_resource_load(ErlNifEnv* caller_env) {
     assert(ResourceTypes.broker != NULL);
 }
 
+static void cmonitor_resource_load(ErlNifEnv* caller_env) {
+    ErlNifResourceTypeInit callbacks = {cmonitor_dtor, NULL, cmonitor_down, 3, NULL};
+    ErlNifResourceFlags flags = ERL_NIF_RT_CREATE;
+
+    ResourceTypes.cmonitor = enif_init_resource_type(
+        caller_env, 
+        "cbroker.cmonitor",
+        &callbacks,
+        flags,
+        &flags
+    );
+    assert(ResourceTypes.cmonitor != NULL);
+}
+
 static int nif_load(ErlNifEnv* caller_env, void** priv_data, ERL_NIF_TERM load_info) {
     init_atoms(caller_env);
 
     memset(&ResourceTypes, 0, sizeof(ResourceTypes));
     broker_resource_load(caller_env);
+    cmonitor_resource_load(caller_env);
 
     return 0;
 }

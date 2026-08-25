@@ -83,4 +83,4 @@ sup_flags() ->
     }.
 
 child_specs() ->
-    [].
+    [cbroker_serv:child_spec(test)].
