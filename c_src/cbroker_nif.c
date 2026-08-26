@@ -576,8 +576,7 @@ static ERL_NIF_TERM ask(ask_ctx_t* ctx, ask_out_t* out) {
 
     ////
 
-    // FIXME
-    const int max_attempts = 2; //MIN(100, MAX(5, ctx->broker->nr_of_cells_per_batch / 2));
+    const int max_attempts = MIN(100, MAX(5, ctx->broker->nr_of_cells_per_batch / 2));
 
     for (int attempt_nr = 0; attempt_nr < max_attempts; attempt_nr++) {
         skipped_batch = NULL;
@@ -673,7 +672,7 @@ niff_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
     memset(broker, 0, sizeof(broker_t));
 
     broker->nr_of_schedulers = nr_of_schedulers;
-    broker->nr_of_cells_per_batch = 10 * 1024 * 1024; // FIXME
+    broker->nr_of_cells_per_batch = 32 * nr_of_schedulers;
     broker->global_lock = enif_mutex_create("cbroker.mutex");
 
     broker->global_state.batches = cbroker_omap_new();
