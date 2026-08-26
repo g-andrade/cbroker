@@ -170,7 +170,7 @@ typedef struct {
 
 static const thread_id_t get_or_assign_thread_id() {
     if (my_thread_id == -1) {
-        my_thread_id = atomic_fetch_add_explicit(&next_thread_id, 1, memory_order_relaxed);
+        my_thread_id = atomic_fetch_add_explicit(&next_thread_id, 1, memory_order_seq_cst);
     }
     assert(my_thread_id >= 0);
     return my_thread_id;
@@ -329,6 +329,7 @@ static void notify_other_of_match(ask_ctx_t* ctx, ask_out_t* success) {
 }
 
 static batch_t* batch_new(const batch_id_t id, const size_t nr_of_cells) {
+    LOG("NEW BATCH!! %u", id);
     const size_t size = sizeof(batch_t) + (nr_of_cells * sizeof(cell_t));
 
     batch_t* batch = enif_alloc(size);
@@ -427,7 +428,7 @@ static bool batch_lookup(broker_t* broker, local_state_t* local_state, batch_id_
         global_state_t* global_state = &broker->global_state;
         enif_mutex_lock(broker->global_lock);
         if (cbroker_omap_lookup(global_state->batches, batch_id, (void**) &batch)) {
-            atomic_fetch_add_explicit(&batch->ref_count, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&batch->ref_count, 1, memory_order_seq_cst);
             enif_mutex_unlock(broker->global_lock);
             out_handle->batch = batch;
             out_handle->found_locally = false;
@@ -447,8 +448,8 @@ static ERL_NIF_TERM batch_ask(ask_ctx_t* ctx, batch_t* batch, ask_out_t* out) {
 
     offset = (
         ctx->is_left ?
-        atomic_fetch_add_explicit(&batch->left_count, 1, memory_order_relaxed)
-        : atomic_fetch_add_explicit(&batch->right_count, 1, memory_order_relaxed)
+        atomic_fetch_add_explicit(&batch->left_count, 1, memory_order_seq_cst)
+        : atomic_fetch_add_explicit(&batch->right_count, 1, memory_order_seq_cst)
     );
 
     if (offset >= batch->nr_of_cells) {
@@ -489,10 +490,12 @@ static batch_t* get_next_batch(ask_ctx_t* ctx, const batch_id_t prev_batch_id) {
                 cbroker_omap_insert(global_state->batches, next_batch_id, next_batch)
                 == CBROKER_OMAP_OK
             );
-            atomic_fetch_add_explicit(&next_batch->ref_count, 2, memory_order_relaxed);
+            atomic_store_explicit(&next_batch->ref_count, 2, memory_order_seq_cst);
         }
         else {
-            atomic_fetch_add_explicit(&next_batch->ref_count, 1, memory_order_relaxed);
+            size_t ref_count = 1 + atomic_fetch_add_explicit(&next_batch->ref_count, 1, memory_order_seq_cst);
+            LOG("ASC||| REF COUNT for batch %u: %u", next_batch_id, ref_count);
+            assert(ref_count >= 1);
         }
 
         enif_mutex_unlock(broker->global_lock);
@@ -519,25 +522,40 @@ static void batch_lower_ref_count(broker_t* broker, local_state_t* local_state, 
     assert(batch != NULL);
 
     batch_id_t batch_id = batch->id;
-    size_t ref_count = atomic_fetch_sub_explicit(&batch->ref_count, 1, memory_order_relaxed) - 1;
+    size_t ref_count = atomic_fetch_sub_explicit(&batch->ref_count, 1, memory_order_seq_cst) - 1;
+    LOG("DESC REF COUNT for batch %u: %u", batch_id, ref_count);
     assert(ref_count >= 1);
 
-    if (ref_count == 1) {
-        if (handle->found_locally) {
-            cbroker_omap_delete_and_next(local_state->batches, batch_id, NULL, NULL, NULL);
-        }
+    if (handle->found_locally) {
+        cbroker_omap_delete_and_next(local_state->batches, batch_id, NULL, NULL, NULL);
+    }
 
+    if (ref_count == 1) {
         global_state_t* global_state = &broker->global_state;
         enif_mutex_lock(broker->global_lock);
 
         if (cbroker_omap_lookup(global_state->batches, batch_id, (void**) &batch)) {
-            ref_count = atomic_load(&batch->ref_count);
+            ref_count = atomic_load_explicit(&batch->ref_count, memory_order_seq_cst);
             assert(ref_count >= 1);
 
             if (ref_count == 1) {
-                cbroker_omap_delete_and_next(global_state->batches, batch_id, NULL, NULL, NULL);
+                bool has_next = true;
+                cbroker_omap_delete_and_next(global_state->batches, batch_id, &has_next, NULL, NULL);
                 LOG("CONSUME: batch %u deleted", batch_id);
+                memset(batch, 0, sizeof(batch_t) + (batch->nr_of_cells * sizeof(cell_t)));
                 enif_free(batch);
+
+                if (! has_next) {
+                    // we create the next batch right away, ensuring batch IDs are not reused
+                    // by a thread that lagged behind.
+                    batch_id_t next_batch_id = batch_id + 1;
+                    batch_t* next_batch = batch_new(next_batch_id, broker->nr_of_cells_per_batch);
+                    assert(
+                        cbroker_omap_insert(global_state->batches, next_batch_id, next_batch)
+                        == CBROKER_OMAP_OK
+                    );
+                    atomic_store_explicit(&next_batch->ref_count, 1, memory_order_seq_cst);
+                }
             }
         }
 
@@ -587,6 +605,7 @@ static ERL_NIF_TERM ask(ask_ctx_t* ctx, ask_out_t* out) {
         }
 
         batch = get_next_batch(ctx, batch_id);
+        batch_id = batch->id;
     } 
 
     return Atoms._retry;
@@ -595,7 +614,7 @@ static ERL_NIF_TERM ask(ask_ctx_t* ctx, ask_out_t* out) {
 
 static void consume_batch_slot(broker_t* broker, local_state_t* local_state, batch_handle_t* handle) {
     batch_t* batch = handle->batch;
-    size_t consumed_count = 1 + atomic_fetch_add_explicit(&batch->consumed_count, 1, memory_order_relaxed);
+    size_t consumed_count = 1 + atomic_fetch_add_explicit(&batch->consumed_count, 1, memory_order_seq_cst);
 
     if (consumed_count < batch->nr_of_cells) {
         return;
@@ -636,7 +655,7 @@ niff_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
     broker->nr_of_schedulers = nr_of_schedulers;
 
     broker->nr_of_cells_per_batch = 4 * nr_of_schedulers;
-    //broker->nr_of_cells_per_batch = 1; // FIXME
+    //broker->nr_of_cells_per_batch = 4;
 
     broker->global_lock = enif_mutex_create("cbroker.mutex");
 
@@ -650,7 +669,7 @@ niff_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
         cbroker_omap_insert(broker->global_state.batches, first_batch_id, first_batch)
         == CBROKER_OMAP_OK
     );
-    atomic_fetch_add(&first_batch->ref_count, 1);
+    atomic_store_explicit(&first_batch->ref_count, 1, memory_order_seq_cst);
 
     
     for (size_t i=0; i < nr_of_schedulers; i++) {
@@ -663,7 +682,7 @@ niff_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
             cbroker_omap_insert(local_state->batches, first_batch_id, first_batch)
             == CBROKER_OMAP_OK
         );
-        atomic_fetch_add(&first_batch->ref_count, 1);
+        atomic_fetch_add_explicit(&first_batch->ref_count, 1, memory_order_seq_cst);
 
         local_state->left_id = first_batch_id;
         local_state->right_id = first_batch_id;
@@ -708,6 +727,7 @@ niff_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
 
     thread_id_t thread_id = get_or_assign_thread_id();
     ctx.local_state = &ctx.broker->local_states[thread_id];
+    assert(thread_id >= 0 && thread_id < ctx.broker->nr_of_schedulers);
 
     ask_out_t success;
     memset(&success, 0, sizeof(ask_out_t));
@@ -807,6 +827,7 @@ niff_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
 
     thread_id_t thread_id = get_or_assign_thread_id();
     LOG("cancel: thread id=%u", thread_id);
+    assert(thread_id >= 0 && thread_id < broker->nr_of_schedulers);
     local_state_t* local_state = &broker->local_states[thread_id];
 
     //
@@ -959,6 +980,7 @@ static void cmonitor_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlN
 
     thread_id_t thread_id = get_or_assign_thread_id();
     LOG("cdown: thread id=%u", thread_id);
+    assert(thread_id >= 0 && thread_id < broker->nr_of_schedulers);
     local_state_t* local_state = &broker->local_states[thread_id];
 
     //
