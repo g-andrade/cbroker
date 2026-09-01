@@ -132,17 +132,21 @@ bench1(Impl, TotalPidsAmount, Iterations) ->
     LeftPids = launch_processes(SidePidsAmount, LeftFun, Iterations),
     RightPids = launch_processes(SidePidsAmount, RightFun, Iterations),
 
-    PidSet = maps:from_keys(LeftPids ++ RightPids, v),
+    Pids = pids_join(LeftPids, RightPids),
+    PidSet = maps:from_keys(Pids, v),
 
+    lists:foreach(fun erlang:garbage_collect/1, processes()),
+    erlang:garbage_collect(),
+    %logger:notice("Starting..."),
     StartTs = erlang:monotonic_time(),
-    processes_send(LeftPids, RightPids, go),
+    processes_send(Pids, go),
     receive_done(PidSet),
     FinishTs = erlang:monotonic_time(),
 
     logger:debug("Collecting stats!"),
     timer:sleep(100),
 
-    processes_send(LeftPids, RightPids, stats),
+    processes_send(Pids, stats),
     Samples = receive_results(PidSet),
 
     TotalSamples = length(Samples),
@@ -408,11 +412,15 @@ receive_results(PidSet) when map_size(PidSet) > 0 ->
 receive_results(#{}) ->
     [].
 
-processes_send([Pid1 | Next1], [Pid2 | Next2], Msg) ->
-    Pid1 ! Msg,
-    Pid2 ! Msg,
-    processes_send(Next1, Next2, Msg);
-processes_send([], [], _) ->
+pids_join([LeftPid | NextLeft], [RightPid | NextRight]) ->
+    [LeftPid, RightPid | pids_join(NextLeft, NextRight)];
+pids_join([], []) ->
+    [].
+
+processes_send([Pid | Next], Msg) ->
+    Pid ! Msg,
+    processes_send(Next, Msg);
+processes_send([], _) ->
     ok.
 
 launch_processes(Amount, RunFun, Iterations) when Amount > 0 ->
@@ -427,6 +435,7 @@ launch_processes(0, _, _) ->
 start_process(Parent, RunFun, Iterations) ->
     receive
         go ->
+            erlang:yield(),
             Samples = run_process(RunFun, Iterations),
             _ = Parent ! {done, self()},
 

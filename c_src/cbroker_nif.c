@@ -806,6 +806,7 @@ niff_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
         }
     }
 
+    enif_consume_timeslice(env, 100);
     return match_res;
 }
 
