@@ -326,7 +326,7 @@ cbroker_iteration_recur(StartTs, Broker, Side, RetryCount) ->
         {await, Ticket} ->
             cbroker_iteration_await(StartTs, Ticket);
         %
-        {match, _} ->
+        {match, _, _} ->
             FinalTs = erlang:monotonic_time(),
             
             case RetryCount of
@@ -344,7 +344,7 @@ cbroker_iteration_await(StartTs, Ticket) ->
     receive
         {T, Result} when T =:= Ticket ->
             FinalTs = erlang:monotonic_time(),
-            {match, _} = Result,
+            {match, _, _} = Result,
             {blocked, FinalTs - StartTs}
     end.
     
@@ -469,7 +469,7 @@ ask_side(Name, Side, Value, Timeout) ->
                 {await, Ticket} ->
                     await_after_ask(Broker, Ticket, Timeout);
                 %
-                {match, _} = Match ->
+                {match, _, _} = Match ->
                     Match;
                 %
                 retry ->
