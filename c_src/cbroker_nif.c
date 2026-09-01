@@ -270,6 +270,7 @@ static ERL_NIF_TERM make_await(ErlNifEnv* env, ERL_NIF_TERM tag) {
 
 static ERL_NIF_TERM make_match(ErlNifEnv* env, ERL_NIF_TERM match_ref, ERL_NIF_TERM exchange_value) {
     return enif_make_tuple3(env, Atoms._match, match_ref, exchange_value);
+    //return enif_make_tuple2(env, Atoms._match, exchange_value);
 }
 
 //static ERL_NIF_TERM make_match_msg(ErlNifEnv* env, ERL_NIF_TERM tag, ERL_NIF_TERM exchange_value) {
@@ -321,7 +322,7 @@ static void pool_return(mempool_t* pool, void* obj) {
 }
 
 static void pool_init(mempool_t* pool) {
-    const size_t initial_size = 1024; // FIXME
+    const size_t initial_size = 0; // FIXME
     pool->size = initial_size;
     pool->array = enif_alloc(pool->size * sizeof(void*));
 
@@ -775,12 +776,13 @@ static ERL_NIF_TERM ask(ask_ctx_t* ctx, ask_out_t* out) {
     batch_id_t batch_id = (ctx->is_left ? local_state->left_id : local_state->right_id);
     batch_t* batch = NULL;
     batch_t* skipped_batch = NULL;
+    bool should_continue = true;
 
     ////
 
     const int max_attempts = MIN(100, MAX(5, ctx->broker->nr_of_cells_per_batch / 2));
 
-    for (int attempt_nr = 0; attempt_nr < max_attempts; attempt_nr++) {
+    for (int attempt_nr = 0; (attempt_nr < max_attempts) && should_continue; attempt_nr++) {
         skipped_batch = NULL;
         if (batch == NULL) {
             cbroker_omap_lookup(local_state->batches, batch_id, (void**) &batch);
@@ -809,6 +811,9 @@ static ERL_NIF_TERM ask(ask_ctx_t* ctx, ask_out_t* out) {
                 return match_res;
             }
         }
+
+        int timeslice_percent = 100 * attempt_nr / max_attempts;
+        should_continue = !enif_consume_timeslice(ctx->env, timeslice_percent);
 
         batch = get_next_batch(ctx, batch_id);
         batch_id = batch->id;
@@ -1014,7 +1019,7 @@ niff_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
         consume_local_batch_slot(ctx.broker, ctx.local_state, success.batch);
     }
 
-    enif_consume_timeslice(env, 100);
+    //enif_consume_timeslice(env, 100);
     return match_res;
 }
 
