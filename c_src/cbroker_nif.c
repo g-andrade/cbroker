@@ -19,18 +19,14 @@
     X(_batch_full,           "batch_full")  \
     X(_cancelled,            "cancelled") \
     X(_delayed_match,        "delayed_match") \
-    X(_empty,                "empty")  \
     X(_instant_match_first,  "instant_match_first") \
     X(_instant_match_second, "instant_match_second") \
     X(_left,                 "left")  \
     X(_match,                "match") \
-    X(_matched,              "matched") \
     X(_none,                 "none") \
-    X(_ok,                   "ok")  \
     X(_retry,                "retry") \
     X(_right,                "right") \
     X(_self_stopped,         "self_stopped") \
-    X(_todo,                 "todo") \
     X(_too_late,             "too_late") \
     X(_true,                 "true")
 /* clang-format on */
@@ -116,7 +112,6 @@ typedef struct {
 
 typedef struct {
     cbroker_omap_t* batches;
-    // batch_id_t min_id;
 } global_state_t;
 
 //
@@ -209,12 +204,13 @@ static void batch_lower_ref_count(broker_t* broker, local_state_t* local_state,
                                   batch_handle_t* handle);
 static batch_t* batch_get_next(ask_ctx_t* ctx, const batch_id_t prev_batch_id);
 
-static void* match_alloc();
+static void* match_alloc(void);
 static match_t* match_new_monitored(ask_ctx_t* ctx, batch_id_t batch_id, offset_t offset);
 static match_t* match_new_unmonitored(ask_ctx_t* ctx, batch_id_t batch_id, offset_t offset);
 static void match_demonitor_and_free(ErlNifEnv* caller_env, local_state_t* local_state,
                                      match_t** match_ptr);
-static void match_clear(match_t* match);
+static void match_clear(void* match);
+static void match_free(void* match);
 
 static void notify_of_match(ask_ctx_t* ctx, ErlNifPid* pid, match_t** match_ptr,
                             const ERL_NIF_TERM side, const batch_id_t batch_id,
@@ -225,6 +221,9 @@ static void notify_of_cancellation(ErlNifEnv* env, local_state_t* local_state,
 
 static ErlNifEnv* env_pool_get(local_state_t* local_state);
 static void env_pool_return(local_state_t* local_state, ErlNifEnv* env);
+static void* env_pool_alloc_env(void);
+static void env_pool_clear_env(void* env);
+static void env_pool_free_env(void* env);
 
 static match_t* match_pool_get(local_state_t* local_state);
 static void match_pool_return(local_state_t* local_state, match_t* match);
@@ -247,7 +246,7 @@ static ERL_NIF_TERM make_tag(ask_ctx_t* ctx, batch_id_t batch_id, offset_t offse
 static ERL_NIF_TERM make_tag_simple(ErlNifEnv* env, ERL_NIF_TERM side, batch_id_t batch_id,
                                     offset_t offset);
 
-static const thread_id_t get_or_assign_thread_id();
+static const thread_id_t get_or_assign_thread_id(void);
 
 static void broker_dtor(ErlNifEnv* caller_env, void* obj);
 static void batch_free_assert_presence_in_global(uint64_t key, void* value, void* ctx);
@@ -372,14 +371,14 @@ static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         local_state->left_id = first_batch_id;
         local_state->right_id = first_batch_id;
 
-        local_state->env_pool.alloc_cb = (void* (*)())enif_alloc_env;
-        local_state->env_pool.clear_cb = (void (*)(void*))enif_clear_env;
-        local_state->env_pool.free_cb = (void (*)(void*))enif_free_env;
+        local_state->env_pool.alloc_cb = env_pool_alloc_env;
+        local_state->env_pool.clear_cb = env_pool_clear_env;
+        local_state->env_pool.free_cb = env_pool_free_env;
         mempool_init(&local_state->env_pool);
 
-        local_state->match_pool.alloc_cb = (void* (*)())match_alloc;
-        local_state->match_pool.clear_cb = (void (*)(void*))match_clear;
-        local_state->match_pool.free_cb = (void (*)(void*))enif_free;
+        local_state->match_pool.alloc_cb = match_alloc;
+        local_state->match_pool.clear_cb = match_clear;
+        local_state->match_pool.free_cb = match_free;
         mempool_init(&local_state->match_pool);
     }
 
@@ -1165,7 +1164,9 @@ static void match_demonitor_and_free(ErlNifEnv* caller_env, local_state_t* local
     *match_ptr = NULL;
 }
 
-static void match_clear(match_t* match) { memset(match, 0, sizeof(match_t)); }
+static void match_clear(void* match) { memset(match, 0, sizeof(match_t)); }
+
+static void match_free(void* match) { enif_free((match_t*)match); }
 
 /*********************************************************************/
 
@@ -1320,6 +1321,12 @@ static void env_pool_return(local_state_t* local_state, ErlNifEnv* env)
     assert(env != NULL);
     mempool_return(&local_state->env_pool, env);
 }
+
+static void* env_pool_alloc_env() { return (void*)enif_alloc_env(); }
+
+static void env_pool_clear_env(void* env) { enif_clear_env((ErlNifEnv*)env); }
+
+static void env_pool_free_env(void* env) { enif_free_env((ErlNifEnv*)env); }
 
 /*********************************************************************/
 
@@ -1536,5 +1543,3 @@ static void cmonitor_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlN
         cmonitor->env = NULL;
     }
 }
-
-/*********************************************************************/
