@@ -48,6 +48,27 @@ static size_t omap_search(const cbroker_omap_t* map, uint64_t key, bool* found) 
     size_t lo = map->head;
     size_t hi = map->tail;
 
+    if (lo == hi) {
+        *found = false;
+        return hi;
+    }
+
+    /* Both hot cases -- the smallest key, and the newest (largest) one -- are
+     * settled without entering the loop. */
+    if (key <= map->keys[lo]) {
+        *found = (key == map->keys[lo]);
+        return lo;
+    }
+    if (key >= map->keys[hi - 1]) {
+        *found = (key == map->keys[hi - 1]);
+        return *found ? hi - 1 : hi;
+    }
+
+    /* Both endpoints are now known to differ from `key`, and to bracket it, so
+     * the answer is strictly interior: keys[head] < key < keys[tail - 1]. */
+    lo++;
+    hi--;
+
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
         if (map->keys[mid] < key) {
@@ -335,7 +356,16 @@ bool cbroker_omap_next(const cbroker_omap_t* map,
                        uint64_t* key_out,
                        void** value_out) {
     bool found;
-    size_t idx = omap_search(map, key, &found);
+    size_t idx;
+
+    /* The common call is "successor of the largest key", which get_next_batch
+     * makes on every batch advance and which has no answer. One compare
+     * settles it, and an empty map, without a search. */
+    if (map->head == map->tail || key >= map->keys[map->tail - 1]) {
+        return false;
+    }
+
+    idx = omap_search(map, key, &found);
 
     /* omap_search lands on the first key >= `key`, which is already the
      * successor unless it is `key` itself. */

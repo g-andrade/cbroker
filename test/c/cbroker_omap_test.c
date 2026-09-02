@@ -325,6 +325,85 @@ static void test_extremes(void) {
     cbroker_omap_destroy(map, NULL, NULL);
 }
 
+/* omap_search short-circuits at both endpoints and cbroker_omap_next
+ * short-circuits at the largest key. Those branches carry the lower-bound
+ * contract that insert() depends on, so pin them down explicitly rather than
+ * leaving them to the randomised run. */
+static void test_endpoint_fast_paths(void) {
+    cbroker_omap_t* map = cbroker_omap_new();
+    uint64_t key = 0;
+    void* value = NULL;
+
+    CASE("endpoint fast paths");
+
+    /* Empty: every path must bail without touching keys[]. */
+    CHECK(!cbroker_omap_lookup(map, 10, &value));
+    CHECK(!cbroker_omap_next(map, 10, &key, &value));
+
+    /* Single entry -- head and tail are the same slot. */
+    CHECK(cbroker_omap_insert(map, 20, (void*)0x20) == CBROKER_OMAP_OK);
+    CHECK(cbroker_omap_lookup(map, 20, &value) && value == (void*)0x20);
+    CHECK(!cbroker_omap_lookup(map, 19, &value));
+    CHECK(!cbroker_omap_lookup(map, 21, &value));
+    CHECK(cbroker_omap_next(map, 19, &key, &value) && key == 20);
+    CHECK(!cbroker_omap_next(map, 20, &key, &value));
+    CHECK(!cbroker_omap_next(map, 21, &key, &value));
+
+    /* Two entries: the interior narrowing is empty. */
+    CHECK(cbroker_omap_insert(map, 40, (void*)0x40) == CBROKER_OMAP_OK);
+    CHECK(cbroker_omap_lookup(map, 20, &value) && value == (void*)0x20);
+    CHECK(cbroker_omap_lookup(map, 40, &value) && value == (void*)0x40);
+    CHECK(!cbroker_omap_lookup(map, 30, &value));
+    CHECK(cbroker_omap_next(map, 20, &key, &value) && key == 40);
+    CHECK(cbroker_omap_next(map, 30, &key, &value) && key == 40);
+    CHECK(!cbroker_omap_next(map, 40, &key, &value));
+
+    /* Three or more: endpoints short-circuit, the middle goes through the
+     * loop, and an interior miss still lands on the lower bound (which is
+     * what insert() relies on to place a new key). */
+    CHECK(cbroker_omap_insert(map, 30, (void*)0x30) == CBROKER_OMAP_OK);
+    CHECK(cbroker_omap_insert(map, 60, (void*)0x60) == CBROKER_OMAP_OK);
+    CHECK(cbroker_omap_lookup(map, 30, &value) && value == (void*)0x30);
+    CHECK(!cbroker_omap_lookup(map, 35, &value));
+    CHECK(cbroker_omap_next(map, 35, &key, &value) && key == 40);
+    CHECK(cbroker_omap_next(map, 40, &key, &value) && key == 60);
+    CHECK(!cbroker_omap_next(map, 60, &key, &value));
+    CHECK(!cbroker_omap_next(map, UINT64_MAX, &key, &value));
+
+    /* Insert into each of the three regions the fast paths partition. */
+    CHECK(cbroker_omap_insert(map, 10, (void*)0x10) == CBROKER_OMAP_OK); /* below head */
+    CHECK(cbroker_omap_insert(map, 50, (void*)0x50) == CBROKER_OMAP_OK); /* interior */
+    CHECK(cbroker_omap_insert(map, 70, (void*)0x70) == CBROKER_OMAP_OK); /* above tail */
+    CHECK(cbroker_omap_size(map) == 7);
+    {
+        const uint64_t expected_keys[] = {10, 20, 30, 40, 50, 60, 70};
+        void* const expected_values[] = {(void*)0x10, (void*)0x20, (void*)0x30,
+                                         (void*)0x40, (void*)0x50, (void*)0x60,
+                                         (void*)0x70};
+        size_t i = 0;
+        bool more = cbroker_omap_first(map, &key, &value);
+        while (more) {
+            CHECK(i < 7 && key == expected_keys[i]);
+            CHECK(value == expected_values[i]);
+            i++;
+            more = cbroker_omap_next(map, key, &key, &value);
+        }
+        CHECK(i == 7);
+    }
+
+    /* Same checks with head > 0, so the endpoint probes are exercised against
+     * a window that does not start at slot 0. */
+    CHECK(cbroker_omap_delete_and_next(map, 10, NULL, NULL, NULL));
+    CHECK(cbroker_omap_delete_and_next(map, 20, NULL, NULL, NULL));
+    CHECK(cbroker_omap_lookup(map, 30, &value) && value == (void*)0x30);
+    CHECK(!cbroker_omap_lookup(map, 20, &value));
+    CHECK(!cbroker_omap_lookup(map, 10, &value));
+    CHECK(cbroker_omap_next(map, 10, &key, &value) && key == 30);
+    CHECK(!cbroker_omap_next(map, 70, &key, &value));
+
+    cbroker_omap_destroy(map, NULL, NULL);
+}
+
 static void test_growth_and_drain(void) {
     cbroker_omap_t* map = cbroker_omap_new();
     const uint64_t n = 5000;
@@ -586,6 +665,7 @@ int main(int argc, char** argv) {
     test_duplicate_and_null_value();
     test_delete_and_next_positions();
     test_extremes();
+    test_endpoint_fast_paths();
     test_growth_and_drain();
     test_sliding_window_is_stable();
     test_allocation_failure();

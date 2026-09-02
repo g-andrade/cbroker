@@ -24,12 +24,29 @@ OMAP_CFLAGS = -include omap_test_alloc.h \
 SEED ?= 0x9E3779B97F4A7C15
 ITERATIONS ?= 200000
 
+gen_verbose_0 = @echo " GEN   " $(@F);
+gen_verbose = $(gen_verbose_$(V))
+
 all: cbroker_omap_test
 .PHONY: all
 
+cbroker_omap_test: compile_flags.txt
 cbroker_omap_test: cbroker_omap_test.c $(C_SRC_DIR)/cbroker_omap.c $(C_SRC_DIR)/cbroker_omap.h omap_test_alloc.h
 	$(CC) $(CFLAGS) $(SANITIZERS) $(OMAP_CFLAGS) \
 		cbroker_omap_test.c $(C_SRC_DIR)/cbroker_omap.c -o $@
+
+# clangd resolves cbroker_omap.h and the -D/-include the test build relies on by
+# reading compile_flags.txt from this directory: one compiler argument per line.
+# Generated rather than committed, because CFLAGS expands to an absolute
+# C_SRC_DIR. Regenerated on every build, but only rewritten when the contents
+# actually change, so clangd does not needlessly re-index. Mirrors the rule in
+# c_src/Makefile.
+compile_flags.txt: FORCE
+	$(gen_verbose) printf '%s\n' -xc $(CFLAGS) $(OMAP_CFLAGS) $(CPPFLAGS) > $@.tmp; \
+		if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv $@.tmp $@; fi
+
+FORCE:
+.PHONY: FORCE
 
 test: cbroker_omap_test
 	./cbroker_omap_test $(SEED) $(ITERATIONS)
@@ -45,6 +62,6 @@ test-fuzz: cbroker_omap_test
 .PHONY: test-fuzz
 
 clean:
-	@rm -f cbroker_omap_test
+	@rm -f cbroker_omap_test compile_flags.txt
 	@rm -rf cbroker_omap_test.dSYM
 .PHONY: clean

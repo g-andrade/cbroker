@@ -44,7 +44,15 @@
 
 /*********************************************************************/
 
+/* A negative value low enough that an attempt to match can never reset the cell
+ * from its cancelled state 
+ */
 #define CELL_COUNT_CANCELLED -10
+
+/* Determined very informally, can probably be optimized (and different between
+ * match and envs pools)
+ */
+#define TARGET_MEMPOOL_SIZE 8
 
 /*********************************************************************/
 
@@ -271,16 +279,7 @@ static ERL_NIF_TERM make_await(ErlNifEnv* env, ERL_NIF_TERM tag) {
 
 static ERL_NIF_TERM make_match(ErlNifEnv* env, ERL_NIF_TERM match_ref, ERL_NIF_TERM exchange_value) {
     return enif_make_tuple3(env, Atoms._match, match_ref, exchange_value);
-    //return enif_make_tuple2(env, Atoms._match, exchange_value);
 }
-
-//static ERL_NIF_TERM make_match_msg(ErlNifEnv* env, ERL_NIF_TERM tag, ERL_NIF_TERM exchange_value) {
-//    return enif_make_tuple2(env, tag, enif_make_tuple2(env, Atoms._match, exchange_value));
-//}
-
-//static int get_batch(ErlNifEnv* env, ERL_NIF_TERM term, batch_t** out) {
-//    return enif_get_resource(env, term, ResourceTypes.batch, (void**) out);
-//}
 
 /*********************************************************************/
 
@@ -302,8 +301,10 @@ static void* pool_get(mempool_t* pool) {
     }
 }
 
+#define MAGIC 8
+
 static void pool_return(mempool_t* pool, void* obj) {
-    if (pool->count >= 2048) { // FIXME
+    if (pool->count >= TARGET_MEMPOOL_SIZE) { // FIXME
         pool->free_cb(obj);
         return;
     }
@@ -323,7 +324,7 @@ static void pool_return(mempool_t* pool, void* obj) {
 }
 
 static void pool_init(mempool_t* pool) {
-    const size_t initial_size = 0; // FIXME
+    const size_t initial_size = TARGET_MEMPOOL_SIZE;
     pool->size = initial_size;
     pool->array = enif_alloc(pool->size * sizeof(void*));
 
@@ -1138,6 +1139,10 @@ niff_to_list(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
         return make_badarg(env, argv[0]);
     }
 
+    ERL_NIF_TERM env_pools_atom = enif_make_atom(env, "env_pools");
+    ERL_NIF_TERM match_pools_atom = enif_make_atom(env, "match_pools");
+    ERL_NIF_TERM batches_atom = enif_make_atom(env, "batches");
+
     ERL_NIF_TERM empty_atom = enif_make_atom(env, "");
     ERL_NIF_TERM set_atom = enif_make_atom(env, "!!");
     ERL_NIF_TERM id_atom = enif_make_atom(env, "batch_id");
@@ -1228,7 +1233,31 @@ niff_to_list(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
 
     /// Return
 
-    return enif_make_list_from_array(env, batch_terms, nr_of_batches);
+    ERL_NIF_TERM output_terms[3];
+
+    ERL_NIF_TERM env_pool_terms[broker->nr_of_schedulers];
+    ERL_NIF_TERM match_pool_terms[broker->nr_of_schedulers];
+
+    for (size_t i = 0; i < broker->nr_of_schedulers; i++) {
+        local_state_t* local_state = &broker->local_states[i];
+
+        size_t env_pool_count = local_state->env_pool.count;
+        env_pool_terms[i] = enif_make_uint64(env, env_pool_count);
+
+        size_t match_pool_count = local_state->match_pool.count;
+        match_pool_terms[i] = enif_make_uint64(env, match_pool_count);
+    }
+
+    ERL_NIF_TERM env_pools_list = enif_make_list_from_array(env, env_pool_terms, broker->nr_of_schedulers);
+    output_terms[0] = enif_make_tuple2(env, env_pools_atom, env_pools_list);
+
+    ERL_NIF_TERM match_pools_list = enif_make_list_from_array(env, match_pool_terms, broker->nr_of_schedulers);
+    output_terms[1] = enif_make_tuple2(env, match_pools_atom, match_pools_list);
+    
+    ERL_NIF_TERM batches_list = enif_make_list_from_array(env, batch_terms, nr_of_batches);
+    output_terms[2] = enif_make_tuple2(env, batches_atom, batches_list);
+
+    return enif_make_list_from_array(env, output_terms, 3);
 }
 
 //

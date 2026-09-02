@@ -18,6 +18,8 @@ rebar3.crashdump
 /priv/
 # generated from CFLAGS by c_src/Makefile; holds machine-specific include paths
 /c_src/compile_flags.txt
+/test/c/compile_flags.txt
+/test/c/cbroker_omap_test
 
 # editors
 *.swp
