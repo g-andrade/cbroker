@@ -35,10 +35,23 @@ test: eunit ct
 .NOTPARALLEL: test
 .PHONY: test
 
-format:
-	@rebar3 fmt
+C_SOURCES := $(wildcard c_src/*.c c_src/*.h test/c/*.c test/c/*.h)
+
+format: format-erl format-c
 .NOTPARALLEL: format
 .PHONY: format
+
+format-erl:
+	@rebar3 fmt
+.PHONY: format-erl
+
+format-c:
+	@if command -v clang-format >/dev/null 2>&1; then \
+		clang-format -i $(C_SOURCES); \
+	else \
+		echo >&2 "WARN: skipping clang-format"; \
+	fi
+.PHONY: format-c
 
 ## Tests
 
@@ -52,14 +65,25 @@ eunit:
 
 ## Checks
 
-check-formatted:
+check-formatted: check-formatted-erl check-formatted-c
+.NOTPARALLEL: check-formatted
+.PHONY: check-formatted
+
+check-formatted-erl:
 	@if rebar3 plugins list | grep '^erlfmt\>' >/dev/null; then \
 		rebar3 fmt --check; \
 	else \
 		echo >&2 "WARN: skipping rebar3 erlfmt check"; \
 	fi
-.NOTPARALLEL: check-formatted
-.PHONY: check-formatted
+.PHONY: check-formatted-erl
+
+check-formatted-c:
+	@if command -v clang-format >/dev/null 2>&1; then \
+		clang-format --dry-run --Werror $(C_SOURCES); \
+	else \
+		echo >&2 "WARN: skipping clang-format check"; \
+	fi
+.PHONY: check-formatted-c
 
 xref:
 	@rebar3 xref

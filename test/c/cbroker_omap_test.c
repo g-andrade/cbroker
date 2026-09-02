@@ -23,23 +23,22 @@ static unsigned long checks_run = 0;
 static unsigned long failures = 0;
 static const char* current_case = "";
 
-#define CHECK(cond)                                                                  \
-    do {                                                                             \
-        checks_run++;                                                                \
-        if (!(cond)) {                                                               \
-            failures++;                                                              \
-            fprintf(stderr, "FAIL %s:%d [%s]: %s\n", __FILE__, __LINE__,             \
-                    current_case, #cond);                                            \
-            if (failures > 20) {                                                      \
-                fprintf(stderr, "too many failures, giving up\n");                   \
-                exit(1);                                                             \
-            }                                                                        \
-        }                                                                            \
+#define CHECK(cond)                                                                                \
+    do {                                                                                           \
+        checks_run++;                                                                              \
+        if (!(cond)) {                                                                             \
+            failures++;                                                                            \
+            fprintf(stderr, "FAIL %s:%d [%s]: %s\n", __FILE__, __LINE__, current_case, #cond);     \
+            if (failures > 20) {                                                                   \
+                fprintf(stderr, "too many failures, giving up\n");                                 \
+                exit(1);                                                                           \
+            }                                                                                      \
+        }                                                                                          \
     } while (0)
 
-#define CASE(name)                                                                   \
-    do {                                                                             \
-        current_case = (name);                                                       \
+#define CASE(name)                                                                                 \
+    do {                                                                                           \
+        current_case = (name);                                                                     \
     } while (0)
 
 /*********************************************************************/
@@ -50,7 +49,8 @@ static long alloc_budget = -1; /* < 0: unlimited */
 static size_t live_allocations = 0;
 static unsigned long total_allocations = 0;
 
-void* omap_test_alloc(size_t size) {
+void* omap_test_alloc(size_t size)
+{
     void* ptr;
 
     if (alloc_budget == 0) {
@@ -68,7 +68,8 @@ void* omap_test_alloc(size_t size) {
     return ptr;
 }
 
-void omap_test_free(void* ptr) {
+void omap_test_free(void* ptr)
+{
     if (ptr != NULL) {
         live_allocations--;
     }
@@ -85,11 +86,10 @@ static uint64_t model_keys[MODEL_CAPACITY];
 static void* model_values[MODEL_CAPACITY];
 static size_t model_count = 0;
 
-static void model_reset(void) {
-    model_count = 0;
-}
+static void model_reset(void) { model_count = 0; }
 
-static bool model_find(uint64_t key, size_t* idx_out) {
+static bool model_find(uint64_t key, size_t* idx_out)
+{
     size_t i;
 
     for (i = 0; i < model_count && model_keys[i] < key; i++) {
@@ -98,7 +98,8 @@ static bool model_find(uint64_t key, size_t* idx_out) {
     return (i < model_count && model_keys[i] == key);
 }
 
-static bool model_insert(uint64_t key, void* value) {
+static bool model_insert(uint64_t key, void* value)
+{
     size_t idx;
 
     if (model_find(key, &idx)) {
@@ -109,8 +110,7 @@ static bool model_insert(uint64_t key, void* value) {
         exit(1);
     }
 
-    memmove(&model_keys[idx + 1], &model_keys[idx],
-            (model_count - idx) * sizeof(model_keys[0]));
+    memmove(&model_keys[idx + 1], &model_keys[idx], (model_count - idx) * sizeof(model_keys[0]));
     memmove(&model_values[idx + 1], &model_values[idx],
             (model_count - idx) * sizeof(model_values[0]));
     model_keys[idx] = key;
@@ -119,10 +119,9 @@ static bool model_insert(uint64_t key, void* value) {
     return true;
 }
 
-static bool model_delete_and_next(uint64_t key,
-                                  bool* has_next,
-                                  uint64_t* next_key,
-                                  void** next_value) {
+static bool model_delete_and_next(uint64_t key, bool* has_next, uint64_t* next_key,
+                                  void** next_value)
+{
     size_t idx;
 
     if (!model_find(key, &idx)) {
@@ -145,7 +144,8 @@ static bool model_delete_and_next(uint64_t key,
 
 /* Walks the map with first()/next() and compares it to the model entry by
  * entry -- so this also exercises the iteration pair. */
-static void check_matches_model(const cbroker_omap_t* map) {
+static void check_matches_model(const cbroker_omap_t* map)
+{
     uint64_t key;
     void* value;
     size_t i = 0;
@@ -155,7 +155,8 @@ static void check_matches_model(const cbroker_omap_t* map) {
 
     if (model_count == 0) {
         CHECK(!cbroker_omap_last(map, &key, &value));
-    } else {
+    }
+    else {
         CHECK(cbroker_omap_last(map, &key, &value));
         CHECK(key == model_keys[model_count - 1]);
         CHECK(value == model_values[model_count - 1]);
@@ -182,13 +183,15 @@ static void check_matches_model(const cbroker_omap_t* map) {
 static uint64_t value_seen_keys[MODEL_CAPACITY];
 static size_t value_seen_count = 0;
 
-static void record_freed_value(uint64_t key, void* value, void* ctx) {
+static void record_freed_value(uint64_t key, void* value, void* ctx)
+{
     CHECK(ctx == (void*)0xC0FFEE);
     CHECK(value == (void*)(uintptr_t)(key + 1));
     value_seen_keys[value_seen_count++] = key;
 }
 
-static void test_empty(void) {
+static void test_empty(void)
+{
     cbroker_omap_t* map;
     uint64_t key = 12345;
     void* value = (void*)0xDEAD;
@@ -215,7 +218,8 @@ static void test_empty(void) {
     cbroker_omap_destroy(NULL, NULL, NULL); /* tolerated */
 }
 
-static void test_single_entry(void) {
+static void test_single_entry(void)
+{
     cbroker_omap_t* map = cbroker_omap_new();
     uint64_t key = 0;
     void* value = NULL;
@@ -242,7 +246,8 @@ static void test_single_entry(void) {
     cbroker_omap_destroy(map, NULL, NULL);
 }
 
-static void test_duplicate_and_null_value(void) {
+static void test_duplicate_and_null_value(void)
+{
     cbroker_omap_t* map = cbroker_omap_new();
     void* value = (void*)0xFF;
 
@@ -262,7 +267,8 @@ static void test_duplicate_and_null_value(void) {
     cbroker_omap_destroy(map, NULL, NULL);
 }
 
-static void test_delete_and_next_positions(void) {
+static void test_delete_and_next_positions(void)
+{
     cbroker_omap_t* map = cbroker_omap_new();
     uint64_t key = 0;
     void* value = NULL;
@@ -307,7 +313,8 @@ static void test_delete_and_next_positions(void) {
     cbroker_omap_destroy(map, NULL, NULL);
 }
 
-static void test_extremes(void) {
+static void test_extremes(void)
+{
     cbroker_omap_t* map = cbroker_omap_new();
     uint64_t key = 0;
     void* value = NULL;
@@ -329,7 +336,8 @@ static void test_extremes(void) {
  * short-circuits at the largest key. Those branches carry the lower-bound
  * contract that insert() depends on, so pin them down explicitly rather than
  * leaving them to the randomised run. */
-static void test_endpoint_fast_paths(void) {
+static void test_endpoint_fast_paths(void)
+{
     cbroker_omap_t* map = cbroker_omap_new();
     uint64_t key = 0;
     void* value = NULL;
@@ -377,9 +385,8 @@ static void test_endpoint_fast_paths(void) {
     CHECK(cbroker_omap_size(map) == 7);
     {
         const uint64_t expected_keys[] = {10, 20, 30, 40, 50, 60, 70};
-        void* const expected_values[] = {(void*)0x10, (void*)0x20, (void*)0x30,
-                                         (void*)0x40, (void*)0x50, (void*)0x60,
-                                         (void*)0x70};
+        void* const expected_values[] = {(void*)0x10, (void*)0x20, (void*)0x30, (void*)0x40,
+                                         (void*)0x50, (void*)0x60, (void*)0x70};
         size_t i = 0;
         bool more = cbroker_omap_first(map, &key, &value);
         while (more) {
@@ -404,7 +411,8 @@ static void test_endpoint_fast_paths(void) {
     cbroker_omap_destroy(map, NULL, NULL);
 }
 
-static void test_growth_and_drain(void) {
+static void test_growth_and_drain(void)
+{
     cbroker_omap_t* map = cbroker_omap_new();
     const uint64_t n = 5000;
     uint64_t i;
@@ -451,7 +459,8 @@ static void test_growth_and_drain(void) {
 /* The steady state: append at the tail, remove the head. The live window walks
  * off the end of the buffer over and over, so this is what the slide path is
  * for -- and it must not keep reallocating. */
-static void test_sliding_window_is_stable(void) {
+static void test_sliding_window_is_stable(void)
+{
     cbroker_omap_t* map = cbroker_omap_new();
     const uint64_t cycles = 200000;
     unsigned long allocations_after_warmup;
@@ -465,15 +474,13 @@ static void test_sliding_window_is_stable(void) {
     for (i = 0; i < 1000; i++) {
         CHECK(cbroker_omap_delete_and_next(map, i, NULL, NULL, NULL) ||
               cbroker_omap_insert(map, i + 64, NULL) != CBROKER_OMAP_OK);
-        CHECK(cbroker_omap_insert(map, i + 64, (void*)(uintptr_t)(i + 65)) ==
-              CBROKER_OMAP_OK);
+        CHECK(cbroker_omap_insert(map, i + 64, (void*)(uintptr_t)(i + 65)) == CBROKER_OMAP_OK);
     }
     allocations_after_warmup = total_allocations;
 
     for (; i < cycles; i++) {
         CHECK(cbroker_omap_delete_and_next(map, i, NULL, NULL, NULL));
-        CHECK(cbroker_omap_insert(map, i + 64, (void*)(uintptr_t)(i + 65)) ==
-              CBROKER_OMAP_OK);
+        CHECK(cbroker_omap_insert(map, i + 64, (void*)(uintptr_t)(i + 65)) == CBROKER_OMAP_OK);
         CHECK(cbroker_omap_size(map) == 64);
     }
     CHECK(total_allocations == allocations_after_warmup);
@@ -483,7 +490,8 @@ static void test_sliding_window_is_stable(void) {
     cbroker_omap_destroy(map, NULL, NULL);
 }
 
-static void test_allocation_failure(void) {
+static void test_allocation_failure(void)
+{
     cbroker_omap_t* map;
     void* value = NULL;
     uint64_t i;
@@ -524,15 +532,15 @@ static void test_allocation_failure(void) {
     cbroker_omap_destroy(map, NULL, NULL);
 }
 
-static void test_destroy_callback(void) {
+static void test_destroy_callback(void)
+{
     cbroker_omap_t* map = cbroker_omap_new();
     uint64_t i;
 
     CASE("destroy frees every value in order");
     for (i = 0; i < 100; i++) {
         uint64_t key = (i * 37) % 100; /* scattered insert order */
-        CHECK(cbroker_omap_insert(map, key, (void*)(uintptr_t)(key + 1)) ==
-              CBROKER_OMAP_OK);
+        CHECK(cbroker_omap_insert(map, key, (void*)(uintptr_t)(key + 1)) == CBROKER_OMAP_OK);
     }
     /* Remove a few so the callback runs over a window that is not at offset 0. */
     CHECK(cbroker_omap_delete_and_next(map, 0, NULL, NULL, NULL));
@@ -553,22 +561,20 @@ static void test_destroy_callback(void) {
 
 static uint64_t rng_state;
 
-static uint64_t rng_next(void) {
+static uint64_t rng_next(void)
+{
     rng_state ^= rng_state << 13;
     rng_state ^= rng_state >> 7;
     rng_state ^= rng_state << 17;
     return rng_state;
 }
 
-static uint64_t rng_below(uint64_t bound) {
-    return rng_next() % bound;
-}
+static uint64_t rng_below(uint64_t bound) { return rng_next() % bound; }
 
-static void* value_for(uint64_t key) {
-    return (void*)(uintptr_t)(key * 2654435761u + 1);
-}
+static void* value_for(uint64_t key) { return (void*)(uintptr_t)(key * 2654435761u + 1); }
 
-static void test_random(uint64_t seed, unsigned long iterations) {
+static void test_random(uint64_t seed, unsigned long iterations)
+{
     cbroker_omap_t* map = cbroker_omap_new();
     uint64_t tail_key = 1000;
     unsigned long i;
@@ -585,11 +591,13 @@ static void test_random(uint64_t seed, unsigned long iterations) {
             /* Tail append: the dominant case, mostly consecutive keys. */
             tail_key += 1 + rng_below(3);
             key = tail_key;
-        } else if (roll < 55) {
+        }
+        else if (roll < 55) {
             /* Middle insert: land between two live keys, or on one of them to
              * exercise the duplicate path. */
             key = model_keys[rng_below(model_count)] + rng_below(2);
-        } else if (roll < 70) {
+        }
+        else if (roll < 70) {
             /* Lookup, half the time for a key that is present. */
             void* value = (void*)0xBADBAD;
             bool present;
@@ -605,11 +613,14 @@ static void test_random(uint64_t seed, unsigned long iterations) {
                 CHECK(present || value == (void*)0xBADBAD);
             }
             continue;
-        } else if (roll < 90) {
+        }
+        else if (roll < 90) {
             key = model_keys[0]; /* delete the smallest: the normal case */
-        } else if (roll < 97) {
+        }
+        else if (roll < 97) {
             key = model_keys[rng_below(model_count)]; /* delete a middle key */
-        } else {
+        }
+        else {
             key = tail_key + 1 + rng_below(1000); /* delete something absent */
         }
 
@@ -617,7 +628,8 @@ static void test_random(uint64_t seed, unsigned long iterations) {
             cbroker_omap_result_t result = cbroker_omap_insert(map, key, value_for(key));
             bool inserted = model_insert(key, value_for(key));
             CHECK(result == (inserted ? CBROKER_OMAP_OK : CBROKER_OMAP_DUPLICATE));
-        } else {
+        }
+        else {
             bool has_next = false;
             uint64_t next_key = 0;
             void* next_value = NULL;
@@ -627,10 +639,9 @@ static void test_random(uint64_t seed, unsigned long iterations) {
             bool removed;
             bool model_removed;
 
-            removed = cbroker_omap_delete_and_next(map, key, &has_next, &next_key,
-                                                   &next_value);
-            model_removed = model_delete_and_next(key, &model_has_next, &model_next_key,
-                                                  &model_next_value);
+            removed = cbroker_omap_delete_and_next(map, key, &has_next, &next_key, &next_value);
+            model_removed =
+                model_delete_and_next(key, &model_has_next, &model_next_key, &model_next_value);
             CHECK(removed == model_removed);
             if (removed) {
                 CHECK(has_next == model_has_next);
@@ -646,8 +657,7 @@ static void test_random(uint64_t seed, unsigned long iterations) {
         /* Keep the working set near the described peak. */
         while (model_count > 4000) {
             CHECK(cbroker_omap_delete_and_next(map, model_keys[0], NULL, NULL, NULL));
-            model_delete_and_next(model_keys[0], &(bool){false}, &(uint64_t){0},
-                                  &(void*){NULL});
+            model_delete_and_next(model_keys[0], &(bool){false}, &(uint64_t){0}, &(void*){NULL});
         }
     }
 
@@ -656,7 +666,8 @@ static void test_random(uint64_t seed, unsigned long iterations) {
 
 /*********************************************************************/
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     uint64_t seed = (argc > 1) ? strtoull(argv[1], NULL, 0) : 0x9E3779B97F4A7C15ull;
     unsigned long iterations = (argc > 2) ? strtoul(argv[2], NULL, 0) : 200000;
 
@@ -675,7 +686,7 @@ int main(int argc, char** argv) {
     CASE("no leaks");
     CHECK(live_allocations == 0);
 
-    printf("%lu checks, %lu failures (seed 0x%" PRIx64 ", %lu iterations)\n", checks_run,
-           failures, seed, iterations);
+    printf("%lu checks, %lu failures (seed 0x%" PRIx64 ", %lu iterations)\n", checks_run, failures,
+           seed, iterations);
     return failures == 0 ? 0 : 1;
 }

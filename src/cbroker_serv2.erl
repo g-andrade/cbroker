@@ -67,7 +67,7 @@ start_link(Name) ->
 get_shared_state(Name) ->
     Key = ?SHARED_STATE_KEY(Name),
 
-    try 
+    try
         persistent_term:get(Key)
     catch
         error:badarg ->
@@ -123,7 +123,7 @@ code_change(_OldVsn, State, _Extra) ->
 %% ------------------------------------------------------------------
 
 new_shared_state() ->
-    #shared_state{ 
-       broker = cbroker_nif2:new(),
-       instance = erlang:unique_integer()
-      }.
+    #shared_state{
+        broker = cbroker_nif2:new(),
+        instance = erlang:unique_integer()
+    }.

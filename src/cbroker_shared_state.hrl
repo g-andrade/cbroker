@@ -2,4 +2,3 @@
     broker :: cbroker_nif:broker(),
     instance :: integer()
 }).
-

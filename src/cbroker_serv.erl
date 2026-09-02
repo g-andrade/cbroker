@@ -67,7 +67,7 @@ start_link(Name) ->
 get_shared_state(Name) ->
     Key = ?SHARED_STATE_KEY(Name),
 
-    try 
+    try
         persistent_term:get(Key)
     catch
         error:badarg ->
@@ -80,7 +80,8 @@ get_shared_state(Name) ->
 
 %-spec init([]) -> {ok, state()}.
 init([Name]) ->
-    _ = process_flag(trap_exit, true), % almost always call `terminate/2`
+    % almost always call `terminate/2`
+    _ = process_flag(trap_exit, true),
     SharedStateKey = ?SHARED_STATE_KEY(Name),
     SharedState = new_shared_state(),
     persistent_term:put(SharedStateKey, SharedState),
@@ -108,9 +109,10 @@ handle_info(Info, State) ->
     {stop, {unexpected_info, Info}, State}.
 
 -spec terminate(term(), state()) -> ok.
-terminate(Reason, #state{shared_state_key =  SharedStateKey}) ->
-    _ = (is_termination_reason_healthy(Reason)
-         andalso persistent_term:erase(SharedStateKey)),
+terminate(Reason, #state{shared_state_key = SharedStateKey}) ->
+    _ =
+        (is_termination_reason_healthy(Reason) andalso
+            persistent_term:erase(SharedStateKey)),
     ok.
 
 -spec code_change(term(), state() | term(), term()) ->
@@ -125,10 +127,10 @@ code_change(_OldVsn, State, _Extra) ->
 %% ------------------------------------------------------------------
 
 new_shared_state() ->
-    #shared_state{ 
-       broker = cbroker_nif:new(),
-       instance = erlang:unique_integer()
-      }.
+    #shared_state{
+        broker = cbroker_nif:new(),
+        instance = erlang:unique_integer()
+    }.
 
 is_termination_reason_healthy(normal) -> true;
 is_termination_reason_healthy(shutdown) -> true;

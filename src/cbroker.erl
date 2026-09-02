@@ -152,19 +152,21 @@ bench1(Impl, TotalPidsAmount, Iterations) ->
     TotalSamples = length(Samples),
     GroupedSamples = maps:groups_from_list(fun sample_group/1, Samples),
 
-    SortedGroups = lists:keysort(1, lists:map(fun group_with_sorting_key/1, maps:to_list(GroupedSamples))),
+    SortedGroups = lists:keysort(
+        1, lists:map(fun group_with_sorting_key/1, maps:to_list(GroupedSamples))
+    ),
 
-    TotalDurationSecs = round(
-      (FinishTs - StartTs) 
-      / erlang:convert_time_unit(1, millisecond, native)
-    ) / 1000,
+    TotalDurationSecs =
+        round(
+            (FinishTs - StartTs) /
+                erlang:convert_time_unit(1, millisecond, native)
+        ) / 1000,
 
     [
         {total_duration_secs, TotalDurationSecs},
-        {delays_per_group, lists:map(fun (Group) -> group_stats(Group, TotalSamples) end, SortedGroups)}
+        {delays_per_group,
+            lists:map(fun(Group) -> group_stats(Group, TotalSamples) end, SortedGroups)}
     ].
-
-
 
 sample_group({blocked, _}) ->
     blocked;
@@ -324,7 +326,7 @@ cbroker_iteration_recur(StartTs, Broker, Side, RetryCount) ->
         %
         {match, _, _} ->
             FinalTs = erlang:monotonic_time(),
-            
+
             case RetryCount of
                 0 ->
                     {instant, FinalTs - StartTs};
@@ -343,7 +345,7 @@ cbroker_iteration_await(StartTs, Ticket) ->
             {match, _, _} = Result,
             {blocked, FinalTs - StartTs}
     end.
-    
+
 %%
 
 receive_done(PidSet) when map_size(PidSet) > 0 ->
@@ -379,8 +381,8 @@ processes_send([], _) ->
 launch_processes(Amount, RunFun, Iterations) when Amount > 0 ->
     Parent = self(),
     [
-     spawn_link(fun () -> start_process(Parent, RunFun, Iterations) end)
-     | launch_processes(Amount - 1, RunFun, Iterations)
+        spawn_link(fun() -> start_process(Parent, RunFun, Iterations) end)
+        | launch_processes(Amount - 1, RunFun, Iterations)
     ];
 launch_processes(0, _, _) ->
     [].
@@ -394,10 +396,9 @@ start_process(Parent, RunFun, Iterations) ->
 
             receive
                 stats ->
-
                     Stats = #proc_stats{
-                               samples = Samples
-                              },
+                        samples = Samples
+                    },
                     _ = Parent ! {finished, self(), Stats},
                     exit(normal)
             end
@@ -408,7 +409,6 @@ run_process(RunFun, Iterations) when Iterations > 0 ->
     [Timestamps | run_process(RunFun, Iterations - 1)];
 run_process(_, 0) ->
     [].
-
 
 %% ------------------------------------------------------------------
 %% Internal Function Definitions
@@ -437,18 +437,17 @@ await_after_ask(Broker, Ticket, Timeout) ->
     receive
         {T, Result} when T =:= Ticket ->
             Result
-    after
-        Timeout ->
-            case cbroker_nif:cancel(Broker, Ticket) of
-                cancelled ->
-                    timeout;
-                %
-                too_late ->
-                    receive
-                        {T, Result} when T =:= Ticket ->
-                            Result
-                    end
-            end
+    after Timeout ->
+        case cbroker_nif:cancel(Broker, Ticket) of
+            cancelled ->
+                timeout;
+            %
+            too_late ->
+                receive
+                    {T, Result} when T =:= Ticket ->
+                        Result
+                end
+        end
     end.
 
 async_ask_side(Name, Side, Value) ->

@@ -41,8 +41,7 @@ cbroker_omap_t* cbroker_omap_new(void);
  * entry, in ascending key order, with ctx passed through. Tolerates a NULL
  * map. */
 void cbroker_omap_destroy(cbroker_omap_t* map,
-                          void (*free_value)(uint64_t key, void* value, void* ctx),
-                          void* ctx);
+                          void (*free_value)(uint64_t key, void* value, void* ctx), void* ctx);
 
 cbroker_omap_result_t cbroker_omap_insert(cbroker_omap_t* map, uint64_t key, void* value);
 
@@ -57,11 +56,8 @@ bool cbroker_omap_lookup(const cbroker_omap_t* map, uint64_t key, void** value_o
  * written. Returns true if it was removed, and sets *has_next to whether a
  * larger key existed; *next_key_out and *next_value_out are written only when
  * *has_next is true. Every out param may be NULL. */
-bool cbroker_omap_delete_and_next(cbroker_omap_t* map,
-                                  uint64_t key,
-                                  bool* has_next,
-                                  uint64_t* next_key_out,
-                                  void** next_value_out);
+bool cbroker_omap_delete_and_next(cbroker_omap_t* map, uint64_t key, bool* has_next,
+                                  uint64_t* next_key_out, void** next_value_out);
 
 size_t cbroker_omap_size(const cbroker_omap_t* map);
 
@@ -74,9 +70,7 @@ bool cbroker_omap_last(const cbroker_omap_t* map, uint64_t* key_out, void** valu
 /* Smallest entry whose key is strictly greater than key; key itself need not
  * be present. False if there is none. Together with cbroker_omap_first() this
  * walks the map in ascending order. */
-bool cbroker_omap_next(const cbroker_omap_t* map,
-                       uint64_t key,
-                       uint64_t* key_out,
+bool cbroker_omap_next(const cbroker_omap_t* map, uint64_t key, uint64_t* key_out,
                        void** value_out);
 
 void** cbroker_omap_values(const cbroker_omap_t* map);

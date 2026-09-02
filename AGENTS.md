@@ -47,9 +47,15 @@ Docs are EEP-48 native, rendered by the standalone `ex_doc` escript (not the
 
 ## Conventions
 
-- Code is formatted with `erlfmt`; run `make format` before committing. A bulk
-  reformat should be its own commit, whose full SHA is appended to
+- Erlang is formatted with `erlfmt` and C with `clang-format` (config in
+  `.clang-format`); run `make format` before committing. `make check-formatted`
+  verifies both and is part of `check-fast`. Both are skipped with a warning
+  when the tool is unavailable, so CI never hard-fails on a missing formatter.
+  A bulk reformat should be its own commit, whose full SHA is appended to
   `.git-blame-ignore-revs`.
+- Blocks whose alignment carries meaning (such as the `ATOM_LIST` X-macro table
+  in `cbroker_nif.c`) are fenced with `/* clang-format off */` and
+  `/* clang-format on */`. The marker comment must contain nothing else.
 - Public API functions that aren't called internally carry `-ignore_xref([…])`
   to satisfy the `exports_not_used` xref check.
 - Documented `elvis`/`hank` exceptions live inline in `elvis.config` /

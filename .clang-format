@@ -1,0 +1,34 @@
+# Formatting for the C sources under c_src/ and test/c/.
+#
+#   make format           # rewrite Erlang (erlfmt) and C (clang-format) sources
+#   make check-formatted  # verify both; part of `make check-fast`, which CI runs
+#
+# Deliberately close to stock LLVM style -- the clang-format default and the
+# most widely recognised C/C++ convention -- so that the layout is whatever a C
+# programmer would expect rather than anything specific to this project. Three
+# overrides:
+#
+#   IndentWidth       LLVM uses 2, which is a C++ habit; 4 is the norm in C.
+#   ColumnLimit       LLVM uses 80, which wraps awkwardly given how long the
+#                     `enif_*` identifiers are at a 4-space indent.
+#   PointerAlignment  `broker_t* broker`, not `broker_t *broker`. Both are
+#                     common; this is the project's preference.
+#   BreakBeforeBraces Stroustrup: `else` starts its own line rather than
+#                     cuddling as `} else {`, and function opening braces go on
+#                     their own line (the K&R/Linux convention for functions).
+#                     Braces on if/for/while stay attached.
+#
+# Everything else is stock: casts with no following space (`(void**)out`),
+# binary operators at the end of the wrapped line, and sorted include blocks.
+#
+# Blocks whose alignment carries meaning (the ATOM_LIST X-macro table) are
+# fenced with `/* clang-format off */` ... `/* clang-format on */`. The marker
+# comment must contain nothing but the directive.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 100
+PointerAlignment: Left
+DerivePointerAlignment: false
+BreakBeforeBraces: Stroustrup

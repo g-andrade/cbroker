@@ -70,8 +70,6 @@
 }).
 -type invariants() :: #invariants{}.
 
-
-
 %% ------------------------------------------------------------------
 %% API Function Definitions
 %% ------------------------------------------------------------------
@@ -115,7 +113,7 @@ init(Parent) ->
             Debug = sys:debug_options([]),
 
             Invariants = #invariants{parent = Parent},
-            
+
             State = #state{
                 invariants = Invariants,
                 side = none,
@@ -202,7 +200,6 @@ handle_ask(Side, Pid, Value, Tag, #state{side = QSide, q = Q, downed_mons = Down
             Entry = ?ENTRY(Pid, Value, Tag, Mon),
             UpdatedQ = queue:in(Entry, Q),
             State#state{side = Side, q = UpdatedQ};
-
         %
         _ ->
             case map_size(DownedMons) of
@@ -234,7 +231,6 @@ try_matching1(Side2, Pid2, Value2, Tag2, Q, State) ->
             State#state{side = Side2, q = UpdatedQ, downed_mons = #{}}
     end.
 
-
 try_matching2(Side2, Pid2, Value2, Tag2, Q, DownedMons, State) ->
     case queue:out(Q) of
         {{value, ?ENTRY(Pid1, Value1, Tag1, Mon1)}, RemainingQ} ->
@@ -253,7 +249,9 @@ try_matching2(Side2, Pid2, Value2, Tag2, Q, DownedMons, State) ->
                 {_, RemainingMons} ->
                     case map_size(RemainingMons) of
                         0 ->
-                            try_matching2(Side2, Pid2, Value2, Tag2, RemainingQ, RemainingMons, State);
+                            try_matching2(
+                                Side2, Pid2, Value2, Tag2, RemainingQ, RemainingMons, State
+                            );
                         %
                         _ ->
                             try_matching1(Side2, Pid2, Value2, Tag2, RemainingQ, State)
@@ -284,7 +282,7 @@ handle_monitor_down(Ref, #state{downed_mons = Mons} = State) ->
             State#state{downed_mons = UpdatedMons};
         %
         true ->
-            FilterFun = fun (?ENTRY(_, _, _, Mon)) -> not maps:is_key(Mon, UpdatedMons) end,
+            FilterFun = fun(?ENTRY(_, _, _, Mon)) -> not maps:is_key(Mon, UpdatedMons) end,
             FilteredQ = queue:filter(FilterFun, State#state.q),
 
             case queue:is_empty(FilteredQ) of

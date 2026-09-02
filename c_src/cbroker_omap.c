@@ -30,7 +30,8 @@ struct cbroker_omap {
 /*********************************************************************/
 
 #ifdef CBROKER_OMAP_DEBUG_CHECKS
-static void omap_assert_invariants(const cbroker_omap_t* map) {
+static void omap_assert_invariants(const cbroker_omap_t* map)
+{
     assert(map->head <= map->tail);
     assert(map->tail <= map->capacity);
     assert(map->capacity == 0 || map->keys != NULL);
@@ -44,7 +45,8 @@ static void omap_assert_invariants(const cbroker_omap_t* map) {
 
 /* Index of the first entry whose key is >= `key`, i.e. the point at which
  * `key` belongs. Returns tail when every key is smaller. */
-static size_t omap_search(const cbroker_omap_t* map, uint64_t key, bool* found) {
+static size_t omap_search(const cbroker_omap_t* map, uint64_t key, bool* found)
+{
     size_t lo = map->head;
     size_t hi = map->tail;
 
@@ -73,7 +75,8 @@ static size_t omap_search(const cbroker_omap_t* map, uint64_t key, bool* found) 
         size_t mid = lo + (hi - lo) / 2;
         if (map->keys[mid] < key) {
             lo = mid + 1;
-        } else {
+        }
+        else {
             hi = mid;
         }
     }
@@ -84,7 +87,8 @@ static size_t omap_search(const cbroker_omap_t* map, uint64_t key, bool* found) 
 
 /* Re-anchors the live window at the start of the buffer, freeing up `head`
  * slots at the tail. */
-static void omap_slide_to_front(cbroker_omap_t* map) {
+static void omap_slide_to_front(cbroker_omap_t* map)
+{
     size_t count = map->tail - map->head;
 
     if (map->head == 0) {
@@ -99,7 +103,8 @@ static void omap_slide_to_front(cbroker_omap_t* map) {
 
 /* Moves the live entries into a fresh block of `new_capacity` entries,
  * anchored at the front. Leaves the map untouched on failure. */
-static bool omap_reallocate(cbroker_omap_t* map, size_t new_capacity) {
+static bool omap_reallocate(cbroker_omap_t* map, size_t new_capacity)
+{
     size_t count = map->tail - map->head;
 
     assert(new_capacity >= count);
@@ -132,7 +137,8 @@ static bool omap_reallocate(cbroker_omap_t* map, size_t new_capacity) {
 
 /* Guarantees one free slot at the tail (and so, since sliding only ever moves
  * entries towards the front, that tail < capacity). */
-static bool omap_make_room(cbroker_omap_t* map) {
+static bool omap_make_room(cbroker_omap_t* map)
+{
     size_t count;
     size_t new_capacity;
 
@@ -151,13 +157,13 @@ static bool omap_make_room(cbroker_omap_t* map) {
         return true;
     }
 
-    new_capacity =
-        (map->capacity == 0) ? CBROKER_OMAP_INITIAL_CAPACITY : map->capacity * 2;
+    new_capacity = (map->capacity == 0) ? CBROKER_OMAP_INITIAL_CAPACITY : map->capacity * 2;
     return omap_reallocate(map, new_capacity);
 }
 
 /* Opens up a free slot at `idx` by pushing [idx, tail) one place right. */
-static void omap_shift_right(cbroker_omap_t* map, size_t idx) {
+static void omap_shift_right(cbroker_omap_t* map, size_t idx)
+{
     size_t count = map->tail - idx;
 
     assert(map->tail < map->capacity);
@@ -167,7 +173,8 @@ static void omap_shift_right(cbroker_omap_t* map, size_t idx) {
 }
 
 /* Opens up a free slot at `idx - 1` by pushing [head, idx) one place left. */
-static void omap_shift_left(cbroker_omap_t* map, size_t idx) {
+static void omap_shift_left(cbroker_omap_t* map, size_t idx)
+{
     size_t count = idx - map->head;
 
     assert(map->head > 0);
@@ -178,7 +185,8 @@ static void omap_shift_left(cbroker_omap_t* map, size_t idx) {
 
 /*********************************************************************/
 
-cbroker_omap_t* cbroker_omap_new(void) {
+cbroker_omap_t* cbroker_omap_new(void)
+{
     cbroker_omap_t* map = CBROKER_OMAP_ALLOC(sizeof(cbroker_omap_t));
 
     if (map == NULL) {
@@ -194,8 +202,8 @@ cbroker_omap_t* cbroker_omap_new(void) {
 }
 
 void cbroker_omap_destroy(cbroker_omap_t* map,
-                          void (*free_value)(uint64_t key, void* value, void* ctx),
-                          void* ctx) {
+                          void (*free_value)(uint64_t key, void* value, void* ctx), void* ctx)
+{
     if (map == NULL) {
         return;
     }
@@ -211,7 +219,8 @@ void cbroker_omap_destroy(cbroker_omap_t* map,
     CBROKER_OMAP_FREE(map);
 }
 
-cbroker_omap_result_t cbroker_omap_insert(cbroker_omap_t* map, uint64_t key, void* value) {
+cbroker_omap_result_t cbroker_omap_insert(cbroker_omap_t* map, uint64_t key, void* value)
+{
     size_t count = map->tail - map->head;
     size_t offset;
     size_t idx;
@@ -220,7 +229,8 @@ cbroker_omap_result_t cbroker_omap_insert(cbroker_omap_t* map, uint64_t key, voi
     if (count == 0 || key > map->keys[map->tail - 1]) {
         /* Fast path: the append that near-monotonic keys almost always want. */
         offset = count;
-    } else {
+    }
+    else {
         bool found;
         size_t pos = omap_search(map, key, &found);
         if (found) {
@@ -237,10 +247,12 @@ cbroker_omap_result_t cbroker_omap_insert(cbroker_omap_t* map, uint64_t key, voi
     idx = map->head + offset;
     if (idx == map->tail) {
         slot = map->tail++;
-    } else if (map->head > 0 && (idx - map->head) < (map->tail - idx)) {
+    }
+    else if (map->head > 0 && (idx - map->head) < (map->tail - idx)) {
         omap_shift_left(map, idx);
         slot = idx - 1;
-    } else {
+    }
+    else {
         omap_shift_right(map, idx);
         slot = idx;
     }
@@ -252,7 +264,8 @@ cbroker_omap_result_t cbroker_omap_insert(cbroker_omap_t* map, uint64_t key, voi
     return CBROKER_OMAP_OK;
 }
 
-bool cbroker_omap_lookup(const cbroker_omap_t* map, uint64_t key, void** value_out) {
+bool cbroker_omap_lookup(const cbroker_omap_t* map, uint64_t key, void** value_out)
+{
     bool found;
     size_t idx = omap_search(map, key, &found);
 
@@ -265,11 +278,9 @@ bool cbroker_omap_lookup(const cbroker_omap_t* map, uint64_t key, void** value_o
     return true;
 }
 
-bool cbroker_omap_delete_and_next(cbroker_omap_t* map,
-                                  uint64_t key,
-                                  bool* has_next,
-                                  uint64_t* next_key_out,
-                                  void** next_value_out) {
+bool cbroker_omap_delete_and_next(cbroker_omap_t* map, uint64_t key, bool* has_next,
+                                  uint64_t* next_key_out, void** next_value_out)
+{
     bool found;
     size_t idx = omap_search(map, key, &found);
     bool next_exists;
@@ -296,14 +307,17 @@ bool cbroker_omap_delete_and_next(cbroker_omap_t* map,
     if (idx == map->head) {
         /* The common case: dropping the smallest key. */
         map->head++;
-    } else if (idx + 1 == map->tail) {
+    }
+    else if (idx + 1 == map->tail) {
         map->tail--;
-    } else if ((idx - map->head) < (map->tail - 1 - idx)) {
+    }
+    else if ((idx - map->head) < (map->tail - 1 - idx)) {
         size_t count = idx - map->head;
         memmove(&map->keys[map->head + 1], &map->keys[map->head], count * sizeof(uint64_t));
         memmove(&map->values[map->head + 1], &map->values[map->head], count * sizeof(void*));
         map->head++;
-    } else {
+    }
+    else {
         size_t count = map->tail - idx - 1;
         memmove(&map->keys[idx], &map->keys[idx + 1], count * sizeof(uint64_t));
         memmove(&map->values[idx], &map->values[idx + 1], count * sizeof(void*));
@@ -321,11 +335,10 @@ bool cbroker_omap_delete_and_next(cbroker_omap_t* map,
     return true;
 }
 
-size_t cbroker_omap_size(const cbroker_omap_t* map) {
-    return map->tail - map->head;
-}
+size_t cbroker_omap_size(const cbroker_omap_t* map) { return map->tail - map->head; }
 
-bool cbroker_omap_first(const cbroker_omap_t* map, uint64_t* key_out, void** value_out) {
+bool cbroker_omap_first(const cbroker_omap_t* map, uint64_t* key_out, void** value_out)
+{
     if (map->head == map->tail) {
         return false;
     }
@@ -338,7 +351,8 @@ bool cbroker_omap_first(const cbroker_omap_t* map, uint64_t* key_out, void** val
     return true;
 }
 
-bool cbroker_omap_last(const cbroker_omap_t* map, uint64_t* key_out, void** value_out) {
+bool cbroker_omap_last(const cbroker_omap_t* map, uint64_t* key_out, void** value_out)
+{
     if (map->head == map->tail) {
         return false;
     }
@@ -351,10 +365,8 @@ bool cbroker_omap_last(const cbroker_omap_t* map, uint64_t* key_out, void** valu
     return true;
 }
 
-bool cbroker_omap_next(const cbroker_omap_t* map,
-                       uint64_t key,
-                       uint64_t* key_out,
-                       void** value_out) {
+bool cbroker_omap_next(const cbroker_omap_t* map, uint64_t key, uint64_t* key_out, void** value_out)
+{
     bool found;
     size_t idx;
 
@@ -385,6 +397,4 @@ bool cbroker_omap_next(const cbroker_omap_t* map,
     return true;
 }
 
-void** cbroker_omap_values(const cbroker_omap_t* map) {
-    return &map->values[map->head];
-}
+void** cbroker_omap_values(const cbroker_omap_t* map) { return &map->values[map->head]; }
