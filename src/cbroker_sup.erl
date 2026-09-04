@@ -85,5 +85,6 @@ sup_flags() ->
 child_specs() ->
     [
         cbroker_simple:child_spec(),
-        cbroker_serv:child_spec(test)
+        cbroker_serv:child_spec(test),
+        cbroker_pool:child_spec()
     ].

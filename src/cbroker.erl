@@ -320,11 +320,11 @@ cbroker_iteration(Side) ->
     end.
 
 cbroker_iteration_recur(StartTs, Broker, Side, RetryCount) ->
-    case cbroker_nif:ask(Broker, Side, self()) of
+    case cbroker_nif:ask(Broker, Side, self(), true) of
         {await, Ticket} ->
             cbroker_iteration_await(StartTs, Ticket);
         %
-        {match, _, _} ->
+        {match, _, _, _} ->
             FinalTs = erlang:monotonic_time(),
 
             case RetryCount of
@@ -342,7 +342,7 @@ cbroker_iteration_await(StartTs, Ticket) ->
     receive
         {T, Result} when T =:= Ticket ->
             FinalTs = erlang:monotonic_time(),
-            {match, _, _} = Result,
+            {match, _, _, _} = Result,
             {blocked, FinalTs - StartTs}
     end.
 
@@ -418,11 +418,11 @@ ask_side(Name, Side, Value, Timeout) ->
     case cbroker_serv:get_shared_state(Name) of
         #shared_state{broker = Broker} ->
             %
-            case cbroker_nif:ask(Broker, Side, Value) of
+            case cbroker_nif:ask(Broker, Side, Value, true) of
                 {await, Ticket} ->
                     await_after_ask(Broker, Ticket, Timeout);
                 %
-                {match, _, _} = Match ->
+                {match, _, _, _} = Match ->
                     Match;
                 %
                 retry ->
@@ -453,7 +453,7 @@ await_after_ask(Broker, Ticket, Timeout) ->
 async_ask_side(Name, Side, Value) ->
     case cbroker_serv:get_shared_state(Name) of
         #shared_state{broker = Broker} ->
-            case cbroker_nif:ask(Broker, Side, Value, true) of
+            case cbroker_nif:ask(Broker, Side, Value, true, true) of
                 retry ->
                     async_ask_side(Name, Side, Value);
                 %

@@ -13,22 +13,29 @@
 /* The columns below are aligned on purpose. */
 /* clang-format off */
 #define ATOM_LIST \
+    X(_about_to_sleep,       "about_to_sleep") \
+    X(_active,               "active") \
     X(_await,                "await") \
     X(_badarg,               "badarg") \
     X(_batch_consumed,       "batch_consumed") \
     X(_batch_full,           "batch_full")  \
     X(_cancelled,            "cancelled") \
     X(_delayed_match,        "delayed_match") \
+    X(_error,                "error") \
+    X(_false,                "false") \
     X(_instant_match_first,  "instant_match_first") \
     X(_instant_match_second, "instant_match_second") \
     X(_left,                 "left")  \
     X(_match,                "match") \
     X(_none,                 "none") \
+    X(_not_owner,            "not_owner") \
+    X(_ok,                   "ok") \
     X(_retry,                "retry") \
     X(_right,                "right") \
     X(_self_stopped,         "self_stopped") \
     X(_too_late,             "too_late") \
-    X(_true,                 "true")
+    X(_true,                 "true") \
+    X(_wake_up,              "wake_up")
 /* clang-format on */
 
 #define MAX(a, b) ((a) >= (b) ? (a) : (b))
@@ -64,10 +71,13 @@ typedef offset_t batch_id_t;
 //
 
 typedef struct {
+    ERL_NIF_TERM side;
     ErlNifPid pid;
     ErlNifEnv* env;
     ERL_NIF_TERM cmonitor_term;
     ERL_NIF_TERM exchange_value;
+    bool with_stats;
+    ErlNifTime enqueue_time;
 } match_t;
 
 //
@@ -87,6 +97,7 @@ typedef struct {
     ERL_NIF_TERM broker_term;
     batch_id_t batch_id;
     offset_t offset;
+    ERL_NIF_TERM side;
 } cmonitor_t;
 
 //
@@ -137,7 +148,14 @@ typedef struct {
 
 //
 
+typedef int_fast64_t balance_t;
+
 typedef struct {
+    ErlNifPid owner_pid;
+    _Atomic(balance_t) balance;
+    bool is_balance_monitored;
+    atomic_flag is_owner_active;
+    //
     size_t nr_of_schedulers;
     size_t nr_of_cells_per_batch;
     //
@@ -155,6 +173,7 @@ typedef struct {
     broker_t* broker;
     ERL_NIF_TERM side;
     bool is_left;
+    bool with_stats;
     local_state_t* local_state;
     //
     ErlNifPid self;
@@ -177,7 +196,7 @@ typedef ssize_t thread_id_t;
 /*********************************************************************/
 
 static int on_load(ErlNifEnv* caller_env, void** priv_data, ERL_NIF_TERM load_info);
-
+;
 static void init_atoms(ErlNifEnv* caller_env);
 static void broker_resource_load(ErlNifEnv* caller_env);
 static void cmonitor_resource_load(ErlNifEnv* caller_env);
@@ -186,8 +205,12 @@ static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM nif_to_list(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM nif_read_balance(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
 static ERL_NIF_TERM ask_loop(ask_ctx_t* ctx, ask_out_t* out);
+
+static void broker_update_balance(ErlNifEnv* env, broker_t* broker, ERL_NIF_TERM side,
+                                  int increment);
 
 static batch_t* batch_new(const batch_id_t id, const size_t nr_of_cells);
 static size_t sizeof_broker(size_t nr_of_schedulers);
@@ -214,7 +237,8 @@ static void match_free(void* match);
 
 static void notify_of_match(ask_ctx_t* ctx, ErlNifPid* pid, match_t** match_ptr,
                             const ERL_NIF_TERM side, const batch_id_t batch_id,
-                            const offset_t offset, const ERL_NIF_TERM match_ref);
+                            const offset_t offset, const ERL_NIF_TERM match_ref, bool with_stats,
+                            ErlNifTime enqueue_time);
 
 static void notify_of_cancellation(ErlNifEnv* env, local_state_t* local_state,
                                    ERL_NIF_TERM tag_term, match_t** match_in_cell_ptr);
@@ -240,7 +264,11 @@ static int get_tag(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM* out_side,
 
 static ERL_NIF_TERM make_await(ErlNifEnv* env, ERL_NIF_TERM tag);
 static ERL_NIF_TERM make_badarg(ErlNifEnv* env, ERL_NIF_TERM term);
+static ERL_NIF_TERM make_error2(ErlNifEnv* env, ERL_NIF_TERM reason);
 static ERL_NIF_TERM make_match(ErlNifEnv* env, ERL_NIF_TERM match_ref, ERL_NIF_TERM exchange_value);
+static ERL_NIF_TERM make_match_with_stats(ErlNifEnv* env, ERL_NIF_TERM match_ref,
+                                          ERL_NIF_TERM exchange_value, ErlNifTime enqueue_time);
+static ERL_NIF_TERM make_ok2(ErlNifEnv* env, ERL_NIF_TERM success);
 static ERL_NIF_TERM make_opposite_side(ERL_NIF_TERM side);
 static ERL_NIF_TERM make_tag(ask_ctx_t* ctx, batch_id_t batch_id, offset_t offset);
 static ERL_NIF_TERM make_tag_simple(ErlNifEnv* env, ERL_NIF_TERM side, batch_id_t batch_id,
@@ -275,11 +303,9 @@ static _Thread_local thread_id_t my_thread_id = -1;
 
 static match_t sentinel_match_cancelled;
 
-static ErlNifFunc nif_funcs[] = {{"new", 0, nif_new},
-                                 {"ask", 3, nif_ask},
-                                 {"ask", 4, nif_ask},
-                                 {"cancel", 2, nif_cancel},
-                                 {"to_list", 1, nif_to_list}};
+static ErlNifFunc nif_funcs[] = {
+    {"new", 0, nif_new},       {"ask", 4, nif_ask},         {"ask", 5, nif_ask},
+    {"cancel", 2, nif_cancel}, {"to_list", 1, nif_to_list}, {"read_balance", 2, nif_read_balance}};
 
 ERL_NIF_INIT(cbroker_nif, nif_funcs, on_load, NULL, NULL, NULL);
 
@@ -343,6 +369,10 @@ static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     assert(broker != NULL);
     memset(broker, 0, broker_size);
 
+    broker->owner_pid = self;
+    broker->is_balance_monitored = false; // FIXME, should be an arg
+    // broker->is_owner_active = ATOMIC_FLAG_INIT;
+
     broker->nr_of_schedulers = nr_of_schedulers;
     broker->nr_of_cells_per_batch = 32 * nr_of_schedulers;
     broker->global_lock = enif_mutex_create("cbroker.mutex");
@@ -400,6 +430,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     ctx.broker_term = argv[0];
     ctx.side = argv[1];
     ctx.exchange_value = argv[2];
+    ERL_NIF_TERM with_stats_term = argv[3];
 
     if (!get_broker(env, ctx.broker_term, &ctx.broker)) {
         return make_badarg(env, ctx.broker_term);
@@ -419,7 +450,14 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         return make_badarg(env, ctx.side);
     }
 
-    is_fully_async = (argc >= 4 && argv[3] == Atoms._true);
+    if (with_stats_term == Atoms._true) {
+        ctx.with_stats = true;
+    }
+    else if (with_stats_term != Atoms._false) {
+        return make_badarg(env, with_stats_term);
+    }
+
+    is_fully_async = (argc >= 5 && argv[4] == Atoms._true);
 
     ////////////////////////////
 
@@ -431,6 +469,12 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     memset(&success, 0, sizeof(ask_out_t));
 
     ERL_NIF_TERM match_res = ask_loop(&ctx, &success);
+
+    ////
+
+    if (match_res != Atoms._retry) {
+        broker_update_balance(ctx.env, ctx.broker, ctx.side, +1);
+    }
 
     ////
 
@@ -459,10 +503,14 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
         ERL_NIF_TERM match_ref = enif_make_ref(env);
 
+        ErlNifTime our_enqueue_time = success.our_match->enqueue_time;
+        bool opposite_with_stats = success.opposite_match->with_stats;
+        ErlNifTime opposite_enqueue_time = success.opposite_match->enqueue_time;
+
         LOG("dmatch: about to notify other");
         const ERL_NIF_TERM opposite_side = make_opposite_side(ctx.side);
         notify_of_match(&ctx, &((*opposite_match_ptr)->pid), our_match_ptr, opposite_side, batch_id,
-                        offset, match_ref);
+                        offset, match_ref, opposite_with_stats, opposite_enqueue_time);
         assert(success.our_match == NULL);
 
         if (success.consume_slot) {
@@ -472,7 +520,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
         if (is_fully_async) {
             notify_of_match(&ctx, &ctx.self, opposite_match_ptr, ctx.side, batch_id, offset,
-                            match_ref);
+                            match_ref, ctx.with_stats, our_enqueue_time);
             assert(success.opposite_match == NULL);
             ERL_NIF_TERM tag = make_tag(&ctx, batch_id, success.offset);
             match_res = make_await(env, tag);
@@ -482,7 +530,9 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                 enif_make_copy(env, (*opposite_match_ptr)->exchange_value);
             match_demonitor_and_free(env, ctx.local_state, opposite_match_ptr);
             assert(success.opposite_match == NULL);
-            match_res = make_match(env, match_ref, opposite_value);
+            match_res = (ctx.with_stats ? make_match_with_stats(env, match_ref, opposite_value,
+                                                                our_enqueue_time)
+                                        : make_match(env, match_ref, opposite_value));
         }
     }
     else if (success.consume_slot) {
@@ -546,6 +596,9 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
     if (atomic_compare_exchange_strong(&cell->count, &cell_count, CELL_COUNT_CANCELLED)) {
         match_t* match_in_cell = atomic_exchange(&cell->match, &sentinel_match_cancelled);
         assert(match_in_cell != NULL);
+        assert(match_in_cell != &sentinel_match_cancelled);
+
+        broker_update_balance(env, broker, match_in_cell->side, -1);
 
         if (enif_compare_pids(&match_in_cell->pid, &self) == 0) {
             match_demonitor_and_free(env, local_state, &match_in_cell);
@@ -703,6 +756,56 @@ static ERL_NIF_TERM nif_to_list(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
     return enif_make_list_from_array(env, output_terms, 3);
 }
 
+//
+
+static ERL_NIF_TERM nif_read_balance(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    broker_t* broker = NULL;
+    bool going_to_sleep = false;
+
+    ERL_NIF_TERM broker_term = argv[0];
+    ERL_NIF_TERM going_to_sleep_term = argv[1];
+    ErlNifPid self;
+
+    if (!get_broker(env, broker_term, &broker)) {
+        return make_badarg(env, broker_term);
+    }
+
+    if (going_to_sleep_term == Atoms._true) {
+        going_to_sleep = true;
+    }
+    else if (going_to_sleep_term != Atoms._false) {
+        return make_badarg(env, going_to_sleep_term);
+    }
+
+    //
+
+    if (!enif_self(env, &self)) {
+        return enif_make_badarg(env);
+    }
+    else if (enif_compare_pids(&self, &broker->owner_pid)) {
+        return make_error2(env, Atoms._not_owner);
+    }
+
+    //
+
+    balance_t balance = 0;
+
+    if (going_to_sleep) {
+        atomic_flag_clear(&broker->is_owner_active);
+        balance = atomic_load(&broker->balance);
+    }
+    else {
+        balance = atomic_load_explicit(&broker->balance, memory_order_relaxed);
+    }
+
+    ErlNifTime now = enif_monotonic_time(ERL_NIF_USEC);
+    ERL_NIF_TERM now_term = enif_make_int64(env, now);
+    ERL_NIF_TERM balance_term = enif_make_int64(env, balance);
+    ERL_NIF_TERM success = enif_make_tuple2(env, now_term, balance_term);
+    return make_ok2(env, success);
+}
+
 /*********************************************************************/
 
 static ERL_NIF_TERM ask_loop(ask_ctx_t* ctx, ask_out_t* out)
@@ -777,6 +880,23 @@ static ERL_NIF_TERM ask_loop(ask_ctx_t* ctx, ask_out_t* out)
     }
 
     return Atoms._retry;
+}
+
+/*********************************************************************/
+
+static void broker_update_balance(ErlNifEnv* env, broker_t* broker, ERL_NIF_TERM side,
+                                  int increment)
+{
+    int sided_increment = (side == Atoms._left ? -increment : increment);
+
+    balance_t prev_balance =
+        atomic_fetch_add_explicit(&broker->balance, sided_increment, memory_order_relaxed);
+
+    if (prev_balance == 0 && broker->is_balance_monitored &&
+        !atomic_flag_test_and_set(&broker->is_owner_active)) {
+        // FIXME what if the calling process stops?
+        enif_send(env, &broker->owner_pid, NULL, Atoms._wake_up);
+    }
 }
 
 /*********************************************************************/
@@ -867,6 +987,9 @@ static ERL_NIF_TERM batch_offset_ask(ask_ctx_t* ctx, batch_t* batch, offset_t of
                 ERL_NIF_TERM tag =
                     make_tag_simple(opposite_match->env, opposite_side, batch->id, offset);
                 notify_of_cancellation(tmp_env, ctx->local_state, tag, &opposite_match);
+
+                broker_update_balance(ctx->env, ctx->broker, opposite_side, -1);
+
                 assert(opposite_match == NULL);
                 env_pool_return(ctx->local_state, tmp_env);
             }
@@ -1108,6 +1231,7 @@ static match_t* match_new_monitored(ask_ctx_t* ctx, batch_id_t batch_id, offset_
     cmonitor->broker_term = enif_make_copy(cmonitor->env, ctx->broker_term);
     cmonitor->batch_id = batch_id;
     cmonitor->offset = offset;
+    cmonitor->side = ctx->side;
 
     if (enif_monitor_process(ctx->env, cmonitor, &ctx->self, &cmonitor->mon)) {
         env_pool_return(ctx->local_state, cmonitor->env);
@@ -1119,10 +1243,16 @@ static match_t* match_new_monitored(ask_ctx_t* ctx, batch_id_t batch_id, offset_
     match_t* match = match_pool_get(ctx->local_state);
 
     ErlNifEnv* match_env = env_pool_get(ctx->local_state);
+    match->side = ctx->side;
     match->pid = ctx->self;
     match->env = match_env;
     match->cmonitor_term = enif_make_resource(match_env, cmonitor);
     match->exchange_value = enif_make_copy(match_env, ctx->exchange_value);
+
+    if (ctx->with_stats) {
+        match->with_stats = true;
+        match->enqueue_time = enif_monotonic_time(ERL_NIF_NSEC);
+    }
 
     enif_release_resource(cmonitor);
 
@@ -1135,10 +1265,16 @@ static match_t* match_new_unmonitored(ask_ctx_t* ctx, batch_id_t batch_id, offse
     memset(match, 0, sizeof(match_t));
 
     ErlNifEnv* match_env = env_pool_get(ctx->local_state);
+    match->side = ctx->side;
     match->pid = ctx->self;
     match->env = match_env;
     match->cmonitor_term = Atoms._none;
     match->exchange_value = enif_make_copy(match_env, ctx->exchange_value);
+
+    if (ctx->with_stats) {
+        match->with_stats = true;
+        match->enqueue_time = enif_monotonic_time(ERL_NIF_NSEC);
+    }
 
     return match;
 }
@@ -1172,7 +1308,8 @@ static void match_free(void* match) { enif_free((match_t*)match); }
 
 static void notify_of_match(ask_ctx_t* ctx, ErlNifPid* pid, match_t** match_ptr,
                             const ERL_NIF_TERM side, const batch_id_t batch_id,
-                            const offset_t offset, const ERL_NIF_TERM match_ref)
+                            const offset_t offset, const ERL_NIF_TERM match_ref, bool with_stats,
+                            ErlNifTime enqueue_time)
 {
     ErlNifEnv* caller_env = ctx->env;
     local_state_t* local_state = ctx->local_state;
@@ -1188,7 +1325,12 @@ static void notify_of_match(ask_ctx_t* ctx, ErlNifPid* pid, match_t** match_ptr,
     ErlNifEnv* match_env = match->env;
     ERL_NIF_TERM tag = make_tag_simple(match_env, side, batch_id, offset);
     ERL_NIF_TERM msg_match_ref = enif_make_copy(match_env, match_ref);
-    ERL_NIF_TERM msg_content = make_match(match_env, msg_match_ref, match->exchange_value);
+
+    ERL_NIF_TERM msg_content =
+        (with_stats
+             ? make_match_with_stats(match_env, msg_match_ref, match->exchange_value, enqueue_time)
+             : make_match(match_env, msg_match_ref, match->exchange_value));
+
     ERL_NIF_TERM msg = enif_make_tuple2(match_env, tag, msg_content);
 
     enif_send(caller_env, pid, match_env, msg);
@@ -1268,20 +1410,38 @@ static int get_tag(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM* out_side,
 
 /*********************************************************************/
 
+static ERL_NIF_TERM make_await(ErlNifEnv* env, ERL_NIF_TERM tag)
+{
+    return enif_make_tuple2(env, Atoms._await, tag);
+}
+
 static ERL_NIF_TERM make_badarg(ErlNifEnv* env, ERL_NIF_TERM term)
 {
     ERL_NIF_TERM reason = enif_make_tuple2(env, Atoms._badarg, term);
     return enif_raise_exception(env, reason);
 }
 
-static ERL_NIF_TERM make_await(ErlNifEnv* env, ERL_NIF_TERM tag)
+static ERL_NIF_TERM make_error2(ErlNifEnv* env, ERL_NIF_TERM success)
 {
-    return enif_make_tuple2(env, Atoms._await, tag);
+    return enif_make_tuple2(env, Atoms._error, success);
 }
 
 static ERL_NIF_TERM make_match(ErlNifEnv* env, ERL_NIF_TERM match_ref, ERL_NIF_TERM exchange_value)
 {
     return enif_make_tuple3(env, Atoms._match, match_ref, exchange_value);
+}
+
+static ERL_NIF_TERM make_match_with_stats(ErlNifEnv* env, ERL_NIF_TERM match_ref,
+                                          ERL_NIF_TERM exchange_value, ErlNifTime enqueue_time)
+{
+    int_fast64_t sojourn_time = enif_monotonic_time(ERL_NIF_NSEC) - enqueue_time;
+    return enif_make_tuple4(env, Atoms._match, match_ref, exchange_value,
+                            enif_make_int64(env, sojourn_time));
+}
+
+static ERL_NIF_TERM make_ok2(ErlNifEnv* env, ERL_NIF_TERM success)
+{
+    return enif_make_tuple2(env, Atoms._ok, success);
 }
 
 static ERL_NIF_TERM make_opposite_side(ERL_NIF_TERM side)
@@ -1529,6 +1689,7 @@ static void cmonitor_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlN
             match_pool_return(local_state, match_in_cell);
         }
 
+        broker_update_balance(caller_env, broker, cmonitor->side, -1);
         batch_consume_slot(broker, local_state, &handle);
     }
 

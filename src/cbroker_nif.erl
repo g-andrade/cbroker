@@ -2,10 +2,11 @@
 
 -export([
     new/0,
-    ask/3,
     ask/4,
+    ask/5,
     cancel/2,
-    to_list/1
+    to_list/1,
+    read_balance/2
 ]).
 
 -on_load(init/0).
@@ -18,16 +19,19 @@
 new() ->
     not_loaded(?LINE).
 
-ask(_Broker, _Side, _Value) ->
+ask(_Broker, _Side, _Value, _WithStats) ->
     not_loaded(?LINE).
 
-ask(_Broker, _Side, _Value, _IsFullyAsync) ->
+ask(_Broker, _Side, _Value, _WithStats, _IsFullyAsync) ->
     not_loaded(?LINE).
 
 cancel(_Broker, _Ticket) ->
     not_loaded(?LINE).
 
 to_list(_Broker) ->
+    not_loaded(?LINE).
+
+read_balance(_Broker, _GoingToSleep) ->
     not_loaded(?LINE).
 
 %%
