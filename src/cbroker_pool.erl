@@ -1,5 +1,7 @@
 -module(cbroker_pool).
 
+-include_lib("stdlib/include/assert.hrl").
+
 -ifdef(E48).
 -moduledoc false.
 -endif.
@@ -13,6 +15,7 @@
 -export([
     child_spec/0,
     start_link/0,
+    get_broker/0,
     run/2
 ]).
 
@@ -39,6 +42,10 @@
 
 -define(SAMPLE(Timestamp, Balance), {Timestamp, Balance}).
 
+-define(TARGET_INTERVAL, 100).
+
+-define(PROBING_INTERVAL, 100).
+
 %% ------------------------------------------------------------------
 %% Record and Type Definitions
 %% ------------------------------------------------------------------
@@ -47,7 +54,14 @@
     settings :: settings(),
     broker :: reference(),
     workers :: #{pid() => worker()},
-    refresh_timer :: none | reference()
+    retirees :: gb_sets:set(pid()),
+    shutdowns :: gb_sets:set(shutdown()),
+    atomics :: atomics:atomics_ref(),
+    %
+    %probe_tag :: none | {some, term()},
+    probing_timer :: none | reference(),
+    probes :: [probe()],
+    missed_probes :: non_neg_integer()
 }).
 -type state() :: #state{}.
 
@@ -60,9 +74,22 @@
 -record(worker, {
     pid :: pid(),
     start_ts :: timestamp(),
-    ready_ts :: none | timestamp()
+    ready_ts :: none | timestamp(),
+    auto_retires :: boolean(),
+    retire_ts :: none | timestamp(),
+    shutdown_ts :: none | timestamp()
 }).
 -type worker() :: #worker{}.
+
+-type shutdown() :: nonempty_improper_list(timestamp(), pid()).
+
+-record(probe, {
+    ts :: timestamp(),
+    tag :: term(),
+    sojourn_time :: none | non_neg_integer(),
+    cancelled :: boolean()
+}).
+-type probe() :: #probe{}.
 
 -type timestamp() :: integer().
 
@@ -82,6 +109,9 @@ child_spec() ->
 -spec start_link() -> {ok, pid()} | {error, term()}.
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+
+get_broker() ->
+    persistent_term:get({ahhh, ?SERVER}).
 
 run(Min, Max) ->
     Broker = persistent_term:get({ahhh, ?SERVER}),
@@ -130,9 +160,11 @@ run(Min, Max) ->
 
 -spec init([]) -> {ok, state()}.
 init([]) ->
+    _ = process_flag(trap_exit, true),
+
     Settings = #settings{
         min_workers = 4,
-        max_workers = 10
+        max_workers = 1000
     },
 
     Broker = cbroker_nif:new(),
@@ -142,11 +174,17 @@ init([]) ->
         settings = Settings,
         broker = Broker,
         workers = #{},
-        refresh_timer = none
+        retirees = gb_sets:new(),
+        shutdowns = gb_sets:new(),
+        atomics = atomics:new(2, [{signed, false}]),
+        %
+        probing_timer = none,
+        probes = []
     },
 
     State2 = start_missing_workers(State),
-    {ok, State2}.
+    State3 = State2#state{probing_timer = schedule_probing()},
+    {ok, State3}.
 
 %-spec handle_call(Request, From, State) -> {stop, Reason, State} when
 %    Request :: term(),
@@ -168,8 +206,17 @@ handle_cast(Request, State) ->
 %    State :: state().
 handle_info({worker_ready, Pid}, State) ->
     handle_worker_ready(Pid, State);
-handle_info(wake_up, State) ->
-    handle_wake_up(State);
+handle_info({worker_retired, Pid, ShutdownTs}, State) ->
+    handle_worker_retirement(Pid, ShutdownTs, State);
+handle_info(refresh_probing, State) ->
+    false = erlang:cancel_timer(State#state.probing_timer),
+    State2 = State#state{probing_timer = schedule_probing()},
+    State3 = refresh_probing(State2),
+    State4 = drop_old_probes(State3),
+    State5 = react(State4),
+    {noreply, State5};
+handle_info({Tag, Reply}, State) ->
+    handle_tagged_reply(Tag, Reply, State);
 handle_info({'EXIT', Pid, Reason}, State) ->
     handle_linked_process_exit(Pid, Reason, State);
 handle_info(Info, State) ->
@@ -198,33 +245,40 @@ start_missing_workers(
 ) when
     map_size(Workers) < MinWorkers
 ->
+    UpdatedState = start_worker(false, State),
+    start_missing_workers(Settings, UpdatedState);
+start_missing_workers(#settings{}, #state{} = State) ->
+    State.
+
+start_worker(AutoRetire, State) ->
+    ?assertEqual([], gb_sets:to_list(State#state.retirees)),
+    ?assertEqual([], gb_sets:to_list(State#state.shutdowns)),
+
+    logger:notice("Expanding pool to ~p", [map_size(State#state.workers) + 1]),
+
     Args = #{
         broker => State#state.broker,
         cb => cbroker_testworker1,
-        cb_args => [todo]
+        cb_args => [todo],
+        auto_retire => AutoRetire,
+        atomics => State#state.atomics
     },
     {ok, Pid} = cbroker_worker:start_link(Args),
 
     Worker = #worker{
         pid = Pid,
         start_ts = timestamp_now(),
-        ready_ts = none
+        ready_ts = none,
+        auto_retires = AutoRetire,
+        retire_ts = none,
+        shutdown_ts = none
     },
 
-    UpdatedWorkers = Workers#{Pid => Worker},
-    UpdatedState = State#state{workers = UpdatedWorkers},
-    start_missing_workers(Settings, UpdatedState);
-start_missing_workers(#settings{}, #state{} = State) ->
-    State.
+    UpdatedWorkers = (State#state.workers)#{Pid => Worker},
+
+    State#state{workers = UpdatedWorkers}.
 
 %%%
-
-handle_wake_up(#state{refresh_timer = RefreshTimer} = State) when is_reference(RefreshTimer) ->
-    % already awake
-    State;
-handle_wake_up(#state{refresh_timer = none} = State) ->
-    %refresh(State).
-    State.
 
 handle_worker_ready(Pid, #state{workers = Workers} = State) ->
     Worker = #worker{ready_ts = none} = maps:get(Pid, Workers),
@@ -233,14 +287,186 @@ handle_worker_ready(Pid, #state{workers = Workers} = State) ->
     UpdatedState = State#state{workers = UpdatedWorkers},
     {noreply, UpdatedState}.
 
+handle_worker_retirement(Pid, ShutdownTs, #state{workers = Workers, retirees = Retirees, shutdowns = Shutdowns} = State) ->
+    Worker = #worker{} = maps:get(Pid, Workers),
+    ?assertEqual(none, Worker#worker.retire_ts),
+
+    UpdatedWorker = Worker#worker{
+        retire_ts = timestamp_now(),
+        shutdown_ts = ShutdownTs
+    },
+    UpdatedWorkers = Workers#{Pid := UpdatedWorker},
+    UpdatedRetirees = gb_sets:insert(Pid, Retirees),
+
+    Shutdown = [ShutdownTs | Pid],
+    UpdatedShutdowns = gb_sets:insert(Shutdown, Shutdowns),
+
+    logger:notice("Shrinking active pool to ~p (~p)", [map_size(UpdatedWorkers) - gb_sets:size(UpdatedRetirees), Pid]),
+
+    UpdatedState = State#state{
+                     workers = UpdatedWorkers, 
+                     retirees = UpdatedRetirees,
+                     shutdowns = UpdatedShutdowns
+                    },
+    {noreply, UpdatedState}.
+
 %%%
 
 handle_linked_process_exit(Pid, _Reason, #state{workers = Workers} = State) ->
-    {#worker{}, Remaining} = maps:take(Pid, Workers),
-    UpdatedState = State#state{workers = Remaining},
-    start_missing_workers(UpdatedState).
+    case maps:take(Pid, Workers) of
+        {#worker{} = Worker, Remaining} ->
+            handle_worker_exit(Pid, Worker, Remaining, State);
+        %
+        error ->
+            {noreply, State}
+    end.
+
+handle_worker_exit(Pid, Worker, Remaining, #state{retirees = Retirees, shutdowns = Shutdowns} = State) ->
+    {UpdatedRetirees, UpdatedShutdowns} =
+        case Worker#worker.retire_ts of
+            none ->
+                logger:notice("Shrinking pool to ~p (DIDNT RETIRE)", [map_size(Remaining)]),
+                {Retirees, Shutdowns};
+            %
+            _ ->
+                %logger:notice("Retired worker ~p terminated", [Pid]),
+                ShutdownTs = Worker#worker.shutdown_ts,
+                ?assertNotEqual(none, ShutdownTs),
+                Shutdown = [ShutdownTs | Pid],
+                {
+                 gb_sets:delete(Pid, Retirees),
+                 gb_sets:delete(Shutdown, Shutdowns)
+                }
+        end,
+
+
+    State2 = State#state{
+               workers = Remaining, 
+               retirees = UpdatedRetirees,
+               shutdowns = UpdatedShutdowns
+              },
+
+    State3 = start_missing_workers(State2),
+    {noreply, State3}.
 
 %%%
 
 timestamp_now() ->
     erlang:monotonic_time(native).
+
+%%%
+
+
+schedule_probing() ->
+    erlang:send_after(?PROBING_INTERVAL, self(), refresh_probing).
+
+refresh_probing(#state{probes = [#probe{ts = Ts, tag = Tag, sojourn_time = none} = Probe | NextProbes]} = State) ->
+    _ = cbroker_nif:cancel(State#state.broker, Tag),
+    SojournTime = timestamp_now() - Ts,
+    UpdatedProbe = Probe#probe{sojourn_time = SojournTime, cancelled = true},
+    UpdatedState = State#state{
+        probes = [UpdatedProbe | NextProbes], 
+        missed_probes = State#state.missed_probes + 1
+    },
+    refresh_probing(UpdatedState);
+refresh_probing(#state{broker = Broker} = State) ->
+    case cbroker_nif:ask(Broker, left, probe, true, false) of
+        {await, Tag} ->
+            Probe = #probe{ts = timestamp_now(), tag = Tag, sojourn_time = none, cancelled = false},
+            State#state{probes = [Probe | State#state.probes]};
+        %
+        {match, _, _, SojournTime} ->
+            Probe = #probe{ts = timestamp_now(), tag = none, sojourn_time = SojournTime, cancelled = false},
+            State#state{probes = [Probe | State#state.probes], missed_probes = 0};
+        %
+        retry ->
+            refresh_probing(State)
+    end.
+
+handle_tagged_reply(Tag, Reply, #state{probes = [#probe{tag = Tag, sojourn_time = none} = Probe | NextProbes]} = State) ->
+    ?assertEqual(none, Probe#probe.sojourn_time),
+
+    SojournTime =
+        case Reply of
+            {match, _, _, SojournT} ->
+                SojournT;
+            %
+            cancelled ->
+                % Good enough approximation
+                timestamp_now() - Probe#probe.ts
+        end,
+
+    UpdatedProbe = Probe#probe{sojourn_time = SojournTime},
+    State2 = State#state{probes = [UpdatedProbe | NextProbes], missed_probes = 0},
+    {noreply, State2};
+handle_tagged_reply(_Tag, _Reply, #state{probes = [#probe{} | _]} = State) ->
+    % Too late
+    {noreply, State}.
+
+drop_old_probes(#state{probes = Probes} = State) ->
+    State#state{probes = lists:sublist(Probes, ceil(1_000 / ?PROBING_INTERVAL))}.
+
+react(#state{missed_probes = 0} = State) ->
+    State;
+react(#state{workers = Workers, retirees = Retirees} = State) ->
+    #settings{max_workers = MaxWorkers} = State#state.settings,
+
+    N = map_size(Workers) - gb_sets:size(Retirees),
+    NewN = min(MaxWorkers, max(N +1, floor(1.07 * N))),
+    ?assertMatch(_ when NewN >= N, {NewN, N}),
+
+    more_workers(NewN - N, State).
+
+
+more_workers(Amount, #state{shutdowns = Shutdowns} = State) ->
+    MinShutdownTs = timestamp_now() + 50,
+
+    ResumptionIter = gb_sets:iterator_from([MinShutdownTs], Shutdowns),
+
+    more_workers_recur(Amount, gb_sets:next(ResumptionIter), State).
+
+more_workers_recur(Amount, {Shutdown, ResumptionIter}, State) when Amount > 0 ->
+    [ShutdownTs | Pid] = Shutdown,
+
+    Worker = #worker{} = maps:get(Pid, State#state.workers),
+    ?assertNotEqual(none, Worker#worker.retire_ts),
+    ?assertNotEqual(none, Worker#worker.shutdown_ts),
+    ?assertEqual(ShutdownTs, Worker#worker.shutdown_ts),
+
+    logger:notice("Resuming worker ~p (size ~p)", [Pid, map_size(State#state.workers) - gb_sets:size(State#state.retirees) + 1]),
+    _ = Pid ! resume,
+
+    UpdatedWorker = Worker#worker{retire_ts = none, shutdown_ts = none},
+    UpdatedWorkers = (State#state.workers)#{Pid := UpdatedWorker},
+    RemainingRetirees = gb_sets:delete(Pid, State#state.retirees),
+    RemainingShutdowns = gb_sets:delete(Shutdown, State#state.shutdowns),
+
+    UpdatedState = State#state{
+        workers = UpdatedWorkers,
+        retirees = RemainingRetirees,
+        shutdowns = RemainingShutdowns
+    },
+
+    Next = gb_sets:next(ResumptionIter),
+    more_workers_recur(Amount - 1, Next, UpdatedState);
+more_workers_recur(Amount, none, State) when Amount > 0 ->
+    AutoRetire = map_size(State#state.workers) >= (State#state.settings)#settings.min_workers,
+    UpdatedState = start_worker(AutoRetire, State),
+    more_workers_recur(Amount - 1, none, UpdatedState);
+more_workers_recur(0, _, State) ->
+    State.
+
+% count_in_flight(Workers) ->
+%     List = maps:values(Workers),
+%     count_in_flight_recur(List).
+% 
+% count_in_flight_recur([#worker{ready_ts = ReadyTs} | Next]) ->
+%     case ReadyTs =:= none of
+%         true ->
+%             1 + count_in_flight_recur(Next);
+%         %
+%         false ->
+%             count_in_flight_recur(Next)
+%     end;
+% count_in_flight_recur([]) ->
+%     0.

@@ -21,6 +21,7 @@
 %% ------------------------------------------------------------------
 
 init([todo]) ->
+    timer:sleep(rand:uniform(100)),
     {ok, #state{}}.
 
 handle_work({sleep_between, Min, Max}, _From, State) ->
