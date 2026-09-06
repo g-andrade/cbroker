@@ -4,11 +4,13 @@
 -moduledoc "FIXME: one-line summary of this module.".
 -endif.
 
+-behaviour(cbroker_worker).
+
 %% ------------------------------------------------------------------
 %% API Function Exports
 %% ------------------------------------------------------------------
 
--export([init/1, handle_work/3]).
+-export([init/1, handle_request/3]).
 
 %% ------------------------------------------------------------------
 %% Type Definitions
@@ -24,7 +26,7 @@ init([todo]) ->
     timer:sleep(rand:uniform(100)),
     {ok, #state{}}.
 
-handle_work({sleep_between, Min, Max}, _From, State) ->
+handle_request({sleep_between, Min, Max}, _From, State) ->
     NapTime = Min + rand:uniform(Max - Min) - 1,
     timer:sleep(NapTime),
     {reply, {alright, self()}, State}.

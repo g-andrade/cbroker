@@ -13,7 +13,8 @@
 -export([
     child_spec/0,
     start_link/0,
-    get_broker/0
+    get_broker/0,
+    run/2
 ]).
 
 -ignore_xref([start_link/0]).
@@ -43,7 +44,7 @@
 
 -record(state, {
     settings :: settings(),
-    broker :: reference(),
+    broker :: cbroker_nif:broker(),
     workers :: #{pid() => worker()}
 }).
 -type state() :: #state{}.
@@ -81,6 +82,42 @@ start_link() ->
 
 get_broker() ->
     persistent_term:get({ahhh, ?SERVER}).
+
+run(Min, Max) ->
+    Broker = get_broker(),
+    Request = {sleep_between, Min, Max},
+
+    case cbroker_nif:ask(Broker, left, {self(), Request}, false) of
+        {await, Tag} ->
+            receive
+                {Tag, Result} ->
+                    case Result of
+                        {match, MatchRef, WorkerPid} ->
+                            run_match(MatchRef, WorkerPid);
+                        %
+                        cancelled ->
+                            run(Min, Max)
+                    end
+            end;
+        %
+        {match, MatchRef, WorkerPid} ->
+            run_match(MatchRef, WorkerPid);
+        %
+        retry ->
+            run(Min, Max)
+    end.
+
+run_match(MatchRef, WorkerPid) ->
+    Mon = monitor(process, WorkerPid),
+
+    receive
+        {MatchRef, Reply} ->
+            demonitor(Mon, [flush]),
+            Reply;
+        %
+        {'DOWN', Mon, _, _, Reason} ->
+            error({worker_down, WorkerPid, Reason})
+    end.
 
 %% ------------------------------------------------------------------
 %% gen_server Function Definitions
@@ -162,7 +199,7 @@ start_worker(State) ->
 
     Args = #{
         broker => State#state.broker,
-        cb => cbroker_testworker1,
+        cb => cbroker_testworker2,
         cb_args => [todo]
     },
     {ok, Pid} = cbroker_worker:start_link(Args),
