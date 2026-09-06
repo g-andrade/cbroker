@@ -894,6 +894,7 @@ static ERL_NIF_TERM batch_offset_ask(ask_ctx_t* ctx, batch_t* batch, offset_t of
             opposite_match = atomic_exchange(&cell->match, &sentinel_match_cancelled);
 
             if (opposite_match != NULL) {
+                // FIXME can we actually send messages?!
                 // The other side is already awaiting us; message it with the cancellation
                 ErlNifEnv* tmp_env = env_pool_get(
                     ctx->local_state); // need a tmp env or we won't be able to send message
