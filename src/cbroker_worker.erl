@@ -38,8 +38,6 @@
 %% Macro Definitions
 %% ------------------------------------------------------------------
 
--define(IDLE_TIMEOUT, 150).
-
 %% ------------------------------------------------------------------
 %% Record and Type Definitions
 %% ------------------------------------------------------------------
@@ -47,28 +45,28 @@
 -type init_args() :: #{
     broker := reference(),
     cb := module(),
-    cb_args := term(),
-    auto_retire := boolean(),
-    atomics := atomics:atomics_ref()
+    cb_args := term()
 }.
 -export_type([init_args/0]).
 
 -record(state, {
     invariants :: invariants(),
     cb_state :: term(),
-    status :: idle | {waiting, Tag :: term(), Timer :: reference()} | working | {retired, reference(), reference()},
-    last_probe_sojourn :: none | non_neg_integer()
+    status :: status()
 }).
 -type state() :: #state{}.
 
 -record(invariants, {
     parent :: pid(),
     broker :: reference(),
-    cb :: module(),
-    auto_retire :: boolean(),
-    atomics :: atomics:atomics_ref()
+    cb :: module()
 }).
 -type invariants() :: #invariants{}.
+
+-type status() ::
+    idle
+    | {waiting, Tag :: term()}
+    | working.
 
 %% ------------------------------------------------------------------
 %% API Function Definitions
@@ -87,9 +85,7 @@ init(Parent, Args) ->
     #{
         broker := Broker,
         cb := Cb,
-        cb_args := CbArgs,
-        auto_retire := AutoRetire,
-        atomics := Atomics
+        cb_args := CbArgs
     } = Args,
 
     Debug = sys:debug_options([]),
@@ -101,16 +97,13 @@ init(Parent, Args) ->
     Invariants = #invariants{
         parent = Parent,
         broker = Broker,
-        cb = Cb,
-        auto_retire = AutoRetire,
-        atomics = Atomics
+        cb = Cb
     },
 
     State = #state{
         invariants = Invariants,
         cb_state = CbState,
-        status = idle,
-        last_probe_sojourn = none
+        status = idle
     },
     loop(Debug, State).
 
@@ -150,14 +143,12 @@ loop(Debug, #state{status = idle, invariants = Invariants} = State) ->
     after 0 ->
         #invariants{broker = Broker} = Invariants,
 
-        case cbroker_nif:ask(Broker, right, self(), true) of
+        case cbroker_nif:ask(Broker, right, self(), false) of
             retry ->
                 loop(Debug, State);
             %
             {await, Tag} ->
-                Timeout = idle_timeout(State),
-                Timer = maybe_start_match_timer(Timeout, Tag),
-                UpdatedState = State#state{status = {waiting, Tag, Timer}},
+                UpdatedState = State#state{status = {waiting, Tag}},
                 loop(Debug, UpdatedState);
             %
             MatchResult ->
@@ -174,77 +165,26 @@ loop(Debug, #state{} = State) ->
 
 %%
 
-idle_timeout(#state{invariants = #invariants{auto_retire = AutoRetire}, last_probe_sojourn = LastProbeSojourn}) ->
-    case AutoRetire of
-        true when LastProbeSojourn =:= none ->
-            ?IDLE_TIMEOUT;
-        %
-        true ->
-            max(0, ?IDLE_TIMEOUT - erlang:convert_time_unit(LastProbeSojourn, native, millisecond));
-            %10;
-        %
-        _ ->
-            infinity
-    end.
-
-maybe_start_match_timer(infinity, _) ->
-    none;
-maybe_start_match_timer(Timeout, Tag) ->
-    erlang:send_after(Timeout, self(), {timeout, Tag}).
-
-maybe_cancel_timer(none) -> false;
-maybe_cancel_timer(Timer) -> erlang:cancel_timer(Timer).
-
-%%
-
-handle_match_timeout(#state{status = {waiting, Tag, Timer}} = State) ->
-    false = maybe_cancel_timer(Timer),
-    #invariants{broker = Broker} = State#state.invariants,
-
-    case cbroker_nif:cancel(Broker, Tag) of
-        cancelled ->
-            ShutdownRef = make_ref(),
-            ShutdownTimeout = 5_000 + rand:uniform(10_000),
-            ScheduledShutdownTs = erlang:monotonic_time(native) + erlang:convert_time_unit(ShutdownTimeout, millisecond, native),
-            ShutdownTimer = erlang:send_after(ShutdownTimeout, self(), {shutdown, ShutdownRef}),
-            state_parent(State) ! {worker_retired, self(), ScheduledShutdownTs},
-            State#state{status = {retired, ShutdownTimer, ShutdownRef}};
-        %
-        too_late ->
-            State
-    end.
-
-handle_match_result({match, MatchRef, Request, SojournTime}, State) ->
-    %logger:notice("SojournTime is ~p ms", [erlang:convert_time_unit(SojournTime, native, millisecond)]),
-    #invariants{atomics = Atomics} = State#state.invariants,
-    atomics:add(Atomics, 1, SojournTime),
-    atomics:add(Atomics, 2, 1),
+handle_match_result({match, MatchRef, Request}, State) ->
     State2 = State#state{status = working},
-    handle_request(MatchRef, Request, SojournTime, State2);
+    handle_request(MatchRef, Request, State2);
 handle_match_result(cancelled, State) ->
     State#state{status = idle}.
 
-handle_request(MatchRef, {Pid, Work}, _, #state{cb_state = CbState} = State) ->
-    #invariants{cb = Cb, atomics = Atomics} = State#state.invariants,
+handle_request(MatchRef, {Pid, Work}, #state{cb_state = CbState} = State) ->
+    #invariants{cb = Cb} = State#state.invariants,
 
     case Cb:handle_work(Work, {Pid, MatchRef}, CbState) of
         {reply, Reply, UpdatedCbState} ->
-            atomics:add(Atomics, 2, -1),
             _ = Pid ! {MatchRef, Reply},
             State#state{
-              cb_state = UpdatedCbState, 
-              status = idle,
-              last_probe_sojourn = none
-             }
+                cb_state = UpdatedCbState,
+                status = idle
+            }
         %
         % {error, _} ->
         %
-    end;
-handle_request(_MatchRef, probe, SojournTime, State) ->
-    State#state{
-      status = idle,
-      last_probe_sojourn = SojournTime
-     }.
+    end.
 
 %%
 
@@ -257,11 +197,8 @@ handle_msg(Msg, Debug, State) ->
     loop(UpdatedDebug, UpdatedState).
 
 -spec handle_non_system_msg(term(), state()) -> state() | no_return().
-handle_non_system_msg({Tag, Result}, #state{status = {waiting, Tag, Timer}} = State) ->
-    _ = maybe_cancel_timer(Timer),
+handle_non_system_msg({Tag, Result}, #state{status = {waiting, Tag}} = State) ->
     handle_match_result(Result, State);
-handle_non_system_msg({timeout, Tag}, #state{status = {waiting, Tag, _Timer}} = State) ->
-    handle_match_timeout(State);
 handle_non_system_msg({timeout, _Tag}, #state{} = State) ->
     % late timeout
     State;

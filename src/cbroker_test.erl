@@ -1,28 +1,29 @@
 -module(cbroker_test).
 
 -export(
-   [
-    run_pool/2,
-    test2_start/0,
-    test2_set_rate/1,
-    test2_stop/0
-   ]
-  ).
+    [
+        run_pool/2,
+        test2_start/0,
+        test2_set_rate/1,
+        test2_stop/0
+    ]
+).
 
 run_pool(Rate, Duration) ->
     Pids = lists:map(
-      fun (WorkerNr) ->
-              InitialDelay = round(1000 * (WorkerNr / Rate)),
-              spawn_link(fun () ->
-                            timer:sleep(InitialDelay),
-                            run_pool_worker(Duration)
-                    end)
-      end,
-      lists:seq(1, Rate)),
+        fun(WorkerNr) ->
+            InitialDelay = round(1000 * (WorkerNr / Rate)),
+            spawn_link(fun() ->
+                timer:sleep(InitialDelay),
+                run_pool_worker(Duration)
+            end)
+        end,
+        lists:seq(1, Rate)
+    ),
 
     timer:sleep(Duration),
 
-    lists:foreach(fun (Pid) -> Pid ! finish end, Pids),
+    lists:foreach(fun(Pid) -> Pid ! finish end, Pids),
 
     ok.
 
@@ -47,9 +48,8 @@ run_pool_worker(Duration) ->
     receive
         finish ->
             ok
-    after 
-        1_000 ->
-            run_pool_worker(Duration)
+    after 1_000 ->
+        run_pool_worker(Duration)
     end.
 
 %%
@@ -64,9 +64,11 @@ run_test2_loop(Broker, Requests, RequestsPerLoop) ->
     NrOfRequest = prob_round(RequestsPerLoop),
     Requests2 = do_asks(Broker, Requests, NrOfRequest),
 
-    case flush_inbox(Requests2, RequestsPerLoop)  of
+    case flush_inbox(Requests2, RequestsPerLoop) of
         {continue, Requests3, UpdatedRequestsPerLoop} ->
-            receive after 1 -> ok end,
+            receive
+            after 1 -> ok
+            end,
             run_test2_loop(Broker, Requests3, UpdatedRequestsPerLoop);
         %
         stop ->
@@ -121,9 +123,8 @@ flush_inbox(Requests, RequestsPerLoop) ->
         %
         stop ->
             stop
-    after
-        0 ->
-            {continue, Requests, RequestsPerLoop}
+    after 0 ->
+        {continue, Requests, RequestsPerLoop}
     end.
 
 async_ask(Broker, Requests) ->
