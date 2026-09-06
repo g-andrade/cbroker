@@ -5,8 +5,7 @@
     ask/4,
     ask/5,
     cancel/2,
-    to_list/1,
-    read_balance/2
+    to_list/1
 ]).
 
 -on_load(init/0).
@@ -29,9 +28,6 @@ cancel(_Broker, _Ticket) ->
     not_loaded(?LINE).
 
 to_list(_Broker) ->
-    not_loaded(?LINE).
-
-read_balance(_Broker, _GoingToSleep) ->
     not_loaded(?LINE).
 
 %%
