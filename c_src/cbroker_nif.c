@@ -1475,7 +1475,7 @@ static void* mempool_get(mempool_t* pool)
 
 static void mempool_return(mempool_t* pool, void* obj)
 {
-    if (pool->count >= TARGET_MEMPOOL_SIZE) { // FIXME
+    if (pool->count >= TARGET_MEMPOOL_SIZE) {
         pool->free_cb(obj);
         return;
     }

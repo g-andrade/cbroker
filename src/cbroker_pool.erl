@@ -480,6 +480,9 @@ nb_checkout(Broker) ->
             {ok, Handle, WorkerPid};
         %
         retry ->
+            full;
+        %
+        self_cancelled ->
             full
     end.
 
