@@ -23,15 +23,19 @@
     X(_delayed_match,        "delayed_match") \
     X(_error,                "error") \
     X(_false,                "false") \
+    X(_fully_async,          "fully_async") \
     X(_instant_match_first,  "instant_match_first") \
     X(_instant_match_second, "instant_match_second") \
     X(_left,                 "left")  \
     X(_match,                "match") \
+    X(_nb,                   "nb") \
     X(_none,                 "none") \
     X(_not_owner,            "not_owner") \
     X(_ok,                   "ok") \
+    X(_regular,              "regular") \
     X(_retry,                "retry") \
     X(_right,                "right") \
+    X(_self_cancelled,       "self_cancelled") \
     X(_self_stopped,         "self_stopped") \
     X(_too_late,             "too_late") \
     X(_true,                 "true") \
@@ -169,6 +173,7 @@ typedef struct {
     ERL_NIF_TERM side;
     bool is_left;
     bool with_stats;
+    bool is_nb;
     local_state_t* local_state;
     //
     ErlNifPid self;
@@ -414,7 +419,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     memset(&ctx, 0, sizeof(ask_ctx_t));
 
     ctx.env = env;
-    bool is_fully_async = false;
+    ERL_NIF_TERM ask_type = Atoms._regular;
 
     ctx.broker_term = argv[0];
     ctx.side = argv[1];
@@ -446,7 +451,15 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         return make_badarg(env, with_stats_term);
     }
 
-    is_fully_async = (argc >= 5 && argv[4] == Atoms._true);
+    if (argc >= 5) {
+        ask_type = argv[4];
+        if (ask_type == Atoms._nb) {
+            ctx.is_nb = true;
+        }
+        else if (ask_type != Atoms._regular && ask_type != Atoms._fully_async) {
+            return make_badarg(env, ask_type);
+        }
+    }
 
     ////////////////////////////
 
@@ -501,7 +514,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             batch_consume_local_slot(ctx.broker, ctx.local_state, success.batch);
         }
 
-        if (is_fully_async) {
+        if (ask_type == Atoms._fully_async) {
             notify_of_match(&ctx, &ctx.self, opposite_match_ptr, ctx.side, batch_id, offset,
                             match_ref, ctx.with_stats, our_enqueue_time);
             assert(success.opposite_match == NULL);
@@ -871,7 +884,28 @@ static ERL_NIF_TERM batch_offset_ask(ask_ctx_t* ctx, batch_t* batch, offset_t of
 
     cell_t* cell = &batch->cells[cell_offset];
 
-    cell_count_t cell_count = 1 + atomic_fetch_add_explicit(&cell->count, 1, memory_order_relaxed);
+    cell_count_t cell_count = 0;
+
+    if (ctx->is_nb) {
+        cell_count = 1;
+        atomic_compare_exchange_strong(&cell->count, &cell_count, 2);
+    }
+    else {
+        cell_count = 1 + atomic_fetch_add_explicit(&cell->count, 1, memory_order_relaxed);
+    }
+
+    //
+
+    if (cell_count == 0) {
+        if (atomic_compare_exchange_strong(&cell->count, &cell_count, CELL_COUNT_CANCELLED)) {
+            out->consume_slot = true;
+            return Atoms._self_cancelled;
+        }
+        else if (cell_count < 0) {
+            return Atoms._self_cancelled;
+        }
+        // too late to cancel
+    }
 
     if (cell_count == 1) {
         match_t* opposite_match = NULL;

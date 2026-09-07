@@ -4,7 +4,7 @@
 -moduledoc "FIXME: one-line summary of this module.".
 -endif.
 
--behaviour(cbroker_worker).
+-behaviour(cbroker_handler).
 
 %% ------------------------------------------------------------------
 %% API Function Exports

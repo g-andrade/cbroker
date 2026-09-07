@@ -86,5 +86,5 @@ child_specs() ->
     [
         cbroker_simple:child_spec(),
         cbroker_serv:child_spec(test),
-        cbroker_pool:child_spec()
+        cbroker_pool:child_spec(magic, cbroker_testworker3, [todo], [{size, 8}])
     ].

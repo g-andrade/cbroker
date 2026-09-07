@@ -21,6 +21,9 @@
 -type side() :: left | right.
 -export_type([side/0]).
 
+-type ask_type() :: regular | nb | fully_async.
+-export_type([ask_type/0]).
+
 -opaque tag() :: {side(), batch_id(), offset()}.
 -export_type([tag/0]).
 
@@ -64,7 +67,7 @@ when
 ask(_Broker, _Side, _Value, _WithStats) ->
     not_loaded(?LINE).
 
--spec ask(Broker, Side, Value, WithStats, true) ->
+-spec ask(Broker, Side, Value, WithStats, AskType) ->
     {await, Tag}
     | retry
 when
@@ -72,8 +75,9 @@ when
     Side :: side(),
     Value :: term(),
     WithStats :: boolean(),
+    AskType :: ask_type(),
     Tag :: tag().
-ask(_Broker, _Side, _Value, _WithStats, _IsFullyAsync) ->
+ask(_Broker, _Side, _Value, _WithStats, _AskType) ->
     not_loaded(?LINE).
 
 -spec cancel(Broker, Tag) -> cancelled | too_late when

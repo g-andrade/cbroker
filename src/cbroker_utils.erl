@@ -1,35 +1,43 @@
--module(cbroker_testworker1).
+-module(cbroker_utils).
 
 -ifdef(E48).
 -moduledoc "FIXME: one-line summary of this module.".
 -endif.
 
--behaviour(cbroker_handler).
-
 %% ------------------------------------------------------------------
 %% API Function Exports
 %% ------------------------------------------------------------------
 
--export([init/1, handle_request/3]).
+-export([
+    reg_name/1,
+    dispatching_name/1,
+    is_termination_reason_wholesome/1
+]).
 
 %% ------------------------------------------------------------------
 %% Type Definitions
 %% ------------------------------------------------------------------
 
--record(state, {}).
-
 %% ------------------------------------------------------------------
 %% API Function Definitions
 %% ------------------------------------------------------------------
 
-init([todo]) ->
-    timer:sleep(rand:uniform(100)),
-    {ok, #state{}}.
+-spec reg_name(atom() | Other) -> {local, atom()} | Other.
+reg_name(Local) when is_atom(Local) ->
+    {local, Local};
+reg_name(Name) ->
+    Name.
 
-handle_request({sleep_between, Min, Max}, _From, State) ->
-    NapTime = Min + rand:uniform(Max - Min) - 1,
-    timer:sleep(NapTime),
-    {reply, {alright, self()}, State}.
+-spec dispatching_name({local, atom()} | Other) -> atom() | Other.
+dispatching_name({local, Local}) when is_atom(Local) ->
+    Local;
+dispatching_name(Name) ->
+    Name.
+
+is_termination_reason_wholesome(normal) -> true;
+is_termination_reason_wholesome(shutdown) -> true;
+is_termination_reason_wholesome({shutdown, _}) -> true;
+is_termination_reason_wholesome(_) -> false.
 
 %% ------------------------------------------------------------------
 %% Internal Function Definitions

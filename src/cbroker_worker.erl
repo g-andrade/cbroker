@@ -10,31 +10,16 @@
 %% Callback Definitions
 %% ------------------------------------------------------------------
 
--callback init(Args) -> init_ret() when
+-callback start_link(Args) -> {ok, pid()} | {error, term()} when
     Args :: term().
-
--callback handle_request(Request, From, State) -> handle_request_ret(State) when
-    Request :: term(),
-    From :: from().
-
--callback handle_requester_down(From, Reason, State) -> handle_requester_down_ret(State) when
-    From :: from(),
-    Reason :: term().
-
--callback handle_info(Info, State) -> handle_info_ret(State) when
-    Info :: term().
-
--optional_callbacks([
-    handle_requester_down/3,
-    handle_info/2
-]).
 
 %% ------------------------------------------------------------------
 %% API Function Exports
 %% ------------------------------------------------------------------
 
 -export([
-    start_link/1
+    start_link/1,
+    checkin/1
 ]).
 
 %% ------------------------------------------------------------------
@@ -72,57 +57,27 @@
 }.
 -export_type([init_args/0]).
 
--type init_ret() :: {ok, CbState :: term()}.
--export_type([init_ret/0]).
-
--type from() :: {pid(), cbroker_nif:match_ref()}.
--export_type([from/0]).
-
-% TODO
--type handle_request_ret(State) ::
-    ({reply, Reply :: term(), State}
-    | {reply_later, State}
-    | {slot_take, State}
-    | {stream_start, Msg :: term(), State}).
--export_type([handle_request_ret/1]).
-
--type handle_requester_down_ret(State) ::
-    ({cancelled, State}
-    | {cancelling, State}).
--export_type([handle_requester_down_ret/1]).
-
--type handle_info_ret(State) ::
-    ({cancelled, from(), State}
-    | {noreply, State}
-    | {reply, from(), Msg :: term(), State}
-    | {slot_return, State}
-    | {stream, from(), Msg :: term(), State}).
--export_type([handle_info_ret/1]).
-
 %%
 
 -record(state, {
     invariants :: invariants(),
-    cb_state :: term(),
-    slots :: non_neg_integer(),
-    waiters :: #{cbroker_nif:tag() => waiting},
-    jobs :: #{cbroker_nif:match_ref() => job()},
-    mons :: #{reference() => cbroker_nif:match_ref()}
+    status :: status()
 }).
 -type state() :: #state{}.
 
 -record(invariants, {
     parent :: pid(),
     broker :: reference(),
-    cb :: module()
+    cb :: module(),
+    cb_pid :: pid(),
+    cb_mon :: reference()
 }).
 -type invariants() :: #invariants{}.
 
--record(job, {
-    requester_pid :: pid(),
-    requester_mon :: reference()
-}).
--type job() :: #job{}.
+-type status() ::
+    (idle
+    | {waiting, cbroker_nif:tag()}
+    | {checked_out, pid(), Monitor :: reference()}).
 
 %% ------------------------------------------------------------------
 %% API Function Definitions
@@ -131,6 +86,11 @@
 -spec start_link(init_args()) -> {ok, pid()} | {error, {already_started, pid()}}.
 start_link(Args) ->
     proc_lib:start_link(?MODULE, init, [self(), Args]).
+
+-spec checkin(pid()) -> ok.
+checkin(Pid) ->
+    _ = Pid ! {checkin, self()},
+    ok.
 
 %% ------------------------------------------------------------------
 %% sys Function Definitions
@@ -147,22 +107,20 @@ init(Parent, Args) ->
     Debug = sys:debug_options([]),
     proc_lib:init_ack(Parent, {ok, self()}),
 
-    {ok, CbState} = cb_init(Cb, CbArgs),
+    {ok, Pid} = cb_start_link(Cb, CbArgs),
     _ = Parent ! {worker_ready, self()},
 
     Invariants = #invariants{
         parent = Parent,
         broker = Broker,
-        cb = Cb
+        cb = Cb,
+        cb_pid = Pid,
+        cb_mon = monitor(process, Pid)
     },
 
     State = #state{
         invariants = Invariants,
-        cb_state = CbState,
-        slots = 10,
-        waiters = #{},
-        jobs = #{},
-        mons = #{}
+        status = idle
     },
     loop(Debug, State).
 
@@ -192,21 +150,8 @@ system_code_change(#state{} = State, _Module, _OldVsn, _Extra) ->
 %% Callback Invokers
 %% ------------------------------------------------------------------
 
--spec cb_init(module(), term()) -> init_ret().
-cb_init(Cb, Args) ->
-    Cb:init(Args).
-
--spec cb_handle_request(module(), term(), from(), State) -> handle_request_ret(State).
-cb_handle_request(Cb, Request, From, CbState) ->
-    Cb:handle_request(Request, From, CbState).
-
--spec cb_handle_requester_down(module(), from(), term(), State) -> handle_requester_down_ret(State).
-cb_handle_requester_down(Cb, From, Reason, CbState) ->
-    Cb:handle_requester_down(From, Reason, CbState).
-
--spec cb_handle_info(module(), term(), State) -> handle_info_ret(State).
-cb_handle_info(Cb, Info, CbState) ->
-    Cb:handle_info(Info, CbState).
+cb_start_link(Cb, Args) ->
+    Cb:start_link(Args).
 
 %% ------------------------------------------------------------------
 %% Internal Function Definitions
@@ -215,9 +160,7 @@ cb_handle_info(Cb, Info, CbState) ->
 state_parent(#state{invariants = #invariants{parent = Parent}}) ->
     Parent.
 
-loop(Debug, #state{slots = Slots} = State) when
-    Slots > 0
-->
+loop(Debug, #state{status = idle} = State) ->
     receive
         Msg ->
             handle_msg(Msg, Debug, State)
@@ -243,21 +186,41 @@ handle_msg(Msg, Debug, State) ->
     loop(UpdatedDebug, UpdatedState).
 
 -spec handle_non_system_msg(term(), state()) -> state() | no_return().
-handle_non_system_msg(Msg, #state{waiters = Waiters, mons = Mons} = State) ->
+handle_non_system_msg(Msg, #state{status = idle} = State) ->
+    handle_unexpected_msg(Msg, State);
+handle_non_system_msg(Msg, #state{status = {waiting, Tag}} = State) ->
     case Msg of
-        {Tag, Content} when is_map_key(Tag, Waiters) ->
-            RemainingWaiters = maps:remove(Tag, Waiters),
-            UpdatedState = State#state{waiters = RemainingWaiters},
-            handle_async_ask_reply(Content, UpdatedState);
-        %
-        {'DOWN', Mon, process, Pid, Reason} when is_map_key(Mon, Mons) ->
-            {MatchRef, RemainingMons} = maps:take(Mon, Mons),
-            UpdatedState = State#state{mons = RemainingMons},
-            handle_requester_down(Pid, MatchRef, Reason, UpdatedState);
+        {Tag, {match, _MatchRef, {checkout, CallerPid}}} ->
+            Mon = monitor(process, CallerPid),
+            State#state{status = {checked_out, CallerPid, Mon}};
         %
         _ ->
-            handle_info(Msg, State)
+            handle_unexpected_msg(Msg, State)
+    end;
+handle_non_system_msg(Msg, #state{status = {checked_out, Pid, Mon}} = State) ->
+    case Msg of
+        {checkin, Pid} ->
+            demonitor(Mon),
+            State#state{status = idle};
+        %
+        {'DOWN', Mon, _, _, _} ->
+            State#state{status = idle};
+        %
+        _ ->
+            handle_unexpected_msg(Msg, State)
     end.
+
+handle_unexpected_msg({'DOWN', Mon, process, _, _}, State) ->
+    case State#state.invariants of
+        #invariants{cb_mon = Mon} ->
+            terminate(normal);
+        _ ->
+            % Late monitor
+            State
+    end;
+handle_unexpected_msg(Msg, State) ->
+    logger:notice("Unexpected info: ~p", [Msg]),
+    State.
 
 -spec terminate(term()) -> no_return().
 terminate(Reason) ->
@@ -265,179 +228,22 @@ terminate(Reason) ->
 
 %%
 
-ask(#state{invariants = Invariants, slots = Slots, waiters = Waiters} = State) ->
-    #invariants{broker = Broker} = Invariants,
-    ?assertMatch(_ when Slots > 0, Slots),
+ask(#state{invariants = Invariants} = State) ->
+    #invariants{broker = Broker, cb_pid = CbPid} = Invariants,
+    ?assertEqual(idle, State#state.status),
 
-    logger:notice("WORKER ASKING!! (~p)", [map_size(Waiters) + 1]),
+    ExchangeValue = {self(), CbPid},
 
-    case cbroker_nif:ask(Broker, right, self(), false) of
+    logger:notice("ask!!! ~p", [self()]),
+
+    case cbroker_nif:ask(Broker, right, ExchangeValue, false) of
         {await, Tag} ->
-            UpdatedWaiters = Waiters#{Tag => waiting},
-            State#state{slots = Slots - 1, waiters = UpdatedWaiters};
+            State#state{status = {waiting, Tag}};
         %
-        {match, MatchRef, ExchangeValue} ->
-            UpdatedState = State#state{slots = Slots - 1},
-            handle_match(MatchRef, ExchangeValue, UpdatedState);
+        {match, _MatchRef, {checkout, CallerPid}} ->
+            Mon = monitor(process, CallerPid),
+            State#state{status = {checked_out, CallerPid, Mon}};
         %
         retry ->
             State
-    end.
-
-%%
-
-handle_match(
-    MatchRef,
-    {Pid, Request},
-    #state{
-        invariants = Invariants,
-        cb_state = CbState,
-        slots = Slots
-    } = State
-) ->
-    #invariants{cb = Cb} = Invariants,
-    From = {Pid, MatchRef},
-
-    case cb_handle_request(Cb, Request, From, CbState) of
-        {reply, Reply, UpdatedCbState} ->
-            _ = Pid ! {MatchRef, Reply},
-            State#state{
-                cb_state = UpdatedCbState,
-                slots = Slots + 1
-            };
-        %
-        {reply_later, UpdatedCbState} ->
-            UpdatedState = State#state{cb_state = UpdatedCbState},
-            job_start(MatchRef, Pid, UpdatedState);
-        %
-        {stream_start, StreamMsg, UpdatedCbState} ->
-            _ = Pid ! {MatchRef, StreamMsg},
-            UpdatedState = State#state{cb_state = UpdatedCbState},
-            job_start(MatchRef, Pid, UpdatedState);
-        %
-        %
-        {slot_take, UpdatedCbState} ->
-            State#state{cb_state = UpdatedCbState}
-    end.
-
-%%
-
-handle_async_ask_reply(Content, #state{} = State) ->
-    case Content of
-        {match, MatchRef, ExchangeValue} ->
-            handle_match(MatchRef, ExchangeValue, State);
-        %
-        cancelled ->
-            State#state{slots = State#state.slots + 1}
-    end.
-
-%%
-
-handle_info(Info, #state{invariants = Invariants, cb_state = CbState} = State) ->
-    #invariants{cb = Cb} = Invariants,
-
-    case cb_handle_info(Cb, Info, CbState) of
-        {noreply, UpdatedCbState} ->
-            State#state{cb_state = UpdatedCbState};
-        %
-        {cancelled, From, UpdatedCbState} ->
-            UpdatedState = State#state{cb_state = UpdatedCbState},
-            job_cancelled(From, UpdatedState);
-        %
-        {stream, From, StreamMsg, UpdatedCbState} ->
-            UpdatedState = State#state{cb_state = UpdatedCbState},
-            job_msg(From, StreamMsg, UpdatedState);
-        %
-        {reply, From, Reply, UpdatedCbState} ->
-            UpdatedState = State#state{cb_state = UpdatedCbState},
-            job_done(From, Reply, UpdatedState);
-        %
-        {slot_return, UpdatedCbState} ->
-            State#state{
-                cb_state = UpdatedCbState,
-                slots = State#state.slots + 1
-            }
-    end.
-
-%%
-
-handle_requester_down(
-    Pid,
-    MatchRef,
-    Reason,
-    #state{
-        invariants = Invariants,
-        cb_state = CbState,
-        jobs = Jobs
-    } = State
-) ->
-    #invariants{cb = Cb} = Invariants,
-
-    {Job, RemainingJobs} = maps:get(MatchRef, Jobs),
-    #job{requester_pid = Pid} = Job,
-    From = {Pid, MatchRef},
-
-    case cb_handle_requester_down(Cb, From, Reason, CbState) of
-        {cancelling, UpdatedCbState} ->
-            State#state{
-                cb_state = UpdatedCbState,
-                jobs = RemainingJobs
-            };
-        %
-        {cancelled, UpdatedCbState} ->
-            State#state{
-                cb_state = UpdatedCbState,
-                slots = State#state.slots + 1,
-                jobs = RemainingJobs
-            }
-    end.
-
-%%
-
-job_start(MatchRef, Pid, #state{jobs = Jobs, mons = Mons} = State) ->
-    ?assertEqual(false, is_map_key(MatchRef, Jobs)),
-    Mon = monitor(process, Pid),
-    Job = #job{requester_pid = Pid, requester_mon = Mon},
-    UpdatedJobs = Jobs#{MatchRef => Job},
-    UpdatedMons = Mons#{Mon => MatchRef},
-
-    State#state{
-        jobs = UpdatedJobs,
-        mons = UpdatedMons
-    }.
-
-job_msg({Pid, MatchRef}, StreamMsg, #state{jobs = Jobs} = State) ->
-    #job{requester_pid = Pid} = maps:get(MatchRef, Jobs),
-    _ = Pid ! {MatchRef, StreamMsg},
-    State.
-
-job_cancelled({MatchRef, _Pid} = From, #state{slots = Slots, jobs = Jobs} = State) ->
-    case maps:is_key(MatchRef, Jobs) of
-        true ->
-            job_done(From, cancelled, State);
-        %
-        false ->
-            State#state{slots = Slots + 1}
-    end.
-
-job_done({Pid, MatchRef}, FinalMsg, #state{slots = Slots, jobs = Jobs, mons = Mons} = State) ->
-    {Job, RemainingJobs} = maps:take(MatchRef, Jobs),
-    #job{requester_pid = Pid, requester_mon = Mon} = Job,
-
-    case maps:take(Mon, Mons) of
-        {MatchRef, RemainingMons} ->
-            demonitor(Mon, [flush]),
-            _ = Pid ! {MatchRef, FinalMsg},
-            State#state{
-                slots = Slots + 1,
-                jobs = RemainingJobs,
-                mons = RemainingMons
-            };
-        %
-        error ->
-            % Requester already terminated
-            State#state{
-                slots = Slots + 1,
-                jobs = RemainingJobs
-            }
     end.
