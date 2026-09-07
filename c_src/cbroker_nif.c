@@ -239,6 +239,9 @@ static void notify_of_match(ask_ctx_t* ctx, ErlNifPid* pid, match_t** match_ptr,
 static void notify_of_cancellation(ErlNifEnv* env, local_state_t* local_state,
                                    ERL_NIF_TERM tag_term, match_t** match_in_cell_ptr);
 
+static void notify_if_alive(ErlNifEnv* caller_env, ErlNifPid* pid, ErlNifEnv* msg_env,
+                            ERL_NIF_TERM msg);
+
 static ErlNifEnv* env_pool_get(local_state_t* local_state);
 static void env_pool_return(local_state_t* local_state, ErlNifEnv* env);
 static void* env_pool_alloc_env(void);
@@ -928,17 +931,12 @@ static ERL_NIF_TERM batch_offset_ask(ask_ctx_t* ctx, batch_t* batch, offset_t of
             opposite_match = atomic_exchange(&cell->match, &sentinel_match_cancelled);
 
             if (opposite_match != NULL) {
-                // FIXME can we actually send messages?!
                 // The other side is already awaiting us; message it with the cancellation
-                ErlNifEnv* tmp_env = env_pool_get(
-                    ctx->local_state); // need a tmp env or we won't be able to send message
                 ERL_NIF_TERM opposite_side = make_opposite_side(ctx->side);
                 ERL_NIF_TERM tag =
                     make_tag_simple(opposite_match->env, opposite_side, batch->id, offset);
-                notify_of_cancellation(tmp_env, ctx->local_state, tag, &opposite_match);
-
+                notify_of_cancellation(ctx->env, ctx->local_state, tag, &opposite_match);
                 assert(opposite_match == NULL);
-                env_pool_return(ctx->local_state, tmp_env);
             }
             else {
                 out->consume_slot = true;
@@ -1279,8 +1277,7 @@ static void notify_of_match(ask_ctx_t* ctx, ErlNifPid* pid, match_t** match_ptr,
              : make_match(match_env, msg_match_ref, match->exchange_value));
 
     ERL_NIF_TERM msg = enif_make_tuple2(match_env, tag, msg_content);
-
-    enif_send(caller_env, pid, match_env, msg);
+    notify_if_alive(caller_env, pid, match_env, msg);
 
     env_pool_return(local_state, match_env);
     match_pool_return(local_state, match);
@@ -1310,13 +1307,28 @@ static void notify_of_cancellation(ErlNifEnv* env, local_state_t* local_state,
     if (enif_demonitor_process(env, cmonitor, &cmonitor->mon) == 0) {
         ERL_NIF_TERM tag_copy = enif_make_copy(match_env, tag_term);
         ERL_NIF_TERM msg = enif_make_tuple2(match_env, tag_copy, Atoms._cancelled);
-
-        enif_send(env, &match_in_cell->pid, match_env, msg);
+        notify_if_alive(env, &match_in_cell->pid, match_env, msg);
     }
 
     env_pool_return(local_state, match_env);
     match_pool_return(local_state, match_in_cell);
     *match_in_cell_ptr = NULL;
+}
+
+static void notify_if_alive(ErlNifEnv* caller_env, ErlNifPid* pid, ErlNifEnv* msg_env,
+                            ERL_NIF_TERM msg)
+{
+    if (!enif_send(caller_env, pid, msg_env, msg)) {
+        /* We assert that the recipient is no longer alive
+         * to ensure we're not running from a dirty NIF.
+         *
+         * Otherwise, the recipient could never be notified
+         * of a cancellation (or a match) after the caller
+         * had been killed while running the NIF - which
+         * would be Very Bad.
+         */
+        assert(!enif_is_process_alive(caller_env, pid));
+    }
 }
 
 /*********************************************************************/
