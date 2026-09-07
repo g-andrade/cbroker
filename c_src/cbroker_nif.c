@@ -231,6 +231,8 @@ static void batch_consume_slot(broker_t* broker, local_state_t* local_state,
 static void batch_lower_ref_count(broker_t* broker, local_state_t* local_state,
                                   batch_handle_t* handle);
 static batch_t* batch_get_next(ask_ctx_t* ctx, const batch_id_t prev_batch_id);
+static void batch_preemptively_ensure_next(broker_t* broker, local_state_t* local_state,
+                                           const batch_t* batch, const offset_t offset);
 
 static void* match_alloc(void);
 static match_t* match_new_monitored(ask_ctx_t* ctx, batch_id_t batch_id, offset_t offset);
@@ -511,6 +513,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     if (match_res == Atoms._await) {
         ERL_NIF_TERM tag = make_tag(&ctx, success.batch->id, success.offset);
         match_res = make_await(env, tag);
+        batch_preemptively_ensure_next(ctx.broker, ctx.local_state, success.batch, success.offset);
     }
     else if (match_res == Atoms._instant_match_first) {
         // The other party will message us
@@ -518,6 +521,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
         assert(success.consume_slot);
         batch_consume_local_slot(ctx.broker, ctx.local_state, success.batch);
+        batch_preemptively_ensure_next(ctx.broker, ctx.local_state, success.batch, success.offset);
 
         ERL_NIF_TERM tag = make_tag(&ctx, batch_id, success.offset);
         match_res = make_await(env, tag);
@@ -1161,6 +1165,55 @@ static batch_t* batch_get_next(ask_ctx_t* ctx, const batch_id_t prev_batch_id)
     }
 
     return next_batch;
+}
+
+static void batch_preemptively_ensure_next(broker_t* broker, local_state_t* local_state,
+                                           const batch_t* batch, const offset_t offset)
+{
+    /* Ensure next batch is allocated when we're halfway through enqueuing in previous
+     * - this will reduce lock times once all other threads want to get the next batch,
+     *   since it's already allocated and only needs a ref count increment.
+     */
+    const offset_t target_offset = batch->nr_of_cells >> 1;
+    cbroker_omap_result_t map_res = CBROKER_OMAP_NOMEM;
+
+    if (offset != target_offset) {
+        return;
+    }
+
+    if (cbroker_omap_next(local_state->batches, batch->id, NULL, NULL)) {
+        // Already ensured
+        return;
+    }
+
+    global_state_t* global_state = &broker->global_state;
+    batch_id_t next_batch_id = 0;
+    batch_t* next_batch = NULL;
+
+    enif_mutex_lock(broker->global_lock);
+
+    if (cbroker_omap_next(global_state->batches, batch->id, &next_batch_id, (void**)&next_batch)) {
+        // Already ensured
+        size_t ref_count =
+            1 + atomic_fetch_add_explicit(&next_batch->ref_count, 1, memory_order_seq_cst);
+        assert(ref_count >= 1);
+    }
+    else {
+        next_batch_id = batch->id + 1;
+        assert(next_batch_id > local_state->left_id);
+        assert(next_batch_id > local_state->right_id);
+
+        next_batch = batch_new(next_batch_id, broker->nr_of_cells_per_batch);
+        atomic_store_explicit(&next_batch->ref_count, 2, memory_order_relaxed);
+
+        map_res = cbroker_omap_insert(global_state->batches, next_batch_id, next_batch);
+        assert(map_res == CBROKER_OMAP_OK);
+    }
+
+    enif_mutex_unlock(broker->global_lock);
+
+    map_res = cbroker_omap_insert(local_state->batches, next_batch_id, next_batch);
+    assert(map_res == CBROKER_OMAP_OK);
 }
 
 /*********************************************************************/
