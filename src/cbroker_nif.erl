@@ -2,6 +2,7 @@
 
 -export([
     new/0,
+    new/1,
     ask/4,
     ask/5,
     cancel/2,
@@ -46,7 +47,7 @@
 -type async_reply_content() ::
     (match()
     | match_with_stats()
-    | cancelled).
+    | closed).
 -export_type([async_reply_content/0]).
 
 %%
@@ -54,11 +55,15 @@
 new() ->
     not_loaded(?LINE).
 
+new(_Opts) ->
+    not_loaded(?LINE).
+
 -spec ask(Broker, Side, Value, WithStats) ->
     {await, Tag}
     | match()
     | retry
     | cancelled
+    | closed
 when
     Broker :: broker(),
     Side :: side(),

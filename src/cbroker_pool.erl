@@ -172,7 +172,7 @@ init([RegName, Settings]) ->
 
     DispatchingName = cbroker_utils:dispatching_name(RegName),
     SharedStateKey = ?SHARED_STATE_KEY(DispatchingName),
-    Broker = cbroker_nif:new(),
+    Broker = cbroker_nif:new([depends_on_creator]),
     SharedState = #shared_state{
         broker = Broker,
         cb_type = Settings#settings.cb_type,
