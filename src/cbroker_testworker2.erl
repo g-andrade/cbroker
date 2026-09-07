@@ -31,17 +31,17 @@ handle_request({sleep_between, Min, Max}, From, State) ->
 
     case rand:uniform(3) of
         1 ->
-            logger:notice("DIRECT REPLY"),
+            %logger:notice("DIRECT REPLY"),
             timer:sleep(NapTime),
             {reply, reply(), State};
         %
         2 ->
-            logger:notice("ASYNC REPLY"),
+            %logger:notice("ASYNC REPLY"),
             _ = self() ! {nap_async_and_reply, From, NapTime},
             {reply_later, State};
         %
         3 ->
-            logger:notice("SLOT TAKE REPLY"),
+            %logger:notice("SLOT TAKE REPLY"),
             _ = self() ! {nap_async_and_return, From, NapTime},
             {slot_take, State}
     end.

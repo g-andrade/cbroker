@@ -58,6 +58,7 @@ new() ->
     {await, Tag}
     | match()
     | retry
+    | cancelled
 when
     Broker :: broker(),
     Side :: side(),

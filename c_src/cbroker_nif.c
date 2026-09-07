@@ -21,6 +21,7 @@
     X(_batch_full,           "batch_full")  \
     X(_cancelled,            "cancelled") \
     X(_delayed_match,        "delayed_match") \
+    X(_empty,                "empty") \
     X(_error,                "error") \
     X(_false,                "false") \
     X(_fully_async,          "fully_async") \
@@ -28,6 +29,7 @@
     X(_instant_match_second, "instant_match_second") \
     X(_left,                 "left")  \
     X(_match,                "match") \
+    X(_matched,              "matched") \
     X(_nb,                   "nb") \
     X(_none,                 "none") \
     X(_not_owner,            "not_owner") \
@@ -35,7 +37,6 @@
     X(_regular,              "regular") \
     X(_retry,                "retry") \
     X(_right,                "right") \
-    X(_self_cancelled,       "self_cancelled") \
     X(_self_stopped,         "self_stopped") \
     X(_too_late,             "too_late") \
     X(_true,                 "true") \
@@ -89,7 +90,7 @@ typedef struct {
 typedef int_fast8_t cell_count_t;
 
 typedef struct {
-    _Atomic(cell_count_t) count;
+    _Atomic(ERL_NIF_TERM) status; // 'empty' | Pid | 'matched' | 'cancelled'
     _Atomic(match_t*) match;
 } cell_t;
 
@@ -235,9 +236,6 @@ static void notify_of_match(ask_ctx_t* ctx, ErlNifPid* pid, match_t** match_ptr,
                             const ERL_NIF_TERM side, const batch_id_t batch_id,
                             const offset_t offset, const ERL_NIF_TERM match_ref, bool with_stats,
                             ErlNifTime enqueue_time);
-
-static void notify_of_cancellation(ErlNifEnv* env, local_state_t* local_state,
-                                   ERL_NIF_TERM tag_term, match_t** match_in_cell_ptr);
 
 static void notify_if_alive(ErlNifEnv* caller_env, ErlNifPid* pid, ErlNifEnv* msg_env,
                             ERL_NIF_TERM msg);
@@ -559,6 +557,7 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
     batch_id_t batch_id;
     offset_t offset;
     ErlNifPid self;
+    ERL_NIF_TERM self_term;
 
     const ERL_NIF_TERM broker_term = argv[0];
     const ERL_NIF_TERM tag_term = argv[1];
@@ -574,7 +573,10 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
     }
 
     LOG("cancel: get self");
-    if (!enif_self(env, &self)) {
+    if (enif_self(env, &self)) {
+        self_term = enif_make_pid(env, &self);
+    }
+    else {
         return enif_make_badarg(env);
     }
 
@@ -597,26 +599,25 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
     LOG("cancel: batch %u found, cell at offset %u", batch_id, offset);
     cell_t* cell = &batch->cells[offset];
 
-    cell_count_t cell_count = 1;
+    ERL_NIF_TERM status = self_term;
     ERL_NIF_TERM cancel_res;
 
-    if (atomic_compare_exchange_strong(&cell->count, &cell_count, CELL_COUNT_CANCELLED)) {
+    if (atomic_compare_exchange_strong(&cell->status, &status, Atoms._cancelled)) {
         match_t* match_in_cell = atomic_exchange(&cell->match, &sentinel_match_cancelled);
         assert(match_in_cell != NULL);
         assert(match_in_cell != &sentinel_match_cancelled);
 
-        if (enif_compare_pids(&match_in_cell->pid, &self) == 0) {
-            match_demonitor_and_free(env, local_state, &match_in_cell);
-        }
-        else {
-            notify_of_cancellation(env, local_state, tag_term, &match_in_cell);
-        }
+        assert(enif_compare_pids(&match_in_cell->pid, &self) == 0);
+        match_demonitor_and_free(env, local_state, &match_in_cell);
 
         batch_consume_slot(broker, local_state, &handle);
         cancel_res = Atoms._cancelled;
     }
-    else if (cell_count < 0) {
+    else if (status == Atoms._cancelled) {
         cancel_res = Atoms._cancelled;
+    }
+    else if (enif_is_pid(env, status)) {
+        return enif_raise_exception(env, Atoms._not_owner);
     }
     else {
         cancel_res = Atoms._too_late;
@@ -685,8 +686,7 @@ static ERL_NIF_TERM nif_to_list(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
         for (size_t j = 0; j < nr_of_cells; j++) {
             cell_t* cell = &batch->cells[j];
 
-            cell_count_t count = atomic_load_explicit(&cell->count, memory_order_relaxed);
-            ERL_NIF_TERM count_term = enif_make_int(env, count);
+            ERL_NIF_TERM status = atomic_load_explicit(&cell->status, memory_order_relaxed);
 
             match_t* match = atomic_load_explicit(&cell->match, memory_order_relaxed);
             ERL_NIF_TERM match_term = empty_atom;
@@ -698,7 +698,7 @@ static ERL_NIF_TERM nif_to_list(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
                 match_term = set_atom;
             }
 
-            cell_terms[j] = enif_make_tuple2(env, count_term, match_term);
+            cell_terms[j] = enif_make_tuple2(env, status, match_term);
         }
 
         batch_id_t batch_id = batch->id;
@@ -805,7 +805,7 @@ static ERL_NIF_TERM ask_loop(ask_ctx_t* ctx, ask_out_t* out)
                 batch_lower_ref_count(ctx->broker, ctx->local_state, &handle);
                 batch = NULL;
             }
-            else if (match_res == Atoms._cancelled) {
+            else if (match_res == Atoms._cancelled && !ctx->is_nb) {
                 continue;
             }
             else {
@@ -851,6 +851,10 @@ static batch_t* batch_new(const batch_id_t id, const size_t nr_of_cells)
     batch->id = id;
     batch->nr_of_cells = nr_of_cells;
 
+    for (offset_t i = 0; i < nr_of_cells; i++) {
+        batch->cells[i].status = Atoms._empty;
+    }
+
     return batch;
 }
 
@@ -895,30 +899,17 @@ static ERL_NIF_TERM batch_offset_ask(ask_ctx_t* ctx, batch_t* batch, offset_t of
 
     cell_t* cell = &batch->cells[cell_offset];
 
-    cell_count_t cell_count = 0;
-
-    if (ctx->is_nb) {
-        cell_count = 1;
-        atomic_compare_exchange_strong(&cell->count, &cell_count, 2);
-    }
-    else {
-        cell_count = 1 + atomic_fetch_add_explicit(&cell->count, 1, memory_order_relaxed);
-    }
+    ERL_NIF_TERM status = Atoms._empty;
+    ERL_NIF_TERM desired_status = (ctx->is_nb ? Atoms._cancelled : ctx->self_term);
 
     //
 
-    if (cell_count == 0) {
-        if (atomic_compare_exchange_strong(&cell->count, &cell_count, CELL_COUNT_CANCELLED)) {
+    if (atomic_compare_exchange_strong(&cell->status, &status, desired_status)) {
+        if (ctx->is_nb) {
             out->consume_slot = true;
-            return Atoms._self_cancelled;
+            return Atoms._cancelled;
         }
-        else if (cell_count < 0) {
-            return Atoms._self_cancelled;
-        }
-        // too late to cancel
-    }
 
-    if (cell_count == 1) {
         match_t* opposite_match = NULL;
         match_t* our_match = match_new_monitored(ctx, batch->id, offset);
         LOG("match value is: %p", our_match);
@@ -929,11 +920,11 @@ static ERL_NIF_TERM batch_offset_ask(ask_ctx_t* ctx, batch_t* batch, offset_t of
             return Atoms._await;
         }
         else if (opposite_match == &sentinel_match_cancelled) {
-            // Monitored triggered concurrently, we're cancelled
+            // Opposite monitor triggered concurrently, cancelled
             our_match->cmonitor_term = Atoms._none;
             match_demonitor_and_free(ctx->env, ctx->local_state, &our_match);
             assert(our_match == NULL);
-            return Atoms._self_stopped;
+            return Atoms._cancelled;
         }
         else {
             assert(opposite_match != NULL);
@@ -945,7 +936,8 @@ static ERL_NIF_TERM batch_offset_ask(ask_ctx_t* ctx, batch_t* batch, offset_t of
             return Atoms._instant_match_second;
         }
     }
-    else if (cell_count == 2) {
+    else if (enif_is_pid(ctx->env, status) &&
+             atomic_compare_exchange_strong(&cell->status, &status, Atoms._matched)) {
         match_t* our_match = match_new_unmonitored(ctx, batch->id, offset);
         match_t* opposite_match = atomic_exchange(&cell->match, our_match);
 
@@ -977,7 +969,7 @@ static ERL_NIF_TERM batch_offset_ask(ask_ctx_t* ctx, batch_t* batch, offset_t of
         }
     }
 
-    assert(cell_count < 0);
+    assert(status == Atoms._cancelled);
     return Atoms._cancelled;
 }
 
@@ -1268,29 +1260,6 @@ static void notify_of_match(ask_ctx_t* ctx, ErlNifPid* pid, match_t** match_ptr,
     }
 
     *match_ptr = NULL;
-}
-
-static void notify_of_cancellation(ErlNifEnv* env, local_state_t* local_state,
-                                   ERL_NIF_TERM tag_term, match_t** match_in_cell_ptr)
-{
-    match_t* match_in_cell = *match_in_cell_ptr;
-    assert(match_in_cell != NULL);
-
-    cmonitor_t* cmonitor = NULL;
-    int get_monitor_res = get_cmonitor(env, match_in_cell->cmonitor_term, &cmonitor);
-    assert(get_monitor_res);
-
-    ErlNifEnv* match_env = match_in_cell->env;
-
-    if (enif_demonitor_process(env, cmonitor, &cmonitor->mon) == 0) {
-        ERL_NIF_TERM tag_copy = enif_make_copy(match_env, tag_term);
-        ERL_NIF_TERM msg = enif_make_tuple2(match_env, tag_copy, Atoms._cancelled);
-        notify_if_alive(env, &match_in_cell->pid, match_env, msg);
-    }
-
-    env_pool_return(local_state, match_env);
-    match_pool_return(local_state, match_in_cell);
-    *match_in_cell_ptr = NULL;
 }
 
 static void notify_if_alive(ErlNifEnv* caller_env, ErlNifPid* pid, ErlNifEnv* msg_env,
@@ -1605,16 +1574,16 @@ static void cmonitor_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlN
     LOG("cdown: cell offset is %u", offset);
     cell_t* cell = &batch->cells[offset];
 
-    cell_count_t cell_count = 1;
+    ERL_NIF_TERM status = enif_make_pid(caller_env, pid);
 
-    if (atomic_compare_exchange_strong(&cell->count, &cell_count, CELL_COUNT_CANCELLED)) {
+    if (atomic_compare_exchange_strong(&cell->status, &status, Atoms._cancelled)) {
         LOG("cdown: cancelled");
         match_t* match_in_cell = atomic_exchange(&cell->match, &sentinel_match_cancelled);
+        assert(match_in_cell != NULL);
+        assert(match_in_cell != &sentinel_match_cancelled);
 
-        if (match_in_cell != NULL) {
-            env_pool_return(local_state, match_in_cell->env);
-            match_pool_return(local_state, match_in_cell);
-        }
+        env_pool_return(local_state, match_in_cell->env);
+        match_pool_return(local_state, match_in_cell);
 
         batch_consume_slot(broker, local_state, &handle);
     }

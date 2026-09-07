@@ -269,7 +269,7 @@ ask(#state{invariants = Invariants, slots = Slots, waiters = Waiters} = State) -
     #invariants{broker = Broker} = Invariants,
     ?assertMatch(_ when Slots > 0, Slots),
 
-    logger:notice("WORKER ASKING!! (~p)", [map_size(Waiters) + 1]),
+    % logger:notice("WORKER ASKING!! (~p)", [map_size(Waiters) + 1]),
 
     case cbroker_nif:ask(Broker, right, self(), false) of
         {await, Tag} ->

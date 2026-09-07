@@ -11,20 +11,10 @@
 %% ------------------------------------------------------------------
 
 -export([
-    child_spec/4,
-    start_link/4,
-    %
-    checkout/1,
-    checkout/2,
-    checkout/3,
-    %
-    checkin/1,
-    %
-    transaction/2,
-    transaction/3
+    child_spec/5,
+    start_link/5,
+    get_broker/2
 ]).
-
--ignore_xref([start_link/0]).
 
 %% ------------------------------------------------------------------
 %% gen_server Function Exports
@@ -45,9 +35,6 @@
 
 -define(SHARED_STATE_KEY(DispatchingName), ['__$cbroker_pool.shared_state' | DispatchingName]).
 
--define(DEFAULT_CHECKOUT_TIMEOUT, (5_000)).
--define(DEFAULT_TRANSACTION_TIMEOUT, (5_000)).
-
 %% ------------------------------------------------------------------
 %% API Type Definitions
 %% ------------------------------------------------------------------
@@ -58,6 +45,9 @@
 %% ------------------------------------------------------------------
 %% Internal Record and Type Definitions
 %% ------------------------------------------------------------------
+
+-type cb_type() :: worker | handler.
+-export_type([cb_type/0]).
 
 -type opt() ::
     ({size, non_neg_integer()}).
@@ -89,8 +79,6 @@
 }).
 -type settings() :: #settings{}.
 
--type cb_type() :: worker | handler.
-
 -record(worker, {
     pid :: pid(),
     start_ts :: timestamp(),
@@ -104,8 +92,9 @@
 %% API Function Definitions
 %% ------------------------------------------------------------------
 
--spec child_spec(Name, Module, Args, Opts) -> ChildSpec when
+-spec child_spec(Name, ModType, Module, Args, Opts) -> ChildSpec when
     Name :: LocalName | {local, LocalName} | {global, GlobalName} | {via, RegMod, ViaName},
+    ModType :: cb_type(),
     Module :: module(),
     Args :: term(),
     Opts :: opts(),
@@ -115,19 +104,20 @@
     ViaName :: term(),
     ChildSpec :: supervisor:child_spec().
 
-child_spec(Name, Module, Args, Opts) ->
+child_spec(Name, ModType, Module, Args, Opts) ->
     RegName = cbroker_utils:reg_name(Name),
     #{
         id => {?MODULE, RegName},
-        start => {?MODULE, start_link, [RegName, Module, Args, Opts]},
+        start => {?MODULE, start_link, [RegName, ModType, Module, Args, Opts]},
         % key for release upgrades
         type => supervisor
     }.
 
 %%
 
--spec start_link(RegName, Module, Args, Opts) -> {ok, pid()} | {error, term()} when
+-spec start_link(RegName, ModType, Module, Args, Opts) -> {ok, pid()} | {error, term()} when
     RegName :: LocalName | {local, LocalName} | {global, GlobalName} | {via, RegMod, ViaName},
+    ModType :: cb_type(),
     Module :: module(),
     Args :: term(),
     Opts :: opts(),
@@ -136,10 +126,10 @@ child_spec(Name, Module, Args, Opts) ->
     RegMod :: module(),
     ViaName :: term().
 
-start_link(Name, Module, Args, Opts) ->
+start_link(Name, ModType, Module, Args, Opts) ->
     RegName = cbroker_utils:reg_name(Name),
 
-    try new_settings(Module, Args, Opts) of
+    try new_settings(ModType, Module, Args, Opts) of
         Settings ->
             gen_server:start_link(RegName, ?MODULE, [RegName, Settings], [])
     catch
@@ -150,42 +140,19 @@ start_link(Name, Module, Args, Opts) ->
             {error, {badopt, Opt}}
     end.
 
-%%
+get_broker(Name, ExpectedCbType) ->
+    DispatchingName = cbroker_utils:dispatching_name(Name),
+    SharedStateKey = ?SHARED_STATE_KEY(DispatchingName),
 
-checkout(Name) ->
-    checkout(Name, true).
-
-checkout(Name, Block) ->
-    checkout(Name, Block, ?DEFAULT_CHECKOUT_TIMEOUT).
-
-checkout(Name, Block, Timeout) ->
-    case get_broker(Name, worker) of
-        {ok, Broker} when Block ->
-            Deadline = timeout_deadline(Timeout),
-            blocking_checkout_recur(Broker, Deadline);
+    try persistent_term:get(SharedStateKey) of
+        #shared_state{cb_type = ExpectedCbType, broker = Broker} ->
+            {ok, Broker};
         %
-        {ok, Broker} when not Block ->
-            nb_checkout(Broker);
-        %
-        {error, Reason} ->
-            error(Reason)
-    end.
-
-checkin(Handle) ->
-    WrapperPid = Handle,
-    cbroker_worker:checkin(WrapperPid).
-
-transaction(Name, Fun) ->
-    transaction(Name, Fun, ?DEFAULT_TRANSACTION_TIMEOUT).
-
-transaction(Name, Fun, Timeout) ->
-    case checkout(Name, true, Timeout) of
-        {ok, Handle, WorkerPid} ->
-            try
-                Fun(WorkerPid)
-            after
-                checkin(Handle)
-            end
+        #shared_state{cb_type = CbType} ->
+            {unexpected_cb_type, CbType}
+    catch
+        error:badarg ->
+            not_running
     end.
 
 %% ------------------------------------------------------------------
@@ -268,9 +235,9 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal Function Definitions: Server
 %% ------------------------------------------------------------------
 
-new_settings(Module, Args, Opts) ->
+new_settings(ModType, Module, Args, Opts) ->
     case infer_cb_type(Module) of
-        {ok, CbType} ->
+        {ok, CbType} when CbType =:= ModType ->
             Default = #settings{
                 cb = Module,
                 cb_init_args = Args,
@@ -278,6 +245,16 @@ new_settings(Module, Args, Opts) ->
                 size = erlang:system_info(schedulers)
             },
             new_settings_recur(Opts, Default);
+        %
+        {ok, worker} ->
+            {error,
+                {module, Module,
+                    'Module declares behaviour cbroker_worker but pool is configured to cbroker_handler'}};
+        %
+        {ok, handler} ->
+            {error,
+                {module, Module,
+                    'Module declares behaviour cbroker_handler but pool is configured to cbroker_worker'}};
         %
         {error, Reason} ->
             {error, {module, Module, Reason}}
@@ -385,129 +362,6 @@ handle_worker_exit(_Pid, _Worker, Remaining, #state{} = State) ->
 
 timestamp_now() ->
     erlang:monotonic_time(native).
-
-%% ------------------------------------------------------------------
-%% Internal Function Definitions: Callers
-%% ------------------------------------------------------------------
-
-get_broker(Name, ExpectedCbType) ->
-    DispatchingName = cbroker_utils:dispatching_name(Name),
-    SharedStateKey = ?SHARED_STATE_KEY(DispatchingName),
-
-    try persistent_term:get(SharedStateKey) of
-        #shared_state{cb_type = ExpectedCbType, broker = Broker} ->
-            {ok, Broker};
-        %
-        #shared_state{cb_type = CbType} ->
-            {unexpected_cb_type, CbType}
-    catch
-        error:badarg ->
-            not_running
-    end.
-
-%%%%%%%%%%%%
-%% blocking check-out
-
-blocking_checkout_recur(Broker, Deadline) ->
-    ExchangeValue = {checkout, self()},
-
-    case cbroker_nif:ask(Broker, left, ExchangeValue, false) of
-        {await, Tag} ->
-            blocking_checkout_await(Broker, Tag, Deadline);
-        %
-        {match, _MatchRef, {WrapperPid, WorkerPid}} ->
-            Handle = WrapperPid,
-            {ok, Handle, WorkerPid};
-        %
-        retry ->
-            blocking_checkout_recur(Broker, Deadline)
-    end.
-
-blocking_checkout_await(Broker, Tag, Deadline) ->
-    Timeout = millis_left_to_deadline(Deadline),
-
-    receive
-        {Tag, Result} ->
-            blocking_checkout_handle_result(Broker, Result, Deadline)
-    after Timeout ->
-        blocking_checkout_timeout(Broker, Tag)
-    end.
-
-blocking_checkout_handle_result(Broker, Result, Deadline) ->
-    case Result of
-        {match, _MatchRef, {WrapperPid, WorkerPid}} ->
-            Handle = WrapperPid,
-            {ok, Handle, WorkerPid};
-        %
-        cancelled ->
-            blocking_checkout_recur(Broker, Deadline)
-    end.
-
-blocking_checkout_timeout(Broker, Tag) ->
-    case cbroker_nif:cancel(Broker, Tag) of
-        cancelled ->
-            error(timeout);
-        %
-        too_late ->
-            receive
-                {Tag, Result} ->
-                    blocking_checkout_timeout_concurrent_result(Result)
-            end
-    end.
-
-blocking_checkout_timeout_concurrent_result(Result) ->
-    case Result of
-        {match, _MatchRef, {WrapperPid, WorkerPid}} ->
-            Handle = WrapperPid,
-            {ok, Handle, WorkerPid};
-        %
-        cancelled ->
-            error(timeout)
-    end.
-
-%%%%%%%%%%%%
-%% non-blocking check-out
-
-nb_checkout(Broker) ->
-    ExchangeValue = {checkout, self()},
-
-    case cbroker_nif:ask(Broker, left, ExchangeValue, false, nb) of
-        {await, Tag} ->
-            nb_checkout_await(Tag);
-        %
-        {match, _, {WrapperPid, WorkerPid}} ->
-            Handle = WrapperPid,
-            {ok, Handle, WorkerPid};
-        %
-        retry ->
-            full;
-        %
-        self_cancelled ->
-            full
-    end.
-
-nb_checkout_await(Tag) ->
-    receive
-        {Tag, Result} ->
-            case Result of
-                {match, _, WorkerPid} ->
-                    WorkerPid;
-                %
-                cancelled ->
-                    full
-            end
-    end.
-
-%%%%%%%%%%%%
-
-timeout_deadline(infinity) ->
-    none;
-timeout_deadline(Timeout) ->
-    timestamp_now() + erlang:convert_time_unit(Timeout, millisecond, native).
-
-millis_left_to_deadline(Deadline) ->
-    TimeLeft = Deadline - timestamp_now(),
-    ceil(TimeLeft / erlang:convert_time_unit(1, millisecond, native)).
 
 %% ------------------------------------------------------------------
 %% Internal Function Definitions: Release Upgrades

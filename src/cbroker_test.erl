@@ -2,30 +2,11 @@
 
 -export(
     [
-        run_pool/2,
         test2_start/0,
         test2_set_rate/1,
         test2_stop/0
     ]
 ).
-
-run_pool(Rate, Duration) ->
-    Pids = lists:map(
-        fun(WorkerNr) ->
-            InitialDelay = round(1000 * (WorkerNr / Rate)),
-            spawn_link(fun() ->
-                timer:sleep(InitialDelay),
-                run_pool_worker(Duration)
-            end)
-        end,
-        lists:seq(1, Rate)
-    ),
-
-    timer:sleep(Duration),
-
-    lists:foreach(fun(Pid) -> Pid ! finish end, Pids),
-
-    ok.
 
 test2_start() ->
     spawn_link(fun run_test2/0).
@@ -42,21 +23,11 @@ test2_stop() ->
 
 %%
 
-run_pool_worker(Duration) ->
-    cbroker_pool:run(15, 25),
-
-    receive
-        finish ->
-            ok
-    after 1_000 ->
-        run_pool_worker(Duration)
-    end.
-
 %%
 
 run_test2() ->
     register(test2, self()),
-    Broker = cbroker_pool:get_broker(),
+    {ok, Broker} = cbroker_pool:get_broker(magic2, handler),
     Requests = #{},
     run_test2_loop(Broker, Requests, 0).
 
@@ -128,7 +99,7 @@ flush_inbox(Requests, RequestsPerLoop) ->
     end.
 
 async_ask(Broker, Requests) ->
-    case cbroker_nif:ask(Broker, left, {self(), {sleep_between, 50, 100}}, false, true) of
+    case cbroker_nif:ask(Broker, left, {self(), {sleep_between, 50, 100}}, false, fully_async) of
         {await, Tag} ->
             Requests#{Tag => v};
         %
