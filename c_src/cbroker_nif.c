@@ -312,6 +312,14 @@ ERL_NIF_INIT(cbroker_nif, nif_funcs, on_load, NULL, NULL, NULL);
 
 static int on_load(ErlNifEnv* caller_env, void** priv_data, ERL_NIF_TERM load_info)
 {
+    /* None of our NIFs may be scheduled on a dirty scheduler
+     * - we rely on the calling process staying alive until
+     * the NIF returns.
+     */
+    for (size_t i = 0; i < sizeof(nif_funcs) / sizeof(nif_funcs[0]); i++) {
+        assert(nif_funcs[i].flags == 0);
+    }
+
     init_atoms(caller_env);
 
     memset(&ResourceTypes, 0, sizeof(ResourceTypes));
@@ -915,36 +923,7 @@ static ERL_NIF_TERM batch_offset_ask(ask_ctx_t* ctx, batch_t* batch, offset_t of
         match_t* our_match = match_new_monitored(ctx, batch->id, offset);
         LOG("match value is: %p", our_match);
 
-        if (our_match == NULL) {
-            // Caller stopped in the mean time
-            if (atomic_compare_exchange_strong(&cell->count, &cell_count, CELL_COUNT_CANCELLED)) {
-                out->consume_slot = true;
-                return Atoms._self_stopped;
-            }
-            else if (cell_count < 0) {
-                return Atoms._self_stopped;
-            }
-
-            // Too late
-            assert(cell_count == 2);
-
-            opposite_match = atomic_exchange(&cell->match, &sentinel_match_cancelled);
-
-            if (opposite_match != NULL) {
-                // The other side is already awaiting us; message it with the cancellation
-                ERL_NIF_TERM opposite_side = make_opposite_side(ctx->side);
-                ERL_NIF_TERM tag =
-                    make_tag_simple(opposite_match->env, opposite_side, batch->id, offset);
-                notify_of_cancellation(ctx->env, ctx->local_state, tag, &opposite_match);
-                assert(opposite_match == NULL);
-            }
-            else {
-                out->consume_slot = true;
-            }
-
-            return Atoms._self_stopped;
-        }
-        else if (atomic_compare_exchange_strong(&cell->match, &opposite_match, our_match)) {
+        if (atomic_compare_exchange_strong(&cell->match, &opposite_match, our_match)) {
             // Enqueued
             LOG("enqueued!!");
             return Atoms._await;
@@ -1178,12 +1157,11 @@ static match_t* match_new_monitored(ask_ctx_t* ctx, batch_id_t batch_id, offset_
     cmonitor->offset = offset;
     cmonitor->side = ctx->side;
 
-    if (enif_monitor_process(ctx->env, cmonitor, &ctx->self, &cmonitor->mon)) {
-        env_pool_return(ctx->local_state, cmonitor->env);
-        cmonitor->env = NULL;
-        enif_release_resource(cmonitor);
-        return NULL;
-    }
+    /* We should never fail to monitor selves within the queue
+     * as long as we're running as a regular NIF
+     */
+    int monitor_res = enif_monitor_process(ctx->env, cmonitor, &ctx->self, &cmonitor->mon);
+    assert(monitor_res == 0);
 
     match_t* match = match_pool_get(ctx->local_state);
 
