@@ -45,7 +45,7 @@
     %
     to_list/1,
     %
-    bench1/3
+    bench1/4
 ]).
 
 %% ------------------------------------------------------------------
@@ -123,14 +123,15 @@ to_list(Name) ->
 
 %%%%%%%%%%%%%%%%%%%%%%%%
 
-bench1(Impl, TotalPidsAmount, Iterations) ->
+bench1(Impl, ExchangeValueName, TotalPidsAmount, Iterations) ->
     LeftFun = left_fun(Impl),
     RightFun = right_fun(Impl),
 
+    ExchangeValue = generate_exchange_value(ExchangeValueName),
     SidePidsAmount = TotalPidsAmount div 2,
 
-    LeftPids = launch_processes(SidePidsAmount, LeftFun, Iterations),
-    RightPids = launch_processes(SidePidsAmount, RightFun, Iterations),
+    LeftPids = launch_processes(SidePidsAmount, LeftFun, ExchangeValue, Iterations),
+    RightPids = launch_processes(SidePidsAmount, RightFun, ExchangeValue, Iterations),
 
     Pids = pids_join(LeftPids, RightPids),
     PidSet = maps:from_keys(Pids, v),
@@ -235,6 +236,12 @@ percentile_us(Percentile, Bag) ->
 %     ]}
 %    ].
 
+generate_exchange_value(smallest) ->
+    self();
+generate_exchange_value(tuple128) ->
+    L = lists:seq(1, 128),
+    list_to_tuple(L).
+
 native_to_us({value, Value}) ->
     native_to_us(Value);
 native_to_us(Interval) when is_number(Interval) ->
@@ -272,26 +279,26 @@ native_to_us(Interval) when is_number(Interval) ->
 %%
 
 left_fun(simple) ->
-    fun simple_left_iteration/0;
+    fun simple_left_iteration/1;
 left_fun(cbroker) ->
-    fun cbroker_left_iteration/0.
+    fun cbroker_left_iteration/1.
 
 right_fun(simple) ->
-    fun simple_right_iteration/0;
+    fun simple_right_iteration/1;
 right_fun(cbroker) ->
-    fun cbroker_right_iteration/0.
+    fun cbroker_right_iteration/1.
 
 %%
 
-simple_left_iteration() ->
-    simple_iteration(left).
+simple_left_iteration(ExchangeValue) ->
+    simple_iteration(left, ExchangeValue).
 
-simple_right_iteration() ->
-    simple_iteration(right).
+simple_right_iteration(ExchangeValue) ->
+    simple_iteration(right, ExchangeValue).
 
-simple_iteration(Side) ->
+simple_iteration(Side, ExchangeValue) ->
     StartTs = erlang:monotonic_time(),
-    {await, Pid, Tag} = cbroker_simple:async_ask(Side, self(), self()),
+    {await, Pid, Tag} = cbroker_simple:async_ask(Side, self(), ExchangeValue),
 
     receive
         {Ref, Reply} when Ref =:= Tag ->
@@ -305,22 +312,22 @@ simple_iteration(Side) ->
 
 %%
 
-cbroker_left_iteration() ->
-    cbroker_iteration(left).
+cbroker_left_iteration(ExchangeValue) ->
+    cbroker_iteration(left, ExchangeValue).
 
-cbroker_right_iteration() ->
-    cbroker_iteration(right).
+cbroker_right_iteration(ExchangeValue) ->
+    cbroker_iteration(right, ExchangeValue).
 
-cbroker_iteration(Side) ->
+cbroker_iteration(Side, ExchangeValue) ->
     StartTs = erlang:monotonic_time(),
 
     case cbroker_serv:get_shared_state(test) of
         #shared_state{broker = Broker} ->
-            cbroker_iteration_recur(StartTs, Broker, Side, 0)
+            cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, 0)
     end.
 
-cbroker_iteration_recur(StartTs, Broker, Side, RetryCount) ->
-    case cbroker_nif:ask(Broker, Side, self(), true) of
+cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
+    case cbroker_nif:ask(Broker, Side, ExchangeValue, true) of
         {await, Ticket} ->
             cbroker_iteration_await(StartTs, Ticket);
         %
@@ -335,7 +342,7 @@ cbroker_iteration_recur(StartTs, Broker, Side, RetryCount) ->
             end;
         %
         retry ->
-            cbroker_iteration_recur(StartTs, Broker, Side, RetryCount + 1)
+            cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount + 1)
     end.
 
 cbroker_iteration_await(StartTs, Ticket) ->
@@ -378,20 +385,20 @@ processes_send([Pid | Next], Msg) ->
 processes_send([], _) ->
     ok.
 
-launch_processes(Amount, RunFun, Iterations) when Amount > 0 ->
+launch_processes(Amount, RunFun, ExchangeValue, Iterations) when Amount > 0 ->
     Parent = self(),
     [
-        spawn_link(fun() -> start_process(Parent, RunFun, Iterations) end)
-        | launch_processes(Amount - 1, RunFun, Iterations)
+        spawn_link(fun() -> start_process(Parent, RunFun, ExchangeValue, Iterations) end)
+        | launch_processes(Amount - 1, RunFun, ExchangeValue, Iterations)
     ];
-launch_processes(0, _, _) ->
+launch_processes(0, _, _, _) ->
     [].
 
-start_process(Parent, RunFun, Iterations) ->
+start_process(Parent, RunFun, ExchangeValue, Iterations) ->
     receive
         go ->
             erlang:yield(),
-            Samples = run_process(RunFun, Iterations),
+            Samples = run_process(RunFun, ExchangeValue, Iterations),
             _ = Parent ! {done, self()},
 
             receive
@@ -404,10 +411,10 @@ start_process(Parent, RunFun, Iterations) ->
             end
     end.
 
-run_process(RunFun, Iterations) when Iterations > 0 ->
-    Timestamps = RunFun(),
-    [Timestamps | run_process(RunFun, Iterations - 1)];
-run_process(_, 0) ->
+run_process(RunFun, ExchangeValue, Iterations) when Iterations > 0 ->
+    Timestamps = RunFun(ExchangeValue),
+    [Timestamps | run_process(RunFun, ExchangeValue, Iterations - 1)];
+run_process(_, _, 0) ->
     [].
 
 %% ------------------------------------------------------------------
