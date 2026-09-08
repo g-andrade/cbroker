@@ -24,8 +24,6 @@
 -moduledoc "FIXME: one-line summary of the `cbroker` public API.".
 -endif.
 
--include("src/cbroker_shared_state.hrl").
-
 %% ------------------------------------------------------------------
 %% API Function Exports
 %% ------------------------------------------------------------------
@@ -116,10 +114,7 @@ async_ask_r(Name, Value) ->
     async_ask_side(Name, right, Value).
 
 to_list(Name) ->
-    case cbroker_serv:get_shared_state(Name) of
-        #shared_state{broker = Broker} ->
-            cbroker_nif:to_list(Broker)
-    end.
+    cbroker_nif:to_list(Name).
 
 %%%%%%%%%%%%%%%%%%%%%%%%
 
@@ -321,15 +316,13 @@ cbroker_right_iteration(ExchangeValue) ->
 cbroker_iteration(Side, ExchangeValue) ->
     StartTs = erlang:monotonic_time(),
 
-    case cbroker_serv:get_shared_state(test) of
-        #shared_state{broker = Broker} ->
-            cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, 0)
-    end.
+    Broker = test,
+    cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, 0).
 
 cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
     case cbroker_nif:ask(Broker, Side, ExchangeValue, true) of
-        {await, Ticket} ->
-            cbroker_iteration_await(StartTs, Ticket);
+        {await, Tag} ->
+            cbroker_iteration_await(StartTs, Tag);
         %
         {match, _, _, _} ->
             FinalTs = erlang:monotonic_time(),
@@ -345,9 +338,9 @@ cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
             cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount + 1)
     end.
 
-cbroker_iteration_await(StartTs, Ticket) ->
+cbroker_iteration_await(StartTs, Tag) ->
     receive
-        {T, Result} when T =:= Ticket ->
+        {T, Result} when T =:= Tag ->
             FinalTs = erlang:monotonic_time(),
             {match, _, _, _} = Result,
             {blocked, FinalTs - StartTs}
@@ -422,52 +415,39 @@ run_process(_, _, 0) ->
 %% ------------------------------------------------------------------
 
 ask_side(Name, Side, Value, Timeout) ->
-    case cbroker_serv:get_shared_state(Name) of
-        #shared_state{broker = Broker} ->
-            %
-            case cbroker_nif:ask(Broker, Side, Value, true) of
-                {await, Ticket} ->
-                    await_after_ask(Broker, Ticket, Timeout);
-                %
-                {match, _, _, _} = Match ->
-                    Match;
-                %
-                retry ->
-                    ask_side(Name, Side, Value, Timeout)
-            end;
+    case cbroker_nif:ask(Name, Side, Value, true) of
+        {await, Tag} ->
+            await_after_ask(Tag, Timeout);
         %
-        none ->
-            not_running
+        {match, _, _, _} = Match ->
+            Match;
+        %
+        retry ->
+            ask_side(Name, Side, Value, Timeout)
     end.
 
-await_after_ask(Broker, Ticket, Timeout) ->
+await_after_ask(Tag, Timeout) ->
     receive
-        {T, Result} when T =:= Ticket ->
+        {T, Result} when T =:= Tag ->
             Result
     after Timeout ->
-        case cbroker_nif:cancel(Broker, Ticket) of
+        case cbroker_nif:cancel(Tag) of
             cancelled ->
                 timeout;
             %
             too_late ->
                 receive
-                    {T, Result} when T =:= Ticket ->
+                    {T, Result} when T =:= Tag ->
                         Result
                 end
         end
     end.
 
 async_ask_side(Name, Side, Value) ->
-    case cbroker_serv:get_shared_state(Name) of
-        #shared_state{broker = Broker} ->
-            case cbroker_nif:ask(Broker, Side, Value, true, true) of
-                retry ->
-                    async_ask_side(Name, Side, Value);
-                %
-                Result ->
-                    Result
-            end;
+    case cbroker_nif:ask(Name, Side, Value, true, fully_async) of
+        retry ->
+            async_ask_side(Name, Side, Value);
         %
-        none ->
-            not_running
+        Result ->
+            Result
     end.

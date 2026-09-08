@@ -172,9 +172,9 @@ init([RegName, Settings]) ->
 
     DispatchingName = cbroker_utils:dispatching_name(RegName),
     SharedStateKey = ?SHARED_STATE_KEY(DispatchingName),
-    Broker = cbroker_nif:new([depends_on_creator]),
+    cbroker_nif:new(DispatchingName),
     SharedState = #shared_state{
-        broker = Broker,
+        broker = DispatchingName,
         cb_type = Settings#settings.cb_type,
         serv_pid = self()
     },
@@ -183,7 +183,7 @@ init([RegName, Settings]) ->
     State = #state{
         settings = Settings,
         shared_state_key = SharedStateKey,
-        broker = Broker,
+        broker = DispatchingName,
         workers = #{}
     },
 
@@ -218,10 +218,7 @@ handle_info(Info, State) ->
     {stop, {unexpected_info, Info}, State}.
 
 -spec terminate(term(), state()) -> ok.
-terminate(Reason, #state{shared_state_key = SharedStateKey}) ->
-    _ =
-        (cbroker_utils:is_termination_reason_wholesome(Reason) andalso
-            persistent_term:erase(SharedStateKey)),
+terminate(_Reason, #state{}) ->
     ok.
 
 -spec code_change(term(), state() | term(), term()) ->
