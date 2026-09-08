@@ -6,13 +6,16 @@
 
 -behaviour(gen_server).
 
+-include("src/cbroker_shared_state.hrl").
+
 %% ------------------------------------------------------------------
 %% API Function Exports
 %% ------------------------------------------------------------------
 
 -export([
     child_spec/1,
-    start_link/1
+    start_link/1,
+    get_shared_state/1
 ]).
 
 -ignore_xref([start_link/0]).
@@ -31,10 +34,18 @@
 ]).
 
 %% ------------------------------------------------------------------
-%% Type Definitions
+%% Macro Definitions
 %% ------------------------------------------------------------------
 
--record(state, {}).
+-define(SHARED_STATE_KEY(Name), ['___$cbroker.shared_state' | Name]).
+
+%% ------------------------------------------------------------------
+%% Record and Type Definitions
+%% ------------------------------------------------------------------
+
+-record(state, {
+    shared_state_key :: term()
+}).
 -type state() :: #state{}.
 
 %% ------------------------------------------------------------------
@@ -52,6 +63,17 @@ child_spec(Name) ->
 start_link(Name) ->
     gen_server:start_link({local, Name}, ?MODULE, [Name], []).
 
+-spec get_shared_state(atom()) -> #shared_state{} | none.
+get_shared_state(Name) ->
+    Key = ?SHARED_STATE_KEY(Name),
+
+    try
+        persistent_term:get(Key)
+    catch
+        error:badarg ->
+            none
+    end.
+
 %% ------------------------------------------------------------------
 %% gen_server Function Definitions
 %% ------------------------------------------------------------------
@@ -60,8 +82,10 @@ start_link(Name) ->
 init([Name]) ->
     % almost always call `terminate/2`
     _ = process_flag(trap_exit, true),
-    cbroker_nif:new(Name),
-    {ok, #state{}}.
+    SharedStateKey = ?SHARED_STATE_KEY(Name),
+    SharedState = new_shared_state(),
+    persistent_term:put(SharedStateKey, SharedState),
+    {ok, #state{shared_state_key = SharedStateKey}}.
 
 -spec handle_call(Request, From, State) -> {stop, Reason, State} when
     Request :: term(),
@@ -85,7 +109,10 @@ handle_info(Info, State) ->
     {stop, {unexpected_info, Info}, State}.
 
 -spec terminate(term(), state()) -> ok.
-terminate(_Reason, #state{}) ->
+terminate(Reason, #state{shared_state_key = SharedStateKey}) ->
+    _ =
+        (is_termination_reason_healthy(Reason) andalso
+            persistent_term:erase(SharedStateKey)),
     ok.
 
 -spec code_change(term(), state() | term(), term()) ->
@@ -99,3 +126,13 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal Function Definitions
 %% ------------------------------------------------------------------
 
+new_shared_state() ->
+    #shared_state{
+        broker = cbroker_nif:new(),
+        instance = erlang:unique_integer()
+    }.
+
+is_termination_reason_healthy(normal) -> true;
+is_termination_reason_healthy(shutdown) -> true;
+is_termination_reason_healthy({shutdown, _}) -> true;
+is_termination_reason_healthy(_) -> false.

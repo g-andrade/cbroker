@@ -1,11 +1,12 @@
 -module(cbroker_nif).
 
 -export([
+    new/0,
     new/1,
     ask/4,
     ask/5,
-    cancel/1
-    %to_list/1
+    cancel/2,
+    to_list/1
 ]).
 
 -on_load(init/0).
@@ -15,7 +16,7 @@
 
 %%
 
--type broker() :: atom().
+-opaque broker() :: reference().
 -export_type([broker/0]).
 
 -type side() :: left | right.
@@ -24,7 +25,7 @@
 -type ask_type() :: regular | nb | fully_async.
 -export_type([ask_type/0]).
 
--opaque tag() :: {atom(), side(), batch_id(), offset()}.
+-opaque tag() :: {side(), batch_id(), offset()}.
 -export_type([tag/0]).
 
 -type batch_id() :: pos_integer().
@@ -51,7 +52,10 @@
 
 %%
 
-new(_Broker) ->
+new() ->
+    not_loaded(?LINE).
+
+new(_Opts) ->
     not_loaded(?LINE).
 
 -spec ask(Broker, Side, Value, WithStats) ->
@@ -82,13 +86,14 @@ when
 ask(_Broker, _Side, _Value, _WithStats, _AskType) ->
     not_loaded(?LINE).
 
--spec cancel(Tag) -> cancelled | too_late when
+-spec cancel(Broker, Tag) -> cancelled | too_late when
+    Broker :: broker(),
     Tag :: tag().
-cancel(_Tag) ->
+cancel(_Broker, _Tag) ->
     not_loaded(?LINE).
 
-%to_list(_Broker) ->
-%    not_loaded(?LINE).
+to_list(_Broker) ->
+    not_loaded(?LINE).
 
 %%
 

@@ -24,6 +24,8 @@
 -moduledoc "FIXME: one-line summary of the `cbroker` public API.".
 -endif.
 
+-include("src/cbroker_shared_state.hrl").
+
 %% ------------------------------------------------------------------
 %% API Function Exports
 %% ------------------------------------------------------------------
@@ -114,7 +116,10 @@ async_ask_r(Name, Value) ->
     async_ask_side(Name, right, Value).
 
 to_list(Name) ->
-    cbroker_nif:to_list(Name).
+    case cbroker_serv:get_shared_state(Name) of
+        #shared_state{broker = Broker} ->
+            cbroker_nif:to_list(Broker)
+    end.
 
 %%%%%%%%%%%%%%%%%%%%%%%%
 
@@ -316,13 +321,15 @@ cbroker_right_iteration(ExchangeValue) ->
 cbroker_iteration(Side, ExchangeValue) ->
     StartTs = erlang:monotonic_time(),
 
-    Broker = test,
-    cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, 0).
+    case cbroker_serv:get_shared_state(test) of
+        #shared_state{broker = Broker} ->
+            cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, 0)
+    end.
 
 cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
     case cbroker_nif:ask(Broker, Side, ExchangeValue, true) of
-        {await, Tag} ->
-            cbroker_iteration_await(StartTs, Tag);
+        {await, Ticket} ->
+            cbroker_iteration_await(StartTs, Ticket);
         %
         {match, _, _, _} ->
             FinalTs = erlang:monotonic_time(),
@@ -338,9 +345,9 @@ cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
             cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount + 1)
     end.
 
-cbroker_iteration_await(StartTs, Tag) ->
+cbroker_iteration_await(StartTs, Ticket) ->
     receive
-        {T, Result} when T =:= Tag ->
+        {T, Result} when T =:= Ticket ->
             FinalTs = erlang:monotonic_time(),
             {match, _, _, _} = Result,
             {blocked, FinalTs - StartTs}
@@ -415,39 +422,52 @@ run_process(_, _, 0) ->
 %% ------------------------------------------------------------------
 
 ask_side(Name, Side, Value, Timeout) ->
-    case cbroker_nif:ask(Name, Side, Value, true) of
-        {await, Tag} ->
-            await_after_ask(Tag, Timeout);
+    case cbroker_serv:get_shared_state(Name) of
+        #shared_state{broker = Broker} ->
+            %
+            case cbroker_nif:ask(Broker, Side, Value, true) of
+                {await, Ticket} ->
+                    await_after_ask(Broker, Ticket, Timeout);
+                %
+                {match, _, _, _} = Match ->
+                    Match;
+                %
+                retry ->
+                    ask_side(Name, Side, Value, Timeout)
+            end;
         %
-        {match, _, _, _} = Match ->
-            Match;
-        %
-        retry ->
-            ask_side(Name, Side, Value, Timeout)
+        none ->
+            not_running
     end.
 
-await_after_ask(Tag, Timeout) ->
+await_after_ask(Broker, Ticket, Timeout) ->
     receive
-        {T, Result} when T =:= Tag ->
+        {T, Result} when T =:= Ticket ->
             Result
     after Timeout ->
-        case cbroker_nif:cancel(Tag) of
+        case cbroker_nif:cancel(Broker, Ticket) of
             cancelled ->
                 timeout;
             %
             too_late ->
                 receive
-                    {T, Result} when T =:= Tag ->
+                    {T, Result} when T =:= Ticket ->
                         Result
                 end
         end
     end.
 
 async_ask_side(Name, Side, Value) ->
-    case cbroker_nif:ask(Name, Side, Value, true, fully_async) of
-        retry ->
-            async_ask_side(Name, Side, Value);
+    case cbroker_serv:get_shared_state(Name) of
+        #shared_state{broker = Broker} ->
+            case cbroker_nif:ask(Broker, Side, Value, true, true) of
+                retry ->
+                    async_ask_side(Name, Side, Value);
+                %
+                Result ->
+                    Result
+            end;
         %
-        Result ->
-            Result
+        none ->
+            not_running
     end.
