@@ -267,7 +267,7 @@ try_matching2(Side2, Pid2, Value2, Tag2, Q, DownedMons, State) ->
 
 match(Pid1, Value1, Tag1, Mon1, Pid2, Value2, Tag2) ->
     demonitor(Mon1),
-    MatchRef = Mon1,
+    MatchRef = make_ref(),
     _ = Pid1 ! {Tag1, {match, MatchRef, Value2}},
     _ = Pid2 ! {Tag2, {match, MatchRef, Value1}},
     ok.
