@@ -123,15 +123,20 @@ to_list(Name) ->
 
 %%%%%%%%%%%%%%%%%%%%%%%%
 
-bench1(Impl, ExchangeValueName, TotalPidsAmount, Iterations) ->
+bench1(Impl, ExchangeValueName, TotalIterations, TotalPidsAmount) ->
     LeftFun = left_fun(Impl),
     RightFun = right_fun(Impl),
 
     ExchangeValue = generate_exchange_value(ExchangeValueName),
-    SidePidsAmount = TotalPidsAmount div 2,
 
-    LeftPids = launch_processes(SidePidsAmount, LeftFun, ExchangeValue, Iterations),
-    RightPids = launch_processes(SidePidsAmount, RightFun, ExchangeValue, Iterations),
+    true = (TotalPidsAmount >= 2),
+    ApproxPidsAmountOnOneside= TotalPidsAmount div 2,
+
+    LeftIterationsList = iterations_list(TotalIterations, ApproxPidsAmountOnOneside),
+    RightIterationsList = iterations_list(TotalIterations, ApproxPidsAmountOnOneside),
+
+    LeftPids = launch_processes(LeftFun, ExchangeValue, LeftIterationsList),
+    RightPids = launch_processes(RightFun, ExchangeValue, RightIterationsList),
 
     Pids = pids_join(LeftPids, RightPids),
     PidSet = maps:from_keys(Pids, v),
@@ -168,6 +173,17 @@ bench1(Impl, ExchangeValueName, TotalPidsAmount, Iterations) ->
         {delays_per_group,
             lists:map(fun(Group) -> group_stats(Group, TotalSamples) end, SortedGroups)}
     ].
+
+iterations_list(TotalIterations, ApproxPidsAmount) ->
+    Each = TotalIterations div ApproxPidsAmount,
+    true = Each >= 1,
+    iterations_list_recur(TotalIterations, Each).
+
+iterations_list_recur(TotalIterations, Each) when TotalIterations > 0 ->
+    Chunk = min(TotalIterations, Each),
+    [Chunk | iterations_list_recur(TotalIterations - Chunk, Each)];
+iterations_list_recur(0, _) ->
+    [].
 
 sample_group({blocked, _}) ->
     blocked;
@@ -379,8 +395,10 @@ receive_results(#{}) ->
 
 pids_join([LeftPid | NextLeft], [RightPid | NextRight]) ->
     [LeftPid, RightPid | pids_join(NextLeft, NextRight)];
-pids_join([], []) ->
-    [].
+pids_join([], Right) ->
+    Right;
+pids_join(Left, []) ->
+    Left.
 
 processes_send([Pid | Next], Msg) ->
     Pid ! Msg,
@@ -388,13 +406,13 @@ processes_send([Pid | Next], Msg) ->
 processes_send([], _) ->
     ok.
 
-launch_processes(Amount, RunFun, ExchangeValue, Iterations) when Amount > 0 ->
+launch_processes(RunFun, ExchangeValue, [Iterations | Next]) ->
     Parent = self(),
     [
         spawn_link(fun() -> start_process(Parent, RunFun, ExchangeValue, Iterations) end)
-        | launch_processes(Amount - 1, RunFun, ExchangeValue, Iterations)
+        | launch_processes(RunFun, ExchangeValue, Next)
     ];
-launch_processes(0, _, _, _) ->
+launch_processes(_, _, []) ->
     [].
 
 start_process(Parent, RunFun, ExchangeValue, Iterations) ->
