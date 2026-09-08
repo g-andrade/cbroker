@@ -528,9 +528,11 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     ////
 
     if (match_res == Atoms._await) {
+        // 1 signal sent (monitor)
         ERL_NIF_TERM tag = make_tag(&ctx, success.batch->id, success.offset);
         match_res = make_await(env, tag);
         batch_preemptively_ensure_next(ctx.broker, ctx.local_state, success.batch, success.offset);
+        enif_consume_timeslice(env, 30);
     }
     else if (match_res == Atoms._matched) {
         match_t* our_match = success.our_match;
@@ -576,6 +578,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         ERL_NIF_TERM self_tag = make_tag(&ctx, batch_id, success.offset);
 
         if (ask_type == Atoms._fully_async) {
+            // 2 messages sent
             notify_of_match(&ctx, &ctx.self, &opposite_match,
                             ctx.side, batch_id,
                             offset, match_ref, ctx.with_stats,
@@ -584,8 +587,10 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             assert(opposite_match == NULL);
 
             match_res = make_await(env, self_tag);
+            //enif_consume_timeslice(env, 100);
         }
         else {
+            // 1 message sent
             ERL_NIF_TERM opposite_value = enif_make_copy(env, opposite_match->exchange_value);
             env_pool_return(ctx.local_state, opposite_match->env);
             match_pool_return(ctx.local_state, opposite_match);
@@ -594,6 +599,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             match_res = (ctx.with_stats ? make_match_with_stats(env, match_ref, opposite_value,
                                                                 ctx.enqueue_time)
                                         : make_match(env, match_ref, opposite_value));
+            enif_consume_timeslice(env, 100);
         }
     }
     else if (success.consume_slot) {
@@ -843,17 +849,17 @@ static ERL_NIF_TERM ask_loop(ask_ctx_t* ctx, ask_out_t* out)
 
     ////
 
-    const int max_attempts = ctx->broker->nr_of_cells_per_batch;
-    //const int max_attempts = 400;
+    //const int max_attempts = ctx->broker->nr_of_cells_per_batch;
+    const int max_attempts = 400;
     int percent_reported = 0;
 
     for (int attempt_nr = 1; attempt_nr <= max_attempts; attempt_nr++) {
-        int percent = MAX(1, 100 * attempt_nr / max_attempts);
+        int percent = MAX(1, 49 * attempt_nr / max_attempts);
         if (percent != percent_reported) {
             percent_reported = percent;
-            if (enif_consume_timeslice(ctx->env, percent)) {
-                break;
-            }
+            //if (enif_consume_timeslice(ctx->env, percent)) {
+            //    break;
+            //}
         }
 
         skipped_batch = NULL;

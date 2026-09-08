@@ -240,6 +240,9 @@ generate_exchange_value(smallest) ->
     self();
 generate_exchange_value(tuple128) ->
     L = lists:seq(1, 128),
+    list_to_tuple(L);
+generate_exchange_value(tuple1024) ->
+    L = lists:seq(1, 1024),
     list_to_tuple(L).
 
 native_to_us({value, Value}) ->
