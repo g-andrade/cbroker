@@ -335,6 +335,68 @@ bool cbroker_omap_delete_and_next(cbroker_omap_t* map, uint64_t key, bool* has_n
     return true;
 }
 
+bool cbroker_omap_take(cbroker_omap_t* map, uint64_t key, void** value_out) {
+    bool found;
+    size_t idx = omap_search(map, key, &found);
+
+    if (!found) {
+        return false;
+    }
+    else if (value_out != NULL) {
+        *value_out = map->values[idx];
+    }
+
+    //
+
+    if (idx == map->head) {
+        /* The common case: dropping the smallest key. */
+        map->head++;
+    }
+    else if (idx + 1 == map->tail) {
+        map->tail--;
+    }
+    else if ((idx - map->head) < (map->tail - 1 - idx)) {
+        size_t count = idx - map->head;
+        memmove(&map->keys[map->head + 1], &map->keys[map->head], count * sizeof(uint64_t));
+        memmove(&map->values[map->head + 1], &map->values[map->head], count * sizeof(void*));
+        map->head++;
+    }
+    else {
+        size_t count = map->tail - idx - 1;
+        memmove(&map->keys[idx], &map->keys[idx + 1], count * sizeof(uint64_t));
+        memmove(&map->values[idx], &map->values[idx + 1], count * sizeof(void*));
+        map->tail--;
+    }
+
+    if (map->head == map->tail) {
+        /* Draining to empty is the natural moment to re-anchor the window,
+         * and it keeps the steady state from ever needing to slide. */
+        map->head = 0;
+        map->tail = 0;
+    }
+
+    omap_assert_invariants(map);
+    return true;
+}
+
+bool cbroker_omap_take_first(cbroker_omap_t* map, uint64_t* key_out, void** value_out) {
+    if (map->head == map->tail) {
+        return false;
+    }
+
+    *key_out = map->keys[map->head];
+    *value_out = map->values[map->head];
+     map->head++;
+
+    if (map->head == map->tail) {
+        map->head = 0;
+        map->tail = 0;
+    }
+
+    omap_assert_invariants(map);
+    return true;
+}
+
 size_t cbroker_omap_size(const cbroker_omap_t* map) { return map->tail - map->head; }
 
 bool cbroker_omap_first(const cbroker_omap_t* map, uint64_t* key_out, void** value_out)

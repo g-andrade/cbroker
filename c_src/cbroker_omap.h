@@ -59,6 +59,10 @@ bool cbroker_omap_lookup(const cbroker_omap_t* map, uint64_t key, void** value_o
 bool cbroker_omap_delete_and_next(cbroker_omap_t* map, uint64_t key, bool* has_next,
                                   uint64_t* next_key_out, void** next_value_out);
 
+bool cbroker_omap_take(cbroker_omap_t* map, uint64_t key, void** value_out);
+
+bool cbroker_omap_take_first(cbroker_omap_t* map, uint64_t* key_out, void** value_out);
+
 size_t cbroker_omap_size(const cbroker_omap_t* map);
 
 /* Smallest entry. False if the map is empty. */

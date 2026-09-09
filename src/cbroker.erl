@@ -187,6 +187,8 @@ iterations_list_recur(0, _) ->
 
 sample_group({blocked, _}) ->
     blocked;
+sample_group({instant, _, _}) ->
+    instant;
 sample_group({instant, _}) ->
     instant;
 sample_group({retried, RetryCount, _}) ->
@@ -300,12 +302,16 @@ native_to_us(Interval) when is_number(Interval) ->
 left_fun(simple) ->
     fun simple_left_iteration/1;
 left_fun(cbroker) ->
-    fun cbroker_left_iteration/1.
+    fun cbroker_left_iteration/1;
+left_fun(cbroker2) ->
+    fun cbroker2_left_iteration/1.
 
 right_fun(simple) ->
     fun simple_right_iteration/1;
 right_fun(cbroker) ->
-    fun cbroker_right_iteration/1.
+    fun cbroker_right_iteration/1;
+right_fun(cbroker2) ->
+    fun cbroker2_right_iteration/1.
 
 %%
 
@@ -350,12 +356,12 @@ cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
         {await, Ticket} ->
             cbroker_iteration_await(StartTs, Ticket);
         %
-        {match, _, _, _} ->
+        {match, _, _, Sojourn} ->
             FinalTs = erlang:monotonic_time(),
 
             case RetryCount of
                 0 ->
-                    {instant, FinalTs - StartTs};
+                    {instant, FinalTs - StartTs, Sojourn};
                 _ ->
                     {retried, RetryCount, FinalTs - StartTs}
             end;
@@ -365,6 +371,44 @@ cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
     end.
 
 cbroker_iteration_await(StartTs, Ticket) ->
+    receive
+        {T, Result} when T =:= Ticket ->
+            FinalTs = erlang:monotonic_time(),
+            {match, _, _, _} = Result,
+            {blocked, FinalTs - StartTs}
+    end.
+
+%%
+
+cbroker2_left_iteration(ExchangeValue) ->
+    cbroker2_iteration(left, ExchangeValue).
+
+cbroker2_right_iteration(ExchangeValue) ->
+    cbroker2_iteration(right, ExchangeValue).
+
+cbroker2_iteration(Side, ExchangeValue) ->
+    StartTs = erlang:monotonic_time(),
+
+    case cbroker_serv:get_shared_state(test) of
+        #shared_state{broker2 = Broker} ->
+            cbroker2_iteration_ask(StartTs, Broker, Side, ExchangeValue, 0)
+    end.
+
+cbroker2_iteration_ask(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
+    case cbroker_nif2:ask(Broker, Side, ExchangeValue, true) of
+        {await, Ticket} ->
+            cbroker2_iteration_await(StartTs, Ticket);
+        %
+        {match, _, _, Sojourn} ->
+            FinalTs = erlang:monotonic_time(),
+
+            case RetryCount of
+                0 ->
+                    {instant, FinalTs - StartTs, Sojourn}
+            end
+    end.
+
+cbroker2_iteration_await(StartTs, Ticket) ->
     receive
         {T, Result} when T =:= Ticket ->
             FinalTs = erlang:monotonic_time(),
