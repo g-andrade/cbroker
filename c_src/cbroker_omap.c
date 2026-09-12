@@ -335,7 +335,8 @@ bool cbroker_omap_delete_and_next(cbroker_omap_t* map, uint64_t key, bool* has_n
     return true;
 }
 
-bool cbroker_omap_take(cbroker_omap_t* map, uint64_t key, void** value_out) {
+bool cbroker_omap_take(cbroker_omap_t* map, uint64_t key, void** value_out)
+{
     bool found;
     size_t idx = omap_search(map, key, &found);
 
@@ -379,14 +380,15 @@ bool cbroker_omap_take(cbroker_omap_t* map, uint64_t key, void** value_out) {
     return true;
 }
 
-bool cbroker_omap_take_first(cbroker_omap_t* map, uint64_t* key_out, void** value_out) {
+bool cbroker_omap_take_first(cbroker_omap_t* map, uint64_t* key_out, void** value_out)
+{
     if (map->head == map->tail) {
         return false;
     }
 
     *key_out = map->keys[map->head];
     *value_out = map->values[map->head];
-     map->head++;
+    map->head++;
 
     if (map->head == map->tail) {
         map->head = 0;

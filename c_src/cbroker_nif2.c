@@ -49,10 +49,10 @@
 #define MIN(a, b) ((a) <= (b) ? (a) : (b))
 
 #define LOG(fmt, ...)
-/*#define LOG(fmt, ...) do { \
-    enif_fprintf(stderr, fmt "\n\r", ##__VA_ARGS__); \
-     fflush(stderr); \
-} while (0)*/
+// #define LOG(fmt, ...) do { \
+//     enif_fprintf(stderr, fmt "\n\r", ##__VA_ARGS__); \
+//      fflush(stderr); \
+// } while (0)
 
 /*********************************************************************/
 
@@ -62,8 +62,8 @@
 /* Determined very informally, can probably be optimized (and different between
  * match and envs pools)
  */
-#define INITIAL_MEMPOOL_SIZE 256
-#define TARGET_MEMPOOL_SIZE 512
+#define INITIAL_MEMPOOL_SIZE 0
+#define TARGET_MEMPOOL_SIZE 0
 
 /*********************************************************************/
 
@@ -115,10 +115,7 @@ typedef struct {
 
 //
 
-enum BrokerFlags {
-    BFLAGS_LEFT = 1,
-    BFLAGS_RIGHT = 2
-};
+enum BrokerFlags { BFLAGS_LEFT = 1, BFLAGS_RIGHT = 2 };
 
 typedef enum BrokerFlags broker_flags_t;
 
@@ -133,7 +130,7 @@ typedef struct {
     ErlNifMutex* lock;
     broker_flags_t flags;
     waiter_id_t counter;
-    //cbroker_omap_t* queue;
+    // cbroker_omap_t* queue;
     ssize_t count;
     waiter_t* head;
     waiter_t* tail;
@@ -156,7 +153,7 @@ static void tag_resource_load(ErlNifEnv* caller_env);
 static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
-//static ERL_NIF_TERM nif_to_list(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+// static ERL_NIF_TERM nif_to_list(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
 static ErlNifEnv* env_pool_get(local_state_t* local_state);
 static void env_pool_return(local_state_t* local_state, ErlNifEnv* env);
@@ -177,8 +174,9 @@ static void mempool_destroy(mempool_t* pool);
 
 static int get_broker(ErlNifEnv* env, ERL_NIF_TERM term, broker_t** out);
 static int get_tag(ErlNifEnv* env, ERL_NIF_TERM term, tag_t** out);
-//static int get_tag(ErlNifEnv* env, ERL_NIF_TERM term, broker_t** out_broker, waiter_id_t* out_waiter_id);
-//static int get_waiter_id(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM* out_side, waiter_id_t *out_waiter_id);
+// static int get_tag(ErlNifEnv* env, ERL_NIF_TERM term, broker_t** out_broker, waiter_id_t*
+// out_waiter_id); static int get_waiter_id(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM*
+// out_side, waiter_id_t *out_waiter_id);
 
 static ERL_NIF_TERM make_badarg(ErlNifEnv* env, ERL_NIF_TERM term);
 
@@ -208,11 +206,27 @@ static struct {
 static _Atomic(thread_id_t) next_thread_id = 0;
 static _Thread_local thread_id_t my_thread_id = -1;
 
-static ErlNifFunc nif_funcs[] = {{"new", 0, nif_new},       
-                                 {"ask", 3, nif_ask},
-                                 {"ask", 4, nif_ask},       
-                                 {"ask", 5, nif_ask},
-                                 {"cancel", 2, nif_cancel}};
+static ERL_NIF_TERM nif_overhead(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    ERL_NIF_TERM t_term = argv[0];
+    ErlNifTime now = enif_monotonic_time(ERL_NIF_MSEC);
+    ErlNifTime t = 0;
+
+    if (t_term == Atoms._none) {
+        return enif_make_int64(env, now);
+    }
+    else if (enif_get_int64(env, t_term, &t)) {
+        if (now - t >= 1000) {
+            return Atoms._ok;
+        }
+        return Atoms._retry;
+    }
+    return make_badarg(env, t_term);
+}
+
+static ErlNifFunc nif_funcs[] = {{"new", 0, nif_new},       {"ask", 3, nif_ask},
+                                 {"ask", 4, nif_ask},       {"ask", 5, nif_ask},
+                                 {"cancel", 2, nif_cancel}, {"overhead_test", 1, nif_overhead}};
 
 ERL_NIF_INIT(cbroker_nif2, nif_funcs, on_load, NULL, NULL, NULL);
 
@@ -269,7 +283,8 @@ static void tag_resource_load(ErlNifEnv* caller_env)
 
 // FIXME FIXME location
 
-static void init_waiter_pool(mempool_t* pool) {
+static void init_waiter_pool(mempool_t* pool)
+{
     memset(pool, 0, sizeof(mempool_t));
     pool->alloc_cb = waiter_pool_alloc_waiter;
     pool->clear_cb = waiter_pool_clear_waiter;
@@ -277,7 +292,8 @@ static void init_waiter_pool(mempool_t* pool) {
     mempool_init(pool);
 }
 
-static void init_env_pool(mempool_t* pool) {
+static void init_env_pool(mempool_t* pool)
+{
     memset(pool, 0, sizeof(mempool_t));
     pool->alloc_cb = env_pool_alloc_env;
     pool->clear_cb = env_pool_clear_env;
@@ -291,14 +307,16 @@ static size_t sizeof_broker(size_t nr_of_schedulers)
     return sizeof(broker_t) + (nr_of_schedulers * sizeof(local_state_t));
 }
 
-static local_state_t* broker_local_state(broker_t* broker) {
+static local_state_t* broker_local_state(broker_t* broker)
+{
     thread_id_t thread_id = get_or_assign_thread_id();
     assert(thread_id >= 0);
     assert(thread_id < broker->nr_of_schedulers);
     return &broker->local_states[thread_id];
 }
 
-static waiter_t* broker_cancel_waiter(broker_t* broker, const waiter_id_t waiter_id) {
+static waiter_t* broker_cancel_waiter(broker_t* broker, const waiter_id_t waiter_id)
+{
     waiter_t* cancelled_waiter = NULL;
     balance_t balance_increment = 0;
 
@@ -308,7 +326,6 @@ static waiter_t* broker_cancel_waiter(broker_t* broker, const waiter_id_t waiter
 
     waiter_t* waiter = broker->head;
     waiter_t* prev = NULL;
-
 
     while (waiter != NULL) {
         if (waiter->id == waiter_id) {
@@ -330,7 +347,7 @@ static waiter_t* broker_cancel_waiter(broker_t* broker, const waiter_id_t waiter
             }
 
             assert(--broker->count >= 0);
-        
+
             //
 
             if (broker->flags & BFLAGS_LEFT) {
@@ -361,15 +378,10 @@ static waiter_t* broker_cancel_waiter(broker_t* broker, const waiter_id_t waiter
     return cancelled_waiter;
 }
 
-static ErlNifTime monotonic_ts() {
-    return enif_monotonic_time(ERL_NIF_NSEC);
-}
+static ErlNifTime monotonic_ts() { return enif_monotonic_time(ERL_NIF_NSEC); }
 
-static tag_t* tag_new(ErlNifEnv* env,
-                      local_state_t* local_state,
-                      ErlNifPid pid,
-                      ERL_NIF_TERM broker_term,
-                      waiter_id_t waiter_id)
+static tag_t* tag_new(ErlNifEnv* env, local_state_t* local_state, ErlNifPid pid,
+                      ERL_NIF_TERM broker_term, waiter_id_t waiter_id)
 {
     tag_t* tag = enif_alloc_resource(ResourceTypes.tag, sizeof(tag_t));
     memset(tag, 0, sizeof(tag_t));
@@ -384,11 +396,8 @@ static tag_t* tag_new(ErlNifEnv* env,
     return tag;
 }
 
-static waiter_t* waiter_new(local_state_t* local_state, 
-                            waiter_id_t id, 
-                            ErlNifPid self, 
-                            ERL_NIF_TERM exchange_value,
-                            bool with_stats)
+static waiter_t* waiter_new(local_state_t* local_state, waiter_id_t id, ErlNifPid self,
+                            ERL_NIF_TERM exchange_value, bool with_stats)
 {
     waiter_t* waiter = waiter_pool_get(local_state);
     memset(waiter, 0, sizeof(waiter_t));
@@ -397,7 +406,7 @@ static waiter_t* waiter_new(local_state_t* local_state,
 
     waiter->id = id;
     waiter->pid = self;
-    
+
     waiter->env = env_pool_get(local_state);
     waiter->exchange_value = enif_make_copy(waiter->env, exchange_value);
     waiter->tag_term = Atoms._none;
@@ -408,10 +417,12 @@ static waiter_t* waiter_new(local_state_t* local_state,
     return waiter;
 }
 
-static void waiter_demonitor(ErlNifEnv* env, local_state_t* local_state, waiter_t* waiter) {
+static void waiter_demonitor(ErlNifEnv* env, local_state_t* local_state, waiter_t* waiter)
+{
     tag_t* tag = NULL;
+    int int_res = 0;
 
-    int int_res = get_tag(waiter->env, waiter->tag_term, &tag);
+    int_res = get_tag(waiter->env, waiter->tag_term, &tag);
     assert(int_res);
 
     if (enif_demonitor_process(env, tag, &tag->mon) == 0) {
@@ -421,14 +432,17 @@ static void waiter_demonitor(ErlNifEnv* env, local_state_t* local_state, waiter_
     }
 }
 
-static void waiter_release(local_state_t* local_state, waiter_t** waiter_ptr) {
+static void waiter_release(local_state_t* local_state, waiter_t** waiter_ptr)
+{
     waiter_t* waiter = *waiter_ptr;
 
     if (waiter->env != NULL) {
+        LOG("[waiter_release] returning env");
         env_pool_return(local_state, waiter->env);
         waiter->env = NULL;
     }
 
+    LOG("[waiter_release] returning waiter to pool");
     waiter_pool_return(local_state, waiter);
 
     *waiter_ptr = NULL;
@@ -440,86 +454,89 @@ static void waiter_release(local_state_t* local_state, waiter_t** waiter_ptr) {
 //     return enif_make_int64(env, signed_id);
 // }
 
-// static ERL_NIF_TERM make_tag(ErlNifEnv* env, ERL_NIF_TERM broker_term, bool is_left, waiter_id_t waiter_id) {
+// static ERL_NIF_TERM make_tag(ErlNifEnv* env, ERL_NIF_TERM broker_term, bool is_left, waiter_id_t
+// waiter_id) {
 //     ERL_NIF_TERM id_term = make_waiter_id(env, is_left, waiter_id);
 //     return enif_make_list_cell(env, broker_term, id_term);
 // }
 
-static ERL_NIF_TERM make_await(ErlNifEnv* env, ERL_NIF_TERM tag) {
+static ERL_NIF_TERM make_await(ErlNifEnv* env, ERL_NIF_TERM tag)
+{
     return enif_make_tuple2(env, Atoms._await, tag);
 }
 
-static ERL_NIF_TERM make_match(ErlNifEnv* env, 
-                               ERL_NIF_TERM match_ref, 
-                               ERL_NIF_TERM exchange_value) 
+static ERL_NIF_TERM make_match(ErlNifEnv* env, ERL_NIF_TERM match_ref, ERL_NIF_TERM exchange_value)
 {
     return enif_make_tuple3(env, Atoms._match, match_ref, exchange_value);
 }
 
-static ERL_NIF_TERM make_match_with_stats(ErlNifEnv* env, 
-                                          ERL_NIF_TERM match_ref, 
-                                          ERL_NIF_TERM exchange_value,
-                                          int64_t sojourn_time)
+static ERL_NIF_TERM make_match_with_stats(ErlNifEnv* env, ERL_NIF_TERM match_ref,
+                                          ERL_NIF_TERM exchange_value, int64_t sojourn_time)
 {
     ERL_NIF_TERM sojourn_time_term = enif_make_int64(env, sojourn_time);
     return enif_make_tuple4(env, Atoms._match, match_ref, exchange_value, sojourn_time_term);
-
 }
 
-static void notify_of_match(ErlNifEnv* env, 
-                            const ErlNifPid pid,
-                            const ERL_NIF_TERM tag_term,
-                            const ERL_NIF_TERM match_ref,
-                            const ERL_NIF_TERM exchange_value,
-                            int64_t sojourn_time,
-                            bool with_stats)
+static void notify_of_match(ErlNifEnv* env, const ErlNifPid pid, const ERL_NIF_TERM tag_term,
+                            const ERL_NIF_TERM match_ref, const ERL_NIF_TERM exchange_value,
+                            int64_t sojourn_time, bool with_stats)
 {
-    ERL_NIF_TERM msg_content = (
-            with_stats
-            ? make_match_with_stats(env, match_ref, exchange_value, sojourn_time)
-            : make_match(env, match_ref, exchange_value)
-    );
+    ERL_NIF_TERM msg_content =
+        (with_stats ? make_match_with_stats(env, match_ref, exchange_value, sojourn_time)
+                    : make_match(env, match_ref, exchange_value));
     ERL_NIF_TERM msg = enif_make_tuple2(env, tag_term, msg_content);
     enif_send(env, &pid, NULL, msg);
 }
 
-static void notify_of_match_using_our_waiter(ErlNifEnv* env, 
-                                             local_state_t* local_state,
-                                             waiter_t* other_waiter,
-                                             ERL_NIF_TERM match_ref,
-                                             int64_t sojourn_time,
-                                             waiter_t** our_waiter_ptr)
+static void notify_of_match_using_our_waiter(ErlNifEnv* env, local_state_t* local_state,
+                                             waiter_t* other_waiter, ERL_NIF_TERM match_ref,
+                                             int64_t sojourn_time, waiter_t** our_waiter_ptr)
 {
     waiter_t* our_waiter = *our_waiter_ptr;
     assert(our_waiter != NULL);
+    assert(our_waiter->tag_term = Atoms._none);
 
     // Reuse waiter env which we would discard anyway
     ErlNifEnv* msg_env = our_waiter->env;
+    assert(msg_env != NULL);
 
+    LOG("[notify using our waiter] copying tag");
     ERL_NIF_TERM tag_copy = enif_make_copy(msg_env, other_waiter->tag_term);
+
+    LOG("[notify using our waiter] copying match_ref");
     ERL_NIF_TERM match_ref_copy = enif_make_copy(msg_env, match_ref);
+
+    LOG("[notify using our waiter] copying exchange value");
     ERL_NIF_TERM exchange_value_copy = enif_make_copy(msg_env, our_waiter->exchange_value);
 
-    ERL_NIF_TERM msg_content = (
-            other_waiter->with_stats 
-            ? make_match_with_stats(msg_env, match_ref_copy, exchange_value_copy, sojourn_time)
-            : make_match(msg_env, match_ref_copy, exchange_value_copy)
-    );
+    LOG("[notify using our waiter] building msg content");
+    ERL_NIF_TERM msg_content =
+        (other_waiter->with_stats
+             ? make_match_with_stats(msg_env, match_ref_copy, exchange_value_copy, sojourn_time)
+             : make_match(msg_env, match_ref_copy, exchange_value_copy));
+
+    LOG("[notify using our waiter] building msg");
     ERL_NIF_TERM msg = enif_make_tuple2(msg_env, tag_copy, msg_content);
 
+    LOG("[notify using our waiter] sending msg");
     enif_send(env, &other_waiter->pid, msg_env, msg);
 
+    LOG("[notify using our waiter] returning env");
     env_pool_return(local_state, msg_env);
+
+    LOG("[notify using our waiter] releasing our waiter");
     waiter_release(local_state, our_waiter_ptr);
     assert(*our_waiter_ptr == NULL);
 }
 
-static void notify_of_cancellation(ErlNifEnv* env, ErlNifPid pid, ERL_NIF_TERM tag_term) {
+static void notify_of_cancellation(ErlNifEnv* env, ErlNifPid pid, ERL_NIF_TERM tag_term)
+{
     ERL_NIF_TERM msg = enif_make_tuple2(env, tag_term, Atoms._cancelled);
     enif_send(env, &pid, NULL, msg);
 }
 
-static int exp_percentage(ErlNifTime enqueue_ts) {
+static int exp_percentage(ErlNifTime enqueue_ts)
+{
     int64_t sojourn = monotonic_ts() - enqueue_ts;
     return MAX(1, MIN(100, sojourn / 10000));
 }
@@ -541,7 +558,7 @@ static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     broker->lock = enif_mutex_create("cbroker.broker.lock");
     broker->flags = BFLAGS_LEFT | BFLAGS_RIGHT;
-    //broker->queue = cbroker_omap_new();
+    // broker->queue = cbroker_omap_new();
 
     for (thread_id_t thread_id = 0; thread_id < nr_of_schedulers; thread_id++) {
         local_state_t* local_state = &broker->local_states[thread_id];
@@ -582,11 +599,10 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     }
     else if (side == Atoms._right) {
         flags = BFLAGS_RIGHT;
-    } 
+    }
     else {
         return make_badarg(env, side);
     }
-
 
     if (with_stats_term == Atoms._true) {
         with_stats = true;
@@ -601,35 +617,35 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     if (enif_self(env, &self)) {
         self_term = enif_make_pid(env, &self);
-    } else {
+    }
+    else {
         return enif_make_badarg(env);
     }
 
     ///////////////////////
 
-    //cbroker_omap_result_t map_res = CBROKER_OMAP_NOMEM;
-    //bool bool_res = false;
+    // cbroker_omap_result_t map_res = CBROKER_OMAP_NOMEM;
+    // bool bool_res = false;
     local_state_t* local_state = broker_local_state(broker);
 
     //
 
     balance_t balance_increment = (is_left ? -1 : +1);
-    balance_t prev_balance = atomic_fetch_add_explicit(&broker->balance, balance_increment, memory_order_relaxed);
+    balance_t prev_balance =
+        atomic_fetch_add_explicit(&broker->balance, balance_increment, memory_order_relaxed);
     LOG("[%T] [ask] Prev balance estimate: %d", self_term, prev_balance);
 
     waiter_t* our_waiter = NULL;
-    //tag_t* our_tag = NULL;
-    //ERL_NIF_TERM our_tag_term;
+    // tag_t* our_tag = NULL;
+    // ERL_NIF_TERM our_tag_term;
 
     waiter_t* other_waiter = NULL;
     bool was_enqueued = false;
 
     balance_t preemptive_alloc_threshold = 4; // MAX(1, broker->nr_of_schedulers >> 1);
-    bool preemptively_alloc_waiter = (
-        is_left 
-        ? prev_balance <= -preemptive_alloc_threshold
-        : prev_balance >= preemptive_alloc_threshold
-    );
+    bool preemptively_alloc_waiter = (is_left ? prev_balance <= -preemptive_alloc_threshold
+                                              : prev_balance >= preemptive_alloc_threshold);
+    preemptively_alloc_waiter = false;
 
     if (preemptively_alloc_waiter) {
         LOG("[%T] [ask] Preemptively allocating waiter", self_term);
@@ -642,7 +658,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     assert(broker->count >= 0);
 
     if (broker->flags & flags) {
-        LOG("[%T] [ask] Enqueuing on queue with size %llu", self_term, cbroker_omap_size(broker->queue));
+        LOG("[%T] [ask] Enqueuing on queue with size %llu", self_term, broker->count);
 
         waiter_id_t our_id = ++broker->counter;
 
@@ -692,7 +708,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         }
         else {
             assert(broker->head != NULL);
-            LOG("[%T] [ask] Queue size is now %llu", self_term, qs);
+            LOG("[%T] [ask] Queue size is now %llu", self_term, broker->count);
         }
 
         enif_mutex_unlock(broker->lock);
@@ -712,9 +728,10 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         spin_lock_t prev_slock_value = atomic_exchange(&our_waiter->spin_lock, SPIN_LOCK_DONE);
         assert(prev_slock_value == SPIN_LOCK_CREATING);
 
+        enif_consume_timeslice(env, 1);
         return make_await(env, tag_term);
     }
-    
+
     /////////
     // got a match
 
@@ -734,30 +751,22 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     int64_t our_sojourn_time = monotonic_ts() - enqueue_ts;
     int64_t other_sojourn_time = monotonic_ts() - other_waiter->enqueue_ts;
 
-    // notify other
     waiter_demonitor(env, local_state, other_waiter);
+
+    // notify other
 
     if (our_waiter != NULL) {
         LOG("[%T] [ask] Match: notifying other using our own waiter's env", self_term);
-        notify_of_match_using_our_waiter(env,
-                                         local_state,
-                                         other_waiter,
-                                         match_ref,
-                                         other_sojourn_time,
-                                         &our_waiter);
+        notify_of_match_using_our_waiter(env, local_state, other_waiter, match_ref,
+                                         other_sojourn_time, &our_waiter);
 
         assert(our_waiter == NULL);
     }
     else {
         LOG("[%T] [ask] Match: notifying other", self_term);
         ERL_NIF_TERM other_tag_copy = enif_make_copy(env, other_waiter->tag_term);
-        notify_of_match(env,
-                        other_waiter->pid,
-                        other_tag_copy,
-                        match_ref,
-                        exchange_value,
-                        other_sojourn_time,
-                        other_waiter->with_stats);
+        notify_of_match(env, other_waiter->pid, other_tag_copy, match_ref, exchange_value,
+                        other_sojourn_time, other_waiter->with_stats);
     }
 
     // notify ourselves
@@ -768,29 +777,24 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     if (ask_type == Atoms._fully_async) {
         LOG("[%T] [ask] Match: notifying ourselves asynchronously", self_term);
         ERL_NIF_TERM faux_tag = enif_make_ref(env);
-        notify_of_match(env,
-                        self,
-                        faux_tag,
-                        match_ref,
-                        other_exchange_value,
-                        our_sojourn_time,
+        notify_of_match(env, self, faux_tag, match_ref, other_exchange_value, our_sojourn_time,
                         with_stats);
 
         match_res = make_await(env, faux_tag);
     }
     else {
         LOG("[%T] [ask] Match: returning", self_term);
-        match_res = (
-            with_stats 
-            ? make_match_with_stats(env, broker_term, other_exchange_value, our_sojourn_time)
-            : make_match(env, broker_term, other_exchange_value)
-        );
+        match_res = (with_stats ? make_match_with_stats(env, broker_term, other_exchange_value,
+                                                        our_sojourn_time)
+                                : make_match(env, broker_term, other_exchange_value));
     }
 
     //
 
     waiter_release(local_state, &other_waiter);
     assert(other_waiter == NULL);
+
+    enif_consume_timeslice(env, 2);
 
     return match_res;
 }
@@ -833,8 +837,7 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
         env_pool_return(local_state, tag->env);
         tag->env = NULL;
 
-        if (enif_compare_pids(&self, &cancelled_waiter->pid) != 0)
-        {
+        if (enif_compare_pids(&self, &cancelled_waiter->pid) != 0) {
             notify_of_cancellation(env, cancelled_waiter->pid, tag_term);
         }
 
@@ -846,8 +849,6 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
 
     return cancel_res;
 }
-    
-    
 
 /*********************************************************************/
 
@@ -863,14 +864,15 @@ static int get_tag(ErlNifEnv* env, ERL_NIF_TERM term, tag_t** out)
     return enif_get_resource(env, term, ResourceTypes.tag, (void**)out);
 }
 
-// static int get_tag(ErlNifEnv* env, ERL_NIF_TERM term, broker_t** out_broker, waiter_id_t* out_waiter_id)
+// static int get_tag(ErlNifEnv* env, ERL_NIF_TERM term, broker_t** out_broker, waiter_id_t*
+// out_waiter_id)
 // {
 //     ERL_NIF_TERM head, tail;
-// 
+//
 //     broker_t* broker = NULL;
 //     ERL_NIF_TERM side; // discarded
 //     waiter_id_t waiter_id = 0;
-// 
+//
 //     if (enif_get_list_cell(env, term, &head, &tail)
 //         && get_broker(env, head, &broker)
 //         && get_waiter_id(env, tail, &side, &waiter_id))
@@ -881,10 +883,11 @@ static int get_tag(ErlNifEnv* env, ERL_NIF_TERM term, tag_t** out)
 //     }
 //     return 0;
 // }
-// 
-// static int get_waiter_id(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM* out_side, waiter_id_t *out_waiter_id) {
+//
+// static int get_waiter_id(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM* out_side, waiter_id_t
+// *out_waiter_id) {
 //     int64_t signed_id = 0;
-// 
+//
 //     if (enif_get_int64(env, term, &signed_id)) {
 //         if (signed_id < 0) {
 //             assert(signed_id > INT64_MIN);
@@ -925,18 +928,18 @@ static void env_pool_free_env(void* env) { enif_free_env((ErlNifEnv*)env); }
 
 /*********************************************************************/
 
-static void* waiter_pool_alloc_waiter() { 
-    return (void*)enif_alloc(sizeof(waiter_t)); 
-}
+static void* waiter_pool_alloc_waiter() { return (void*)enif_alloc(sizeof(waiter_t)); }
 
-static void waiter_pool_clear_waiter(void* waiter) { 
+static void waiter_pool_clear_waiter(void* waiter)
+{
     LOG("Clear waiter %llu", ((waiter_t*)waiter)->id);
     memset(waiter, 0, sizeof(waiter_t));
 }
 
-static void waiter_pool_free_waiter(void* waiter) { 
+static void waiter_pool_free_waiter(void* waiter)
+{
     LOG("Free waiter %llu", ((waiter_t*)waiter)->id);
-    enif_free((ErlNifEnv*)waiter); 
+    enif_free((ErlNifEnv*)waiter);
 }
 
 static waiter_t* waiter_pool_get(local_state_t* local_state)
@@ -1048,7 +1051,7 @@ static const thread_id_t get_or_assign_thread_id()
 
 static void broker_dtor(ErlNifEnv* caller_env, void* obj)
 {
-    broker_t* broker = (broker_t*) obj;
+    broker_t* broker = (broker_t*)obj;
     assert(broker->count == 0);
 
     enif_mutex_destroy(broker->lock);
@@ -1064,16 +1067,14 @@ static void broker_dtor(ErlNifEnv* caller_env, void* obj)
 
 //
 
-static void broker_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon)
-{
-}
+static void broker_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon) {}
 
 /*********************************************************************/
 
 static void tag_dtor(ErlNifEnv* caller_env, void* obj)
 {
     LOG("[tag destroy] %p", obj);
-    tag_t* tag = (tag_t*) obj;
+    tag_t* tag = (tag_t*)obj;
     assert(tag->env == NULL);
 
     memset(tag, 0, sizeof(tag_t));
@@ -1082,7 +1083,7 @@ static void tag_dtor(ErlNifEnv* caller_env, void* obj)
 static void tag_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon)
 {
     ERL_NIF_TERM pid_term = enif_make_pid(caller_env, pid);
-    tag_t* tag = (tag_t*) obj;
+    tag_t* tag = (tag_t*)obj;
     broker_t* broker = NULL;
 
     LOG("[%T] [tag DOWN] Waiter %llu on broker %T", pid_term, tag->waiter_id,

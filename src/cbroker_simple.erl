@@ -111,6 +111,7 @@ init(Parent) ->
     try register(?SERVER, self()) of
         true ->
             Debug = sys:debug_options([]),
+            erlang:process_flag(message_queue_data, off_heap),
 
             Invariants = #invariants{parent = Parent},
 

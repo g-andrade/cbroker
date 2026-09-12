@@ -7,7 +7,8 @@
     ask/4,
     ask/5,
     cancel/2,
-    to_list/1
+    to_list/1,
+    overhead_test/0
 ]).
 
 -on_load(init/0).
@@ -97,6 +98,24 @@ cancel(_Broker, _Tag) ->
     not_loaded(?LINE).
 
 to_list(_Broker) ->
+    not_loaded(?LINE).
+
+overhead_test() ->
+    overhead_test_recur(none, 1).
+
+overhead_test_recur(T, C) ->
+    case overhead_test(T) of
+        ok ->
+            C;
+        %
+        retry ->
+            overhead_test_recur(T, C + 1);
+        %
+        FirstT ->
+            overhead_test_recur(FirstT, C + 1)
+    end.
+
+overhead_test(_) ->
     not_loaded(?LINE).
 
 %%

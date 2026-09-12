@@ -130,7 +130,7 @@ bench1(Impl, ExchangeValueName, TotalIterations, TotalPidsAmount) ->
     ExchangeValue = generate_exchange_value(ExchangeValueName),
 
     true = (TotalPidsAmount >= 2),
-    ApproxPidsAmountOnOneside= TotalPidsAmount div 2,
+    ApproxPidsAmountOnOneside = TotalPidsAmount div 2,
 
     LeftIterationsList = iterations_list(TotalIterations, ApproxPidsAmountOnOneside),
     RightIterationsList = iterations_list(TotalIterations, ApproxPidsAmountOnOneside),
@@ -354,6 +354,7 @@ cbroker_iteration(Side, ExchangeValue) ->
 cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
     case cbroker_nif:ask(Broker, Side, ExchangeValue, true) of
         {await, Ticket} ->
+            %erlang:yield(),
             cbroker_iteration_await(StartTs, Ticket);
         %
         {match, _, _, Sojourn} ->
@@ -361,7 +362,7 @@ cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
 
             case RetryCount of
                 0 ->
-                    {instant, FinalTs - StartTs, Sojourn};
+                    {instant, FinalTs - StartTs};
                 _ ->
                     {retried, RetryCount, FinalTs - StartTs}
             end;
@@ -397,6 +398,7 @@ cbroker2_iteration(Side, ExchangeValue) ->
 cbroker2_iteration_ask(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
     case cbroker_nif2:ask(Broker, Side, ExchangeValue, true) of
         {await, Ticket} ->
+            erlang:yield(),
             cbroker2_iteration_await(StartTs, Ticket);
         %
         {match, _, _, Sojourn} ->
@@ -404,7 +406,7 @@ cbroker2_iteration_ask(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
 
             case RetryCount of
                 0 ->
-                    {instant, FinalTs - StartTs, Sojourn}
+                    {instant, FinalTs - StartTs}
             end
     end.
 
