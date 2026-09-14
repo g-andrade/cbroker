@@ -236,10 +236,15 @@ static match_t sentinel_match_cancelled;
 
 /*********************************************************************/
 
-static const thread_id_t get_or_assign_thread_id()
+static thread_id_t get_or_assign_thread_id(const size_t nr_of_schedulers)
 {
     if (my_thread_id == -1) {
-        my_thread_id = atomic_fetch_add_explicit(&next_thread_id, 1, memory_order_relaxed);
+        if (enif_thread_type() == ERL_NIF_THR_NORMAL_SCHEDULER) {
+            my_thread_id = atomic_fetch_add_explicit(&next_thread_id, 1, memory_order_relaxed);
+        }
+        else {
+            my_thread_id = nr_of_schedulers;
+        }
     }
     assert(my_thread_id >= 0);
     return my_thread_id;
@@ -704,7 +709,12 @@ static void handle_ref_count_dec(handle_t* handle)
     handle->batch = NULL;
 
     if (returnable_batch != NULL) {
-        return_batch(local_state, &returnable_batch);
+        if (local_state == NULL) {
+            enif_free(returnable_batch);
+        }
+        else {
+            return_batch(local_state, &returnable_batch);
+        }
         assert(returnable_batch == NULL);
     }
 }
@@ -745,7 +755,8 @@ static bool batch_lookup(broker_t* broker, local_state_t* local_state, batch_id_
 {
     batch_t* batch = NULL;
 
-    if (cbroker_omap_lookup(local_state->batches, batch_id, (void**)&batch)) {
+    if (local_state != NULL &&
+        cbroker_omap_lookup(local_state->batches, batch_id, (void**)&batch)) {
         out_handle->batch = batch;
         out_handle->found_locally = true;
         out_handle->broker = broker;
@@ -794,7 +805,11 @@ static void broker_get_all_batches(broker_t* broker, local_state_t* local_state,
 
         handle_t* handle = &array[i];
         handle->batch = batch;
-        handle->found_locally = cbroker_omap_lookup(local_state->batches, batch_id, NULL);
+
+        handle->found_locally =
+            (local_state != NULL ? cbroker_omap_lookup(local_state->batches, batch_id, NULL)
+                                 : false);
+
         handle->broker = broker;
         handle->local_state = local_state;
 
@@ -896,12 +911,13 @@ static void local_states_dirty_close(local_state_t local_states[], const size_t 
 
 static local_state_t* broker_local_state(broker_t* broker)
 {
-    const thread_id_t thread_id = get_or_assign_thread_id();
+    const thread_id_t thread_id = get_or_assign_thread_id(broker->nr_of_schedulers);
     assert(thread_id >= 0);
-    assert(thread_id < broker->nr_of_schedulers);
-    local_state_t* local_state = &broker->local_states[thread_id];
 
-    return local_state;
+    if (thread_id < broker->nr_of_schedulers) {
+        return &broker->local_states[thread_id];
+    }
+    return NULL;
 }
 
 static batch_t* ask_get_next_batch(ask_ctx_t* ctx, const batch_id_t prev_batch_id)
@@ -1026,7 +1042,12 @@ static ref_count_t match_dec_ref_count(local_state_t* local_state, match_t** mat
     ref_count_t ref_count = match_dec_ref_count_ahhh(match_ptr);
 
     if (ref_count == 0) {
-        mempool_return(&local_state->match_pool, *match_ptr);
+        if (local_state == NULL) {
+            enif_release_resource(*match_ptr);
+        }
+        else {
+            mempool_return(&local_state->match_pool, *match_ptr);
+        }
         *match_ptr = NULL;
     }
 
@@ -1511,6 +1532,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     LOG("[ask] Getting local state");
     ctx.local_state = broker_local_state(ctx.broker);
+    assert(ctx.local_state != NULL);
 
     if (ctx.local_state->is_closed) {
         return Atoms._closed;
@@ -1638,6 +1660,8 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
     }
 
     local_state_t* local_state = broker_local_state(broker);
+    assert(local_state != NULL);
+
     handle_t handle;
     memset(&handle, 0, sizeof(handle_t));
 
@@ -1707,6 +1731,8 @@ static ERL_NIF_TERM nif_to_list(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
     }
 
     local_state_t* local_state = broker_local_state(broker);
+    assert(local_state != NULL);
+
     handle_t* handles = NULL;
     size_t nr_of_batches = 0;
     broker_get_all_batches(broker, local_state, &handles, &nr_of_batches);
