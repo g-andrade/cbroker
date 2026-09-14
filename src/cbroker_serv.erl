@@ -128,7 +128,7 @@ code_change(_OldVsn, State, _Extra) ->
 
 new_shared_state() ->
     #shared_state{
-        broker = cbroker_nif:new(),
+        broker = cbroker_nif:new([depends_on_creator]),
         instance = erlang:unique_integer()
     }.
 

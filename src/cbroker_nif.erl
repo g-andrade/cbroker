@@ -5,7 +5,8 @@
     new/1,
     ask/3,
     ask/4,
-    cancel/1
+    cancel/1,
+    to_list/1
 ]).
 
 -on_load(init/0).
@@ -78,6 +79,9 @@ ask(_Broker, _Side, _Value, _WithStats) ->
 -spec cancel(Tag) -> cancelled | too_late when
     Tag :: tag().
 cancel(_Tag) ->
+    not_loaded(?LINE).
+
+to_list(_Broker) ->
     not_loaded(?LINE).
 
 %%
