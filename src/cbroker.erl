@@ -179,7 +179,14 @@ iterations_list(TotalIterations, PidsAmount) ->
     Base = TotalIterations div PidsAmount,
     Rem = TotalIterations rem PidsAmount,
     true = Base >= 1,
-    [Base + (if I =< Rem -> 1; true -> 0 end) || I <- lists:seq(1, PidsAmount)].
+    [
+        Base +
+            (if
+                I =< Rem -> 1;
+                true -> 0
+            end)
+     || I <- lists:seq(1, PidsAmount)
+    ].
 
 sample_group({blocked, _}) ->
     blocked;
@@ -298,20 +305,12 @@ native_to_us(Interval) when is_number(Interval) ->
 left_fun(simple) ->
     fun simple_left_iteration/1;
 left_fun(cbroker) ->
-    fun cbroker_left_iteration/1;
-left_fun(cbroker2) ->
-    fun cbroker2_left_iteration/1;
-left_fun(cbroker3) ->
-    fun cbroker3_left_iteration/1.
+    fun cbroker_left_iteration/1.
 
 right_fun(simple) ->
     fun simple_right_iteration/1;
 right_fun(cbroker) ->
-    fun cbroker_right_iteration/1;
-right_fun(cbroker2) ->
-    fun cbroker2_right_iteration/1;
-right_fun(cbroker3) ->
-    fun cbroker3_right_iteration/1.
+    fun cbroker_right_iteration/1.
 
 %%
 
@@ -352,9 +351,9 @@ cbroker_iteration(Side, ExchangeValue) ->
     end.
 
 cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
-    case cbroker_nif:ask(Broker, Side, ExchangeValue, true) of
-        {await, Ticket} ->
-            cbroker_iteration_await(StartTs, Ticket);
+    case cbroker_nif:ask(Broker, Side, ExchangeValue) of
+        {await, Tag} ->
+            cbroker_iteration_await(StartTs, Tag);
         %
         {match, _, _, Sojourn} ->
             FinalTs = erlang:monotonic_time(),
@@ -370,92 +369,13 @@ cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
             cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount + 1)
     end.
 
-cbroker_iteration_await(StartTs, Ticket) ->
+cbroker_iteration_await(StartTs, Tag) ->
     receive
-        {T, Result} when T =:= Ticket ->
+        {T, Result} when T =:= Tag ->
             FinalTs = erlang:monotonic_time(),
             {match, _, _, _} = Result,
             {blocked, FinalTs - StartTs}
     end.
-
-%%
-
-cbroker2_left_iteration(ExchangeValue) ->
-    cbroker2_iteration(left, ExchangeValue).
-
-cbroker2_right_iteration(ExchangeValue) ->
-    cbroker2_iteration(right, ExchangeValue).
-
-cbroker2_iteration(Side, ExchangeValue) ->
-    StartTs = erlang:monotonic_time(),
-
-    case cbroker_serv:get_shared_state(test) of
-        #shared_state{broker2 = Broker} ->
-            cbroker2_iteration_ask(StartTs, Broker, Side, ExchangeValue, 0)
-    end.
-
-cbroker2_iteration_ask(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
-    case cbroker_nif2:ask(Broker, Side, ExchangeValue, true) of
-        {await, Ticket} ->
-            erlang:yield(),
-            cbroker2_iteration_await(StartTs, Ticket);
-        %
-        {match, _, _, Sojourn} ->
-            FinalTs = erlang:monotonic_time(),
-
-            case RetryCount of
-                0 ->
-                    {instant, FinalTs - StartTs}
-            end
-    end.
-
-cbroker2_iteration_await(StartTs, Ticket) ->
-    receive
-        {T, Result} when T =:= Ticket ->
-            FinalTs = erlang:monotonic_time(),
-            {match, _, _, _} = Result,
-            {blocked, FinalTs - StartTs}
-    end.
-
-%%
-
-cbroker3_left_iteration(ExchangeValue) ->
-    cbroker3_iteration(left, ExchangeValue).
-
-cbroker3_right_iteration(ExchangeValue) ->
-    cbroker3_iteration(right, ExchangeValue).
-
-cbroker3_iteration(Side, ExchangeValue) ->
-    StartTs = erlang:monotonic_time(),
-
-    case cbroker_serv:get_shared_state(test) of
-        #shared_state{broker3 = Broker} ->
-            cbroker3_iteration_ask(StartTs, Broker, Side, ExchangeValue, 0)
-    end.
-
-cbroker3_iteration_ask(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
-    case cbroker_nif3:ask(Broker, Side, ExchangeValue, regular) of
-        {await, Ticket} ->
-            cbroker3_iteration_await(StartTs, Ticket);
-        %
-        {match, _, _, Sojourn} ->
-            FinalTs = erlang:monotonic_time(),
-
-            case RetryCount of
-                0 ->
-                    {instant, FinalTs - StartTs}
-            end
-    end.
-
-cbroker3_iteration_await(StartTs, Ticket) ->
-    receive
-        {T, Result} when T =:= Ticket ->
-            FinalTs = erlang:monotonic_time(),
-            {match, _, _, _} = Result,
-            {blocked, FinalTs - StartTs}
-    end.
-
-%%
 
 %%
 
@@ -531,9 +451,9 @@ ask_side(Name, Side, Value, Timeout) ->
     case cbroker_serv:get_shared_state(Name) of
         #shared_state{broker = Broker} ->
             %
-            case cbroker_nif:ask(Broker, Side, Value, true) of
-                {await, Ticket} ->
-                    await_after_ask(Broker, Ticket, Timeout);
+            case cbroker_nif:ask(Broker, Side, Value) of
+                {await, Tag} ->
+                    await_after_ask(Broker, Tag, Timeout);
                 %
                 {match, _, _, _} = Match ->
                     Match;
@@ -546,18 +466,18 @@ ask_side(Name, Side, Value, Timeout) ->
             not_running
     end.
 
-await_after_ask(Broker, Ticket, Timeout) ->
+await_after_ask(Broker, Tag, Timeout) ->
     receive
-        {T, Result} when T =:= Ticket ->
+        {T, Result} when T =:= Tag ->
             Result
     after Timeout ->
-        case cbroker_nif:cancel(Broker, Ticket) of
+        case cbroker_nif:cancel(Tag) of
             cancelled ->
                 timeout;
             %
             too_late ->
                 receive
-                    {T, Result} when T =:= Ticket ->
+                    {T, Result} when T =:= Tag ->
                         Result
                 end
         end
@@ -566,7 +486,7 @@ await_after_ask(Broker, Ticket, Timeout) ->
 async_ask_side(Name, Side, Value) ->
     case cbroker_serv:get_shared_state(Name) of
         #shared_state{broker = Broker} ->
-            case cbroker_nif:ask(Broker, Side, Value, true, true) of
+            case cbroker_nif:ask(Broker, Side, Value, async) of
                 retry ->
                     async_ask_side(Name, Side, Value);
                 %

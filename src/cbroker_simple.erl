@@ -190,7 +190,9 @@ terminate(Reason) ->
 
 %%
 
-handle_ask(Side, Pid, Value, Tag, Ts, #state{side = QSide, q = Q, downed_mons = DownedMons} = State) ->
+handle_ask(
+    Side, Pid, Value, Tag, Ts, #state{side = QSide, q = Q, downed_mons = DownedMons} = State
+) ->
     case Side =:= QSide of
         true ->
             Mon = monitor(process, Pid),
@@ -272,7 +274,7 @@ match(Pid1, Value1, Tag1, Mon1, Ts1, Pid2, Value2, Tag2, Ts2) ->
     demonitor(Mon1),
     MatchRef = make_ref(),
     Now = erlang:monotonic_time(),
-    
+
     Sojourn1 = Now - Ts1,
     _ = Pid1 ! {Tag1, {match, MatchRef, Value2, Sojourn1}},
 

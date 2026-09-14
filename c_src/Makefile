@@ -12,8 +12,6 @@ ERL_INTERFACE_LIB_DIR ?= $(shell erl -noshell -eval "io:format(\"~ts\", [code:li
 
 C_SRC_DIR = $(CURDIR)
 C_SRC_OUTPUT ?= $(CURDIR)/../priv/$(PROJECT).so
-C_SRC_OUTPUT2 ?= $(CURDIR)/../priv/cbroker_nif2.so
-C_SRC_OUTPUT3 ?= $(CURDIR)/../priv/cbroker_nif3.so
 
 # System type and C compiler/flags.
 
@@ -59,20 +57,11 @@ OBJECTS = $(addsuffix .o, $(basename $(SOURCES)))
 COMPILE_C = $(c_verbose) $(CC) $(CFLAGS) $(CPPFLAGS) -c
 COMPILE_CPP = $(cpp_verbose) $(CXX) $(CXXFLAGS) $(CPPFLAGS) -c
 
-all: $(C_SRC_OUTPUT) $(C_SRC_OUTPUT2) $(C_SRC_OUTPUT3)
+all: $(C_SRC_OUTPUT)
 
 $(C_SRC_OUTPUT): compile_flags.txt $(OBJECTS)
 	@mkdir -p $(BASEDIR)/priv/
-	#$(link_verbose) $(CC) $(OBJECTS) $(LDFLAGS) $(LDLIBS) -o $(C_SRC_OUTPUT)
-	$(link_verbose) $(CC) cbroker_nif.o cbroker_omap.o $(LDFLAGS) $(LDLIBS) -o $(C_SRC_OUTPUT)
-
-$(C_SRC_OUTPUT2): compile_flags.txt $(OBJECTS)
-	@mkdir -p $(BASEDIR)/priv/
-	$(link_verbose) $(CC) cbroker_nif2.o cbroker_omap.o $(LDFLAGS) $(LDLIBS) -o $(C_SRC_OUTPUT2)
-
-$(C_SRC_OUTPUT3): compile_flags.txt $(OBJECTS)
-	@mkdir -p $(BASEDIR)/priv/
-	$(link_verbose) $(CC) cbroker_nif3.o cbroker_omap.o $(LDFLAGS) $(LDLIBS) -o $(C_SRC_OUTPUT3)
+	$(link_verbose) $(CC) $(OBJECTS) $(LDFLAGS) $(LDLIBS) -o $(C_SRC_OUTPUT)
 
 # clangd (the C language server) resolves erl_nif.h and friends by reading
 # compile_flags.txt from this directory: one compiler argument per line. It is

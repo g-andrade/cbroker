@@ -3,10 +3,9 @@
 -export([
     new/0,
     new/1,
+    ask/3,
     ask/4,
-    ask/5,
-    cancel/2,
-    to_list/1
+    cancel/1
 ]).
 
 -on_load(init/0).
@@ -58,7 +57,10 @@ new() ->
 new(_Opts) ->
     not_loaded(?LINE).
 
--spec ask(Broker, Side, Value, WithStats) ->
+ask(_Broker, _Side, _Value) ->
+    not_loaded(?LINE).
+
+-spec ask(Broker, Side, Value, AskType) ->
     {await, Tag}
     | match()
     | retry
@@ -68,31 +70,14 @@ when
     Broker :: broker(),
     Side :: side(),
     Value :: term(),
-    WithStats :: boolean(),
+    AskType :: ask_type(),
     Tag :: tag().
 ask(_Broker, _Side, _Value, _WithStats) ->
     not_loaded(?LINE).
 
--spec ask(Broker, Side, Value, WithStats, AskType) ->
-    {await, Tag}
-    | retry
-when
-    Broker :: broker(),
-    Side :: side(),
-    Value :: term(),
-    WithStats :: boolean(),
-    AskType :: ask_type(),
+-spec cancel(Tag) -> cancelled | too_late when
     Tag :: tag().
-ask(_Broker, _Side, _Value, _WithStats, _AskType) ->
-    not_loaded(?LINE).
-
--spec cancel(Broker, Tag) -> cancelled | too_late when
-    Broker :: broker(),
-    Tag :: tag().
-cancel(_Broker, _Tag) ->
-    not_loaded(?LINE).
-
-to_list(_Broker) ->
+cancel(_Tag) ->
     not_loaded(?LINE).
 
 %%
