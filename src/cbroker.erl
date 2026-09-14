@@ -130,10 +130,11 @@ bench1(Impl, ExchangeValueName, TotalIterations, TotalPidsAmount) ->
     ExchangeValue = generate_exchange_value(ExchangeValueName),
 
     true = (TotalPidsAmount >= 2),
-    ApproxPidsAmountOnOneside = TotalPidsAmount div 2,
+    LeftPidsAmount = TotalPidsAmount div 2,
+    RightPidsAmount = TotalPidsAmount - LeftPidsAmount,
 
-    LeftIterationsList = iterations_list(TotalIterations, ApproxPidsAmountOnOneside),
-    RightIterationsList = iterations_list(TotalIterations, ApproxPidsAmountOnOneside),
+    LeftIterationsList = iterations_list(TotalIterations, LeftPidsAmount),
+    RightIterationsList = iterations_list(TotalIterations, RightPidsAmount),
 
     LeftPids = launch_processes(LeftFun, ExchangeValue, LeftIterationsList),
     RightPids = launch_processes(RightFun, ExchangeValue, RightIterationsList),
@@ -174,16 +175,11 @@ bench1(Impl, ExchangeValueName, TotalIterations, TotalPidsAmount) ->
             lists:map(fun(Group) -> group_stats(Group, TotalSamples) end, SortedGroups)}
     ].
 
-iterations_list(TotalIterations, ApproxPidsAmount) ->
-    Each = TotalIterations div ApproxPidsAmount,
-    true = Each >= 1,
-    iterations_list_recur(TotalIterations, Each).
-
-iterations_list_recur(TotalIterations, Each) when TotalIterations > 0 ->
-    Chunk = min(TotalIterations, Each),
-    [Chunk | iterations_list_recur(TotalIterations - Chunk, Each)];
-iterations_list_recur(0, _) ->
-    [].
+iterations_list(TotalIterations, PidsAmount) ->
+    Base = TotalIterations div PidsAmount,
+    Rem = TotalIterations rem PidsAmount,
+    true = Base >= 1,
+    [Base + (if I =< Rem -> 1; true -> 0 end) || I <- lists:seq(1, PidsAmount)].
 
 sample_group({blocked, _}) ->
     blocked;
@@ -304,14 +300,18 @@ left_fun(simple) ->
 left_fun(cbroker) ->
     fun cbroker_left_iteration/1;
 left_fun(cbroker2) ->
-    fun cbroker2_left_iteration/1.
+    fun cbroker2_left_iteration/1;
+left_fun(cbroker3) ->
+    fun cbroker3_left_iteration/1.
 
 right_fun(simple) ->
     fun simple_right_iteration/1;
 right_fun(cbroker) ->
     fun cbroker_right_iteration/1;
 right_fun(cbroker2) ->
-    fun cbroker2_right_iteration/1.
+    fun cbroker2_right_iteration/1;
+right_fun(cbroker3) ->
+    fun cbroker3_right_iteration/1.
 
 %%
 
@@ -328,7 +328,7 @@ simple_iteration(Side, ExchangeValue) ->
     receive
         {Ref, Reply} when Ref =:= Tag ->
             FinalTs = erlang:monotonic_time(),
-            {match, _MatchRef, _} = Reply,
+            {match, _MatchRef, _, _} = Reply,
             {blocked, FinalTs - StartTs};
         %
         {'DOWN', Ref, _, _, Reason} when Ref =:= Tag ->
@@ -354,7 +354,6 @@ cbroker_iteration(Side, ExchangeValue) ->
 cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
     case cbroker_nif:ask(Broker, Side, ExchangeValue, true) of
         {await, Ticket} ->
-            %erlang:yield(),
             cbroker_iteration_await(StartTs, Ticket);
         %
         {match, _, _, Sojourn} ->
@@ -417,6 +416,46 @@ cbroker2_iteration_await(StartTs, Ticket) ->
             {match, _, _, _} = Result,
             {blocked, FinalTs - StartTs}
     end.
+
+%%
+
+cbroker3_left_iteration(ExchangeValue) ->
+    cbroker3_iteration(left, ExchangeValue).
+
+cbroker3_right_iteration(ExchangeValue) ->
+    cbroker3_iteration(right, ExchangeValue).
+
+cbroker3_iteration(Side, ExchangeValue) ->
+    StartTs = erlang:monotonic_time(),
+
+    case cbroker_serv:get_shared_state(test) of
+        #shared_state{broker3 = Broker} ->
+            cbroker3_iteration_ask(StartTs, Broker, Side, ExchangeValue, 0)
+    end.
+
+cbroker3_iteration_ask(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
+    case cbroker_nif3:ask(Broker, Side, ExchangeValue, regular) of
+        {await, Ticket} ->
+            cbroker3_iteration_await(StartTs, Ticket);
+        %
+        {match, _, _, Sojourn} ->
+            FinalTs = erlang:monotonic_time(),
+
+            case RetryCount of
+                0 ->
+                    {instant, FinalTs - StartTs}
+            end
+    end.
+
+cbroker3_iteration_await(StartTs, Ticket) ->
+    receive
+        {T, Result} when T =:= Ticket ->
+            FinalTs = erlang:monotonic_time(),
+            {match, _, _, _} = Result,
+            {blocked, FinalTs - StartTs}
+    end.
+
+%%
 
 %%
 

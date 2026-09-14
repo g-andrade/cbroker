@@ -459,6 +459,16 @@ static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
 //
 
+static inline void consume_timeslice(ErlNifEnv* env, ErlNifTime enqueue_ts)
+{
+    int64_t sojourn = enif_monotonic_time(ERL_NIF_NSEC) - enqueue_ts;
+    int percentage = MAX(0, MIN(100, sojourn / 10000));
+
+    if (percentage != 0) {
+        enif_consume_timeslice(env, percentage);
+    }
+}
+
 static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     ask_ctx_t ctx;
@@ -530,7 +540,6 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         ERL_NIF_TERM tag = make_tag(&ctx, success.batch->id, success.offset);
         match_res = make_await(env, tag);
         batch_preemptively_ensure_next(ctx.broker, ctx.local_state, success.batch, success.offset);
-        enif_consume_timeslice(env, 30);
     }
     else if (match_res == Atoms._matched) {
         match_t* our_match = success.our_match;
@@ -579,7 +588,6 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             assert(opposite_match == NULL);
 
             match_res = make_await(env, self_tag);
-            // enif_consume_timeslice(env, 100);
         }
         else {
             // 1 message sent
@@ -591,7 +599,6 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             match_res = (ctx.with_stats ? make_match_with_stats(env, match_ref, opposite_value,
                                                                 ctx.enqueue_time)
                                         : make_match(env, match_ref, opposite_value));
-            enif_consume_timeslice(env, 100);
         }
     }
     else if (success.consume_slot) {
@@ -599,6 +606,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         batch_consume_local_slot(ctx.broker, ctx.local_state, success.batch);
     }
 
+    consume_timeslice(env, ctx.enqueue_time);
     return match_res;
 }
 

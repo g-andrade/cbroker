@@ -45,7 +45,7 @@
 
 -define(SERVER, ?MODULE).
 
--define(ENTRY(Pid, Value, Tag, Mon), {Pid, Value, Tag, Mon}).
+-define(ENTRY(Pid, Value, Tag, Mon, Ts), {Pid, Value, Tag, Mon, Ts}).
 
 %% ------------------------------------------------------------------
 %% Record and Type Definitions
@@ -59,9 +59,10 @@
 }).
 -type state() :: #state{}.
 
--type entry() :: ?ENTRY(pid(), term(), reference(), reference()).
+-type entry() :: ?ENTRY(pid(), term(), reference(), reference(), ts()).
 
 -type downed_mons() :: #{reference() => v}.
+-type ts() :: integer().
 
 %%
 
@@ -88,7 +89,8 @@ start_link() ->
 async_ask(Side, Pid, Value) ->
     ServPid = whereis(?SERVER),
     Tag = monitor(process, ServPid),
-    _ = ServPid ! {ask, Side, Pid, Value, Tag},
+    Ts = erlang:monotonic_time(),
+    _ = ServPid ! {ask, Side, Pid, Value, Tag, Ts},
     {await, ServPid, Tag}.
 
 ask(Side, Pid, Value) ->
@@ -175,8 +177,8 @@ handle_msg(Msg, Debug, State) ->
     loop(UpdatedDebug, UpdatedState).
 
 -spec handle_non_system_msg(term(), state()) -> state() | no_return().
-handle_non_system_msg({ask, Side, Pid, Value, Tag}, State) ->
-    handle_ask(Side, Pid, Value, Tag, State);
+handle_non_system_msg({ask, Side, Pid, Value, Tag, Ts}, State) ->
+    handle_ask(Side, Pid, Value, Tag, Ts, State);
 handle_non_system_msg({'DOWN', Ref, process, _Pid, _Reason}, State) ->
     handle_monitor_down(Ref, State);
 handle_non_system_msg(Msg, _State) ->
@@ -188,34 +190,34 @@ terminate(Reason) ->
 
 %%
 
-handle_ask(Side, Pid, Value, Tag, #state{side = QSide, q = Q, downed_mons = DownedMons} = State) ->
+handle_ask(Side, Pid, Value, Tag, Ts, #state{side = QSide, q = Q, downed_mons = DownedMons} = State) ->
     case Side =:= QSide of
         true ->
             Mon = monitor(process, Pid),
-            Entry = ?ENTRY(Pid, Value, Tag, Mon),
+            Entry = ?ENTRY(Pid, Value, Tag, Mon, Ts),
             UpdatedQ = queue:in(Entry, Q),
             State#state{q = UpdatedQ};
         %
         _ when QSide =:= none ->
             Mon = monitor(process, Pid),
-            Entry = ?ENTRY(Pid, Value, Tag, Mon),
+            Entry = ?ENTRY(Pid, Value, Tag, Mon, Ts),
             UpdatedQ = queue:in(Entry, Q),
             State#state{side = Side, q = UpdatedQ};
         %
         _ ->
             case map_size(DownedMons) of
                 0 ->
-                    try_matching1(Side, Pid, Value, Tag, Q, State);
+                    try_matching1(Side, Pid, Value, Tag, Ts, Q, State);
                 %
                 _ ->
-                    try_matching2(Side, Pid, Value, Tag, Q, DownedMons, State)
+                    try_matching2(Side, Pid, Value, Tag, Ts, Q, DownedMons, State)
             end
     end.
 
-try_matching1(Side2, Pid2, Value2, Tag2, Q, State) ->
+try_matching1(Side2, Pid2, Value2, Tag2, Ts2, Q, State) ->
     case queue:out(Q) of
-        {{value, ?ENTRY(Pid1, Value1, Tag1, Mon1)}, RemainingQ} ->
-            match(Pid1, Value1, Tag1, Mon1, Pid2, Value2, Tag2),
+        {{value, ?ENTRY(Pid1, Value1, Tag1, Mon1, Ts1)}, RemainingQ} ->
+            match(Pid1, Value1, Tag1, Mon1, Ts1, Pid2, Value2, Tag2, Ts2),
 
             case queue:is_empty(RemainingQ) of
                 false ->
@@ -227,17 +229,17 @@ try_matching1(Side2, Pid2, Value2, Tag2, Q, State) ->
         %
         {empty, EmptyQ} ->
             Mon = monitor(process, Pid2),
-            Entry = ?ENTRY(Pid2, Value2, Tag2, Mon),
+            Entry = ?ENTRY(Pid2, Value2, Tag2, Mon, Ts2),
             UpdatedQ = queue:in(Entry, EmptyQ),
             State#state{side = Side2, q = UpdatedQ, downed_mons = #{}}
     end.
 
-try_matching2(Side2, Pid2, Value2, Tag2, Q, DownedMons, State) ->
+try_matching2(Side2, Pid2, Value2, Tag2, Ts2, Q, DownedMons, State) ->
     case queue:out(Q) of
-        {{value, ?ENTRY(Pid1, Value1, Tag1, Mon1)}, RemainingQ} ->
+        {{value, ?ENTRY(Pid1, Value1, Tag1, Mon1, Ts1)}, RemainingQ} ->
             case maps:take(Mon1, DownedMons) of
                 error ->
-                    match(Pid1, Value1, Tag1, Mon1, Pid2, Value2, Tag2),
+                    match(Pid1, Value1, Tag1, Mon1, Ts1, Pid2, Value2, Tag2, Ts2),
 
                     case queue:is_empty(RemainingQ) of
                         false ->
@@ -251,26 +253,31 @@ try_matching2(Side2, Pid2, Value2, Tag2, Q, DownedMons, State) ->
                     case map_size(RemainingMons) of
                         0 ->
                             try_matching2(
-                                Side2, Pid2, Value2, Tag2, RemainingQ, RemainingMons, State
+                                Side2, Pid2, Value2, Tag2, Ts2, RemainingQ, RemainingMons, State
                             );
                         %
                         _ ->
-                            try_matching1(Side2, Pid2, Value2, Tag2, RemainingQ, State)
+                            try_matching1(Side2, Pid2, Value2, Tag2, Ts2, RemainingQ, State)
                     end
             end;
         %
         {empty, EmptyQ} ->
             Mon = monitor(process, Pid2),
-            Entry = ?ENTRY(Pid2, Value2, Tag2, Mon),
+            Entry = ?ENTRY(Pid2, Value2, Tag2, Mon, Ts2),
             UpdatedQ = queue:in(Entry, EmptyQ),
             State#state{side = Side2, q = UpdatedQ, downed_mons = #{}}
     end.
 
-match(Pid1, Value1, Tag1, Mon1, Pid2, Value2, Tag2) ->
+match(Pid1, Value1, Tag1, Mon1, Ts1, Pid2, Value2, Tag2, Ts2) ->
     demonitor(Mon1),
     MatchRef = make_ref(),
-    _ = Pid1 ! {Tag1, {match, MatchRef, Value2}},
-    _ = Pid2 ! {Tag2, {match, MatchRef, Value1}},
+    Now = erlang:monotonic_time(),
+    
+    Sojourn1 = Now - Ts1,
+    _ = Pid1 ! {Tag1, {match, MatchRef, Value2, Sojourn1}},
+
+    Sojourn2 = Now - Ts2,
+    _ = Pid2 ! {Tag2, {match, MatchRef, Value1, Sojourn2}},
     ok.
 
 %%
@@ -283,7 +290,7 @@ handle_monitor_down(Ref, #state{downed_mons = Mons} = State) ->
             State#state{downed_mons = UpdatedMons};
         %
         true ->
-            FilterFun = fun(?ENTRY(_, _, _, Mon)) -> not maps:is_key(Mon, UpdatedMons) end,
+            FilterFun = fun(?ENTRY(_, _, _, Mon, _)) -> not maps:is_key(Mon, UpdatedMons) end,
             FilteredQ = queue:filter(FilterFun, State#state.q),
 
             case queue:is_empty(FilteredQ) of
