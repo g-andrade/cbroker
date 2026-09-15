@@ -24,13 +24,40 @@ make shell           # interactive REPL with the app started
 ```
 
 All checks run sequentially (`.NOTPARALLEL`). CI runs `make check-fast`, `make test`,
-and `make check-slow` over OTP 24–29 on Linux.
+and `make check-slow` over OTP 24–29 on Linux, plus a Windows job that only builds
+and tests (`rebar3 compile` + `rebar3 do 'eunit,ct'`) over OTP 28–29.
 
 ## Compiler flags
 
 `warn_export_vars`, `warn_missing_spec`, `warn_unused_import`, and `warnings_as_errors`
 are always on — every exported function needs a `-spec`. The `test` and `shell`
 profiles relax `warn_missing_spec` and `warnings_as_errors`.
+
+## The NIF build
+
+The NIF is built by `pre_hooks`/`post_hooks` in `rebar.config`, selected by a
+regex over rebar3's `OTP_RELEASE-SYSTEM_ARCHITECTURE-WORDSIZE` string:
+
+- **Unix** (`linux|darwin|solaris`, and `freebsd` through `gmake`): `c_src/Makefile`
+  builds `priv/cbroker.so` with `cc`/`gcc`, globbing `c_src/*.c`. Warning flags are
+  `-Wall -Wmissing-prototypes -Wsign-compare -Wconversion`; the last two were added
+  because `-Wall` alone hides narrowing and signed/unsigned comparisons that MSVC
+  reports at `/W3`.
+- **Windows** (`windows`, matching e.g. `28-x86_64-pc-windows-64`, not `win32`):
+  `c_src/Makefile.win` builds `priv/cbroker.dll` with nmake and MSVC, and must be
+  run from a Visual Studio developer prompt. `.c` files are listed explicitly there
+  because nmake cannot glob, so **new sources must be added to it by hand**.
+  `/std:c11` is needed for `_Thread_local`, `/experimental:c11atomics` for
+  `<stdatomic.h>` (VS 2022 17.5+), and `/MD` shares ERTS's C runtime, so that e.g.
+  the `stderr` handed to `enif_fprintf` is the same one. The ERTS headers come from
+  `ERLANG_ROOT_DIR`/`ERLANG_ERTS_VER`, which rebar3 exports to hooks.
+
+MSVC portability rules for the C sources: no POSIX-only types (`ptrdiff_t`, not
+`ssize_t`) and no compiler-specific atomics extensions — `memory_order_acq_rel` is
+mapped to `memory_order_seq_cst` on MSVC in `cbroker_nif.c`.
+
+The Windows CI job lists `priv/cbroker.dll` after compiling, because a hook whose
+regex doesn't match fails silently and only surfaces later as a NIF load error.
 
 ## Documentation (EEP-48)
 
