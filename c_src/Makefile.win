@@ -1,0 +1,45 @@
+# NMake build of the NIF for Windows (MSVC), the counterpart of Makefile.
+# rebar3's win32 hooks run it from the project root as:
+#
+#   cd c_src && nmake /nologo /f Makefile.win [clean]
+#
+# cl.exe and link.exe must be on PATH, i.e. run from a Visual Studio developer
+# prompt (vcvars64.bat). rebar3 exports ERLANG_ROOT_DIR and ERLANG_ERTS_VER to
+# hooks; when invoking nmake by hand, set those or ERTS_INCLUDE_DIR.
+#
+# Sources are listed explicitly: nmake cannot glob into a macro.
+
+PROJECT = cbroker
+
+!IFNDEF ERTS_INCLUDE_DIR
+!IFNDEF ERLANG_ROOT_DIR
+!ERROR Set ERTS_INCLUDE_DIR, or ERLANG_ROOT_DIR and ERLANG_ERTS_VER
+!ENDIF
+ERTS_INCLUDE_DIR = $(ERLANG_ROOT_DIR)/erts-$(ERLANG_ERTS_VER)/include
+!ENDIF
+
+C_SRC_OUTPUT = ..\priv\$(PROJECT).dll
+
+OBJECTS = cbroker_nif.obj cbroker_omap.obj
+
+# /std:c11                  _Thread_local
+# /experimental:c11atomics  stdatomic.h (VS 2022 17.5+)
+# /MD                       the DLL C runtime, shared with ERTS, rather than a
+#                           private static copy (e.g. one `stderr` for LOG)
+CFLAGS = /nologo /O2 /std:c11 /experimental:c11atomics /W3 /MD /I"$(ERTS_INCLUDE_DIR)"
+LDFLAGS = /nologo /DLL
+
+all: $(C_SRC_OUTPUT)
+
+$(C_SRC_OUTPUT): $(OBJECTS)
+	@if not exist ..\priv mkdir ..\priv
+	link $(LDFLAGS) /OUT:$@ /IMPLIB:$(PROJECT).lib $(OBJECTS)
+
+cbroker_nif.obj: cbroker_nif.c cbroker_omap.h
+cbroker_omap.obj: cbroker_omap.c cbroker_omap.h
+
+.c.obj:
+	$(CC) $(CFLAGS) /c /Fo$@ $<
+
+clean:
+	-@del /q $(OBJECTS) $(PROJECT).lib $(PROJECT).exp $(C_SRC_OUTPUT) 2>nul

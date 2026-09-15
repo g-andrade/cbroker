@@ -4,10 +4,17 @@
 #include <math.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
 #include "cbroker_omap.h"
+
+/* memory_order_acq_rel is a GCC/Clang extension, missing from MSVC's
+ * stdatomic.h. Orders are only hints, so seq_cst is always a valid stand-in. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define memory_order_acq_rel memory_order_seq_cst
+#endif
 
 /*********************************************************************/
 
@@ -105,7 +112,7 @@ typedef offset_t batch_id_t;
 
 //
 
-typedef ssize_t ref_count_t;
+typedef ptrdiff_t ref_count_t;
 
 //
 
@@ -209,7 +216,7 @@ typedef struct {
 
 //
 
-typedef ssize_t thread_id_t;
+typedef ptrdiff_t thread_id_t;
 
 /*********************************************************************/
 

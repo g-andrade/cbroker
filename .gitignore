@@ -15,6 +15,9 @@ rebar3.crashdump
 
 # c
 *.o
+*.obj
+/c_src/*.exp
+/c_src/*.lib
 /priv/
 # generated from CFLAGS by c_src/Makefile; holds machine-specific include paths
 /c_src/compile_flags.txt

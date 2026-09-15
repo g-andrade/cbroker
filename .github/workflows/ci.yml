@@ -74,3 +74,45 @@ jobs:
         with:
           path: _build
           key: ${{env.build_cache_prefix_with_hash}}-${{github.run_number}}
+
+  windows:
+    # Builds the NIF with MSVC (c_src/Makefile.win) and runs the tests. The
+    # checks are platform-independent, so they only run in the `ci` job.
+    # OTP 28 and 29 cover both offer size paths (erts_debug:flat_size/1 and
+    # enif_term_size()).
+    name: >
+      Run tests over ${{matrix.otp_vsn}} and ${{matrix.os}}
+    runs-on: ${{matrix.os}}
+    strategy:
+      matrix:
+        otp_vsn: ['28.5', '29.0']
+        os: ['windows-2025']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - id: otp-version-to-rebar3-version
+        name: "Read #{OTP version => rebar3 version} map"
+        uses: juliangruber/read-file-action@v1
+        with:
+          path: ./.github/workflows/otp_version_to_rebar3_version.json
+
+      - id: setup-beam
+        name: Setup BEAM
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{matrix.otp_vsn}}
+          rebar3-version: |
+            ${{ fromJson(steps.otp-version-to-rebar3-version.outputs.content)[matrix.otp_vsn] }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      # Puts cl.exe, link.exe and nmake.exe on PATH for the rebar3 hooks
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Compile
+        run: rebar3 compile
+
+      - name: Run Tests
+        run: rebar3 do eunit, ct
