@@ -115,18 +115,13 @@ jobs:
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
-      # TODO drop once the win32 hook regex in rebar.config is confirmed: this
-      # prints the string rebar3 matches pre_hooks against
-      - name: Show rebar3 arch string
-        run: |
-          erl -noshell -eval 'io:format("arch: ~ts-~ts-~b~n", [erlang:system_info(otp_release), erlang:system_info(system_architecture), 8 * erlang:system_info({wordsize, external})])' -s init stop
-          (Get-Command nmake).Source
-
       - name: Compile
         run: rebar3 compile
 
+      # Guards against the rebar3 hook silently not running, which otherwise
+      # only shows up as a NIF load failure during the tests
       - name: Check that the NIF library got built
-        run: Get-ChildItem priv
+        run: Get-ChildItem priv/cbroker.dll
 
       # Quoted: in PowerShell, the default shell here, `eunit, ct` is an array
       - name: Run Tests
