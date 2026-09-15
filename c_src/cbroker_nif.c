@@ -620,6 +620,10 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     if (match_res == Atoms._await) {
         assert(out.batch != NULL);
         match_res = make_await(env, out.our_tag);
+
+        /* TODO do it as well for non-blocking cancellations
+         * that hit the very same offset
+         */
         ask_await_preemptively_fill_batch_pool(&ctx, &out);
     }
     else if (match_res == Atoms._matched) {
