@@ -1,7 +1,6 @@
 #include "erl_nif.h"
 
 #include <assert.h>
-#include <math.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -446,6 +445,7 @@ static ERL_NIF_TERM raise_tuple2(ErlNifEnv* env, ERL_NIF_TERM reason_type,
 static size_t term_size(ErlNifEnv* env, ERL_NIF_TERM term);
 static inline void consume_timeslice(ErlNifEnv* env, const size_t copied_bytes);
 static ErlNifTime monotonic_ts(void);
+static unsigned ceil_log2(size_t value);
 
 /*********************************************************************/
 
@@ -457,9 +457,9 @@ static struct {
 
 //
 
-static ErlNifFunc nif_funcs[] = {{"new", 0, nif_new},       {"new", 1, nif_new},
-                                 {"do_ask", 4, nif_do_ask}, {"do_ask", 5, nif_do_ask},
-                                 {"cancel", 1, nif_cancel}, {"to_list", 1, nif_to_list}};
+static ErlNifFunc nif_funcs[] = {{"new", 0, nif_new, 0},       {"new", 1, nif_new, 0},
+                                 {"do_ask", 4, nif_do_ask, 0}, {"do_ask", 5, nif_do_ask, 0},
+                                 {"cancel", 1, nif_cancel, 0}, {"to_list", 1, nif_to_list, 0}};
 
 static struct {
     ErlNifResourceType* broker;
@@ -547,7 +547,7 @@ static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     ErlNifSysInfo sys_info;
     enif_system_info(&sys_info, sizeof(sys_info));
-    const size_t nr_of_schedulers = sys_info.scheduler_threads;
+    const size_t nr_of_schedulers = (size_t)sys_info.scheduler_threads;
     assert(nr_of_schedulers > 0);
 
     const size_t broker_size = new_broker_size(nr_of_schedulers);
@@ -562,7 +562,7 @@ static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     broker->nr_of_schedulers = nr_of_schedulers;
     broker->nr_of_cells_per_batch = 32 * nr_of_schedulers;
-    broker->tag_batch_shift = ceil(log2(broker->nr_of_cells_per_batch));
+    broker->tag_batch_shift = ceil_log2(broker->nr_of_cells_per_batch);
     broker->tag_offset_mask = (1ull << broker->tag_batch_shift) - 1;
 
     broker->global_lock = enif_mutex_create("cbroker.global_lock");
@@ -830,7 +830,8 @@ static ERL_NIF_TERM nif_to_list(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
     broker_checkin_many_batches(broker, &leases, nr_of_batches);
     assert(leases == NULL);
 
-    ERL_NIF_TERM batch_terms_list = enif_make_list_from_array(env, batch_terms, nr_of_batches);
+    ERL_NIF_TERM batch_terms_list =
+        enif_make_list_from_array(env, batch_terms, (unsigned)nr_of_batches);
     enif_free(batch_terms);
 
     ERL_NIF_TERM global_state_term = global_state_to_term(env, &broker->global_state);
@@ -908,7 +909,7 @@ static void local_states_init(local_state_t local_states[], const size_t nr_of_s
     cbroker_omap_result_t map_res = CBROKER_OMAP_NOMEM;
     assert(first_batch != NULL);
 
-    for (thread_id_t thread_id = 0; thread_id < nr_of_schedulers; thread_id++) {
+    for (size_t thread_id = 0; thread_id < nr_of_schedulers; thread_id++) {
         local_state_t* local_state = &local_states[thread_id];
         local_state->is_closed = false;
         local_state->batches = cbroker_omap_new();
@@ -929,7 +930,7 @@ static void local_states_init(local_state_t local_states[], const size_t nr_of_s
 
 static void local_states_dirty_close(local_state_t local_states[], const size_t nr_of_schedulers)
 {
-    for (thread_id_t thread_id = 0; thread_id < nr_of_schedulers; thread_id++) {
+    for (size_t thread_id = 0; thread_id < nr_of_schedulers; thread_id++) {
         local_state_t* local_state = &local_states[thread_id];
         local_state->is_closed = true; // dirty write
     }
@@ -943,7 +944,7 @@ static local_state_t* broker_local_state(broker_t* broker)
         return NULL;
     }
 
-    assert(thread_id < broker->nr_of_schedulers);
+    assert((size_t)thread_id < broker->nr_of_schedulers);
     return &broker->local_states[thread_id];
 }
 
@@ -960,8 +961,8 @@ static ERL_NIF_TERM local_states_to_term(ErlNifEnv* env, local_state_t local_sta
 {
     ERL_NIF_TERM* local_state_terms = enif_alloc(nr_of_schedulers * sizeof(ERL_NIF_TERM));
 
-    for (thread_id_t i = 0; i < nr_of_schedulers; i++) {
-        local_state_t* local_state = &local_states[i];
+    for (size_t thread_id = 0; thread_id < nr_of_schedulers; thread_id++) {
+        local_state_t* local_state = &local_states[thread_id];
 
         ERL_NIF_TERM local_state_term = enif_make_list3(
             env,
@@ -973,10 +974,11 @@ static ERL_NIF_TERM local_states_to_term(ErlNifEnv* env, local_state_t local_sta
             //
             enif_make_tuple2(env, Atoms._tag_pool, mempool_to_term(env, &local_state->tag_pool)));
 
-        local_state_terms[i] = local_state_term;
+        local_state_terms[thread_id] = local_state_term;
     }
 
-    ERL_NIF_TERM list = enif_make_list_from_array(env, local_state_terms, nr_of_schedulers);
+    ERL_NIF_TERM list =
+        enif_make_list_from_array(env, local_state_terms, (unsigned)nr_of_schedulers);
     enif_free(local_state_terms);
     return list;
 }
@@ -1095,9 +1097,9 @@ static batch_t* ask_get_next_batch(ask_ctx_t* ctx, const batch_id_t prev_batch_i
             atomic_store_explicit(&next_batch->ref_count, 2, memory_order_relaxed);
         }
         else {
-            size_t ref_count =
+            ref_count_t ref_count =
                 1 + atomic_fetch_add_explicit(&next_batch->ref_count, 1, memory_order_seq_cst);
-            LOG("ASC||| REF COUNT for batch %u: %u", next_batch_id, ref_count);
+            LOG("ASC||| REF COUNT for batch %llu: %ll", next_batch_id, ref_count);
             assert(ref_count >= 1);
         }
 
@@ -1591,7 +1593,7 @@ static void broker_dtor(ErlNifEnv* caller_env, void* obj)
 
     //
 
-    for (thread_id_t thread_id = 0; thread_id < broker->nr_of_schedulers; thread_id++) {
+    for (size_t thread_id = 0; thread_id < broker->nr_of_schedulers; thread_id++) {
         local_state_t* local_state = &broker->local_states[thread_id];
         void* destroy_ctx = global_state;
         cbroker_omap_destroy(local_state->batches, broker_dtor_cb_local_batch, destroy_ctx);
@@ -1900,7 +1902,8 @@ static ERL_NIF_TERM batch_to_term(ErlNifEnv* env, const batch_t* batch)
     const offset_t right_count = atomic_load(&batch->right_count);
     const size_t consumed_count = atomic_load(&batch->consumed_count);
 
-    ERL_NIF_TERM cell_terms_list = enif_make_list_from_array(env, cell_terms, nr_of_cells);
+    ERL_NIF_TERM cell_terms_list =
+        enif_make_list_from_array(env, cell_terms, (unsigned)nr_of_cells);
     enif_free(cell_terms);
 
     return enif_make_list6(
@@ -2306,7 +2309,7 @@ static inline void consume_timeslice(ErlNifEnv* env, const size_t copied_bytes)
     const size_t magic_v2 = 4000;
 
     const size_t msg_copy_reds = copy_size / magic_v1;
-    int percent = MAX(1, MIN(100, (100 * msg_copy_reds) / magic_v2));
+    int percent = (int)MAX(1, MIN(100, (100 * msg_copy_reds) / magic_v2));
 
     if (percent != 0) {
         enif_consume_timeslice(env, percent);
@@ -2314,3 +2317,12 @@ static inline void consume_timeslice(ErlNifEnv* env, const size_t copied_bytes)
 }
 
 static ErlNifTime monotonic_ts() { return enif_monotonic_time(ERL_NIF_USEC); }
+
+static unsigned ceil_log2(size_t value)
+{
+    unsigned shift = 0;
+    while (((size_t)1 << shift) < value) {
+        shift++;
+    }
+    return shift;
+}
