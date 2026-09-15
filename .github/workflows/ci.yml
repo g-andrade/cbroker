@@ -13,6 +13,9 @@ jobs:
     name: >
       Run checks and tests over ${{matrix.otp_vsn}} and ${{matrix.os}}
     runs-on: ${{matrix.os}}
+    # Fail a hung run fast rather than after GitHub's 6-hour default; leaves
+    # room for a cold dialyzer PLT build
+    timeout-minutes: 30
     strategy:
       matrix:
         otp_vsn: ['24.3', '25.3', '26.2', '27.3', '28.5', '29.0']
@@ -83,6 +86,7 @@ jobs:
     name: >
       Run tests over ${{matrix.otp_vsn}} and ${{matrix.os}}
     runs-on: ${{matrix.os}}
+    timeout-minutes: 20
     strategy:
       matrix:
         otp_vsn: ['28.5', '29.0']
