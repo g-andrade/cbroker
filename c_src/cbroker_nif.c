@@ -90,18 +90,22 @@ typedef ssize_t ref_count_t;
 
 typedef struct {
     ErlNifTime enqueue_ts;
-    ERL_NIF_TERM side;
     ErlNifPid pid;
     ErlNifEnv* env;
     ERL_NIF_TERM offer;
     //
-    ErlNifMonitor mon;
-    //_Atomic(ref_count_t) ref_count;
-    //
     ERL_NIF_TERM broker_term;
     batch_id_t batch_id;
     offset_t offset;
+    void* tag;
 } match_t;
+
+//
+
+typedef struct {
+    ErlNifMonitor mon;
+    match_t* match;
+} tag_t;
 
 //
 
@@ -150,6 +154,7 @@ typedef struct {
     batch_t* new_batch; // allocated outside critical section, ready to go
     mempool_t match_pool;
     mempool_t env_pool;
+    mempool_t tag_pool;
 } local_state_t;
 
 //
@@ -232,7 +237,7 @@ static struct {
 
 static struct {
     ErlNifResourceType* broker;
-    ErlNifResourceType* match;
+    ErlNifResourceType* tag;
 } ResourceTypes;
 
 static _Atomic(thread_id_t) next_thread_id = 0;
@@ -391,9 +396,9 @@ static int get_broker_opts(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM* out_
     return -2;
 }
 
-static int get_tag(ErlNifEnv* env, ERL_NIF_TERM term, match_t** out_match)
+static int get_tag(ErlNifEnv* env, ERL_NIF_TERM term, tag_t** out_tag)
 {
-    return enif_get_resource(env, term, ResourceTypes.match, (void**)out_match);
+    return enif_get_resource(env, term, ResourceTypes.tag, (void**)out_tag);
 }
 
 // static int get_tag(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM* out_broker_term,
@@ -535,7 +540,7 @@ static void env_pool_init(mempool_t* pool)
 
 static void* match_pool_cb_alloc()
 {
-    match_t* match = enif_alloc_resource(ResourceTypes.match, sizeof(match_t));
+    match_t* match = enif_alloc(sizeof(match_t));
     memset(match, 0, sizeof(match_t));
     return match;
 }
@@ -546,7 +551,7 @@ static void match_pool_cb_clear(void* obj)
     memset(match, 0, sizeof(match_t));
 }
 
-static void match_pool_cb_free(void* obj) { enif_release_resource(obj); }
+static void match_pool_cb_free(void* obj) { enif_free(obj); }
 
 static void match_pool_init(mempool_t* pool)
 {
@@ -554,6 +559,32 @@ static void match_pool_init(mempool_t* pool)
     pool->alloc_cb = match_pool_cb_alloc;
     pool->clear_cb = match_pool_cb_clear;
     pool->free_cb = match_pool_cb_free;
+    mempool_init(pool);
+}
+
+/*********************************************************************/
+
+static void* tag_pool_cb_alloc()
+{
+    tag_t* tag = enif_alloc_resource(ResourceTypes.tag, sizeof(tag_t));
+    memset(tag, 0, sizeof(tag_t));
+    return tag;
+}
+
+static void tag_pool_cb_clear(void* obj)
+{
+    tag_t* tag = (tag_t*)obj;
+    memset(tag, 0, sizeof(tag_t));
+}
+
+static void tag_pool_cb_free(void* obj) { enif_release_resource(obj); }
+
+static void tag_pool_init(mempool_t* pool)
+{
+    memset(pool, 0, sizeof(mempool_t));
+    pool->alloc_cb = tag_pool_cb_alloc;
+    pool->clear_cb = tag_pool_cb_clear;
+    pool->free_cb = tag_pool_cb_free;
     mempool_init(pool);
 }
 
@@ -910,6 +941,7 @@ static void local_states_init(local_state_t local_states[], const size_t nr_of_s
 
         ensure_new_batch(&local_state->new_batch, first_batch->nr_of_cells, NULL);
         match_pool_init(&local_state->match_pool);
+        tag_pool_init(&local_state->tag_pool);
         env_pool_init(&local_state->env_pool);
     }
 }
@@ -1005,14 +1037,9 @@ static match_t* match_new(ask_ctx_t* ctx, batch_id_t batch_id, offset_t offset)
     assert(match != NULL);
 
     match->enqueue_ts = ctx->enqueue_ts;
-    match->side = ctx->side;
     match->pid = ctx->self;
     match->env = mempool_get(ctx, &local_state->env_pool);
     // TODO increment copied bytes?
-
-    LOG("[%T] [match_new] Creating monitor", ctx->self_term);
-    int mon_res = enif_monitor_process(ctx->env, match, &match->pid, &match->mon);
-    assert(mon_res == 0);
 
     LOG("[%T] [match_new] Copying offer", ctx->self_term);
     match->offer = enif_make_copy(match->env, ctx->offer);
@@ -1023,6 +1050,15 @@ static match_t* match_new(ask_ctx_t* ctx, batch_id_t batch_id, offset_t offset)
 
     match->batch_id = batch_id;
     match->offset = offset;
+
+    tag_t* tag = mempool_get(ctx, &local_state->tag_pool);
+    assert(tag != NULL);
+    tag->match = match;
+    match->tag = tag;
+
+    LOG("[%T] [match_new] Creating monitor", ctx->self_term);
+    int mon_res = enif_monitor_process(ctx->env, tag, &match->pid, &tag->mon);
+    assert(mon_res == 0);
 
     return match;
 }
@@ -1055,8 +1091,8 @@ static void notify_other_of_match_v1(ask_ctx_t* ctx, match_t** our_match_ptr,
     ERL_NIF_TERM match_ref_copy = enif_make_copy(msg_env, match_ref);
     ERL_NIF_TERM msg_content =
         make_match(msg_env, match_ref_copy, our_match->offer, opposite_match->enqueue_ts);
-    ERL_NIF_TERM tag = enif_make_resource(msg_env, opposite_match);
-    ERL_NIF_TERM msg = enif_make_tuple2(msg_env, tag, msg_content);
+    ERL_NIF_TERM tag_term = enif_make_resource(msg_env, opposite_match->tag);
+    ERL_NIF_TERM msg = enif_make_tuple2(msg_env, tag_term, msg_content);
 
     // ctx->copied_bytes += enif_term_size(ctx->broker_term);
     // ctx->copied_bytes += enif_term_size(match_ref);
@@ -1065,11 +1101,28 @@ static void notify_other_of_match_v1(ask_ctx_t* ctx, match_t** our_match_ptr,
 
     //
 
-    int demonitor_res = enif_demonitor_process(ctx->env, our_match, &our_match->mon);
+    tag_t* our_tag = (tag_t*)our_match->tag;
+    assert(our_tag != NULL);
+    assert(our_tag->match == our_match);
+
+    int demonitor_res = enif_demonitor_process(ctx->env, our_tag, &our_tag->mon);
     assert(demonitor_res == 0);
+
+    our_match->tag = NULL;
+    our_tag->match = NULL;
 
     mempool_return(&ctx->local_state->env_pool, our_match->env);
     our_match->env = NULL;
+
+    our_match->tag = NULL;
+    if (ctx->is_async) {
+        // We're going to use the tag
+        enif_release_resource(our_tag);
+    }
+    else {
+        mempool_return(&ctx->local_state->tag_pool, our_tag);
+    }
+
     mempool_return(&ctx->local_state->match_pool, our_match);
     *our_match_ptr = NULL;
 }
@@ -1077,10 +1130,12 @@ static void notify_other_of_match_v1(ask_ctx_t* ctx, match_t** our_match_ptr,
 static void notify_other_of_match_v2(ask_ctx_t* ctx, match_t* opposite_match,
                                      ERL_NIF_TERM match_ref)
 {
+    assert(opposite_match->tag != NULL);
+
     ErlNifEnv* env = ctx->env;
 
     ERL_NIF_TERM msg_content = make_match(env, match_ref, ctx->offer, opposite_match->enqueue_ts);
-    ERL_NIF_TERM tag = enif_make_resource(env, opposite_match);
+    ERL_NIF_TERM tag = enif_make_resource(env, opposite_match->tag);
     ERL_NIF_TERM msg = enif_make_tuple2(env, tag, msg_content);
 
     notify_if_alive(ctx->env, &opposite_match->pid, NULL, msg);
@@ -1102,7 +1157,9 @@ static void notify_self_of_match(ask_ctx_t* ctx, ERL_NIF_TERM our_tag, match_t* 
 
 static void notify_of_cancellation(ErlNifEnv* env, match_t* match, bool did_broker_close)
 {
-    ERL_NIF_TERM tag = enif_make_resource(env, match);
+    assert(match->tag != NULL);
+
+    ERL_NIF_TERM tag = enif_make_resource(env, match->tag);
     int64_t sojourn_time = monotonic_ts() - match->enqueue_ts;
     ERL_NIF_TERM cancelled = make_cancelled(env, did_broker_close, sojourn_time);
     ERL_NIF_TERM msg = enif_make_tuple2(env, tag, cancelled);
@@ -1133,18 +1190,19 @@ static void batch_cancel_all(ErlNifEnv* env, local_state_t* local_state, batch_t
         }
         else if (atomic_compare_exchange_strong(&cell->match, &match, &sentinel_match_cancelled)) {
             if (match != NULL) {
-                if (enif_demonitor_process(env, match, &match->mon) == 0) {
-                    notify_of_cancellation(env, match, true);
+                tag_t* tag = (tag_t*)match->tag;
+                assert(tag != NULL);
 
-                    if (local_state == NULL) {
-                        enif_free_env(match->env);
-                    }
-                    else {
-                        mempool_return(&local_state->env_pool, match->env);
-                    }
+                if (enif_demonitor_process(env, tag, &tag->mon) == 0) {
+                    notify_of_cancellation(env, match, true);
+                    tag->match = NULL;
+
+                    enif_free_env(match->env);
                     match->env = NULL;
+                    match->tag = NULL;
+                    enif_free(match);
                 }
-                enif_release_resource(match);
+                enif_release_resource(tag);
             }
         }
         else {
@@ -1176,7 +1234,7 @@ static match_t* batch_offset_ask_ensure_our_match(ask_ctx_t* ctx, const batch_id
 
     if (our_match == NULL) {
         out->our_match = match_new(ctx, batch_id, offset);
-        out->our_tag = enif_make_resource(ctx->env, out->our_match);
+        out->our_tag = enif_make_resource(ctx->env, out->our_match->tag);
     }
     else {
         LOG("[%T] Reusing already allocated match", ctx->self_term);
@@ -1241,13 +1299,16 @@ static ERL_NIF_TERM batch_offset_ask(ask_ctx_t* ctx, batch_t* batch, offset_t of
 
     if (atomic_compare_exchange_strong(match_ptr, &match, &sentinel_match_success)) {
         LOG("[%T] Exchanging succeeded", ctx->self_term);
-        if (enif_demonitor_process(ctx->env, match, &match->mon) == 0) {
+        tag_t* tag = (tag_t*)match->tag;
+        assert(tag != NULL);
+
+        if (enif_demonitor_process(ctx->env, tag, &tag->mon) == 0) {
             out->opposite_match = match;
             out->consume_slot = true;
             return Atoms._match;
         }
         else {
-            enif_release_resource(match);
+            enif_release_resource(tag);
             return Atoms._cancelled;
         }
     }
@@ -1490,6 +1551,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     ensure_new_batch(&ctx.local_state->new_batch, ctx.broker->nr_of_cells_per_batch, &ctx);
     ensure_one_entry_in_pool(&ctx.local_state->match_pool);
     ensure_one_entry_in_pool(&ctx.local_state->env_pool);
+    ensure_one_entry_in_pool(&ctx.local_state->tag_pool);
 
     ask_out_t out;
     memset(&out, 0, sizeof(ask_out_t));
@@ -1501,6 +1563,12 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     if (match_res == Atoms._await) {
         assert(out.batch != NULL);
         match_res = make_await(env, out.our_tag);
+
+        // TODO review
+        ensure_one_entry_in_pool(&ctx.local_state->match_pool);
+        ensure_one_entry_in_pool(&ctx.local_state->env_pool);
+        ensure_one_entry_in_pool(&ctx.local_state->tag_pool);
+
         // batch_preemptively_ensure_next(ctx.broker, ctx.local_state, out.batch, out.offset);
     }
     else if (match_res == Atoms._match) {
@@ -1545,7 +1613,16 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
         mempool_return(&ctx.local_state->env_pool, opposite_match->env);
         opposite_match->env = NULL;
-        enif_release_resource(opposite_match);
+
+        tag_t* opposite_tag = (tag_t*)opposite_match->tag;
+        assert(opposite_tag != NULL);
+        assert(opposite_tag->match == opposite_match);
+
+        opposite_match->tag = NULL;
+        opposite_tag->match = NULL;
+        mempool_return(&ctx.local_state->match_pool, opposite_match);
+
+        enif_release_resource(opposite_tag);
         opposite_match = NULL;
         out.opposite_match = NULL;
     }
@@ -1557,11 +1634,18 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
         if (out.our_match != NULL) {
             match_t* our_match = out.our_match;
-            int demonitor_res = enif_demonitor_process(env, our_match, &our_match->mon);
+            tag_t* our_tag = our_match->tag;
+            assert(our_tag != NULL);
+
+            int demonitor_res = enif_demonitor_process(env, our_tag, &our_tag->mon);
             assert(demonitor_res == 0);
 
             mempool_return(&ctx.local_state->env_pool, our_match->env);
             our_match->env = NULL;
+
+            mempool_return(&ctx.local_state->tag_pool, our_match->tag);
+            our_match->tag = NULL;
+
             mempool_return(&ctx.local_state->match_pool, our_match);
             our_match = NULL;
             out.our_match = NULL;
@@ -1587,22 +1671,26 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     ErlNifPid self;
-    match_t* match = NULL;
+    tag_t* tag = NULL;
 
     if (!enif_self(env, &self)) {
         return enif_make_badarg(env);
     }
 
-    ERL_NIF_TERM tag = argv[0];
+    ERL_NIF_TERM tag_term = argv[0];
 
-    if (!get_tag(env, tag, &match)) {
-        return make_badarg(env, tag);
+    if (!get_tag(env, tag_term, &tag)) {
+        return make_badarg(env, tag_term);
     }
 
-    if (enif_demonitor_process(env, match, &match->mon) != 0) {
+    if (enif_demonitor_process(env, tag, &tag->mon) != 0) {
         // too late
         return Atoms._too_late;
     }
+
+    match_t* match = tag->match;
+    assert(match != NULL);
+    assert(match->tag == tag);
 
     broker_t* broker = NULL;
     int get_broker_res = get_broker(match->env, match->broker_term, &broker);
@@ -1641,7 +1729,12 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
 
         mempool_return(&local_state->env_pool, match->env);
         match->env = NULL;
-        enif_release_resource(match);
+
+        tag->match = NULL;
+        enif_release_resource(tag);
+
+        match->tag = NULL;
+        mempool_return(&local_state->match_pool, match);
 
         res = make_cancelled(env, false, sojourn_time);
     }
@@ -1767,6 +1860,7 @@ static void broker_dtor(ErlNifEnv* caller_env, void* obj)
 
         mempool_destroy(&local_state->match_pool);
         mempool_destroy(&local_state->env_pool);
+        mempool_destroy(&local_state->tag_pool);
     }
 
     //
@@ -1808,22 +1902,37 @@ static void broker_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNif
 
 /*********************************************************************/
 
-static void match_dtor(ErlNifEnv* caller_env, void* obj)
+static void tag_dtor(ErlNifEnv* caller_env, void* obj)
 {
-    match_t* match = (match_t*)obj;
+    tag_t* tag = (tag_t*)obj;
+    match_t* match = tag->match;
 
-    if (match->env != NULL) {
-        enif_free_env(match->env);
+    if (match != NULL) {
+        ErlNifEnv* env = match->env;
+
+        if (env != NULL) {
+            enif_free_env(env);
+            match->env = NULL;
+        }
+
+        memset(match, 0, sizeof(match_t));
+        enif_free(match);
+        tag->match = NULL;
     }
 
-    memset(match, 0, sizeof(match_t));
+    memset(tag, 0, sizeof(tag_t));
 }
 
-static void match_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon)
+static void tag_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon)
 {
     ERL_NIF_TERM pid_term = enif_make_pid(caller_env, pid);
 
-    match_t* match = (match_t*)obj;
+    tag_t* tag = (tag_t*)obj;
+
+    match_t* match = tag->match;
+    assert(match != NULL);
+    assert(match->tag == tag);
+
     LOG_UNCOND("[match DOWN %T] batch %llu, offset %llu", pid_term, match->batch_id, match->offset);
 
     broker_t* broker = NULL;
@@ -1848,14 +1957,20 @@ static void match_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifM
             LOG("[match DOWN %T] match cancelled", pid_term, match->batch_id);
 
             if (local_state == NULL) {
-                enif_free(match->env);
+                enif_free_env(match->env);
                 match->env = NULL;
+
+                enif_free(match);
+                tag->match = NULL;
             }
             else {
                 mempool_return(&local_state->env_pool, match->env);
                 match->env = NULL;
+
+                mempool_return(&local_state->match_pool, match);
+                tag->match = NULL;
             }
-            enif_release_resource(match);
+            enif_release_resource(tag);
 
             handle_consume_slot(&handle);
         }
@@ -1890,14 +2005,14 @@ static void broker_resource_load(ErlNifEnv* caller_env)
     assert(ResourceTypes.broker != NULL);
 }
 
-static void match_resource_load(ErlNifEnv* caller_env)
+static void tag_resource_load(ErlNifEnv* caller_env)
 {
-    ErlNifResourceTypeInit callbacks = {match_dtor, NULL, match_down, 3, NULL};
+    ErlNifResourceTypeInit callbacks = {tag_dtor, NULL, tag_down, 3, NULL};
     ErlNifResourceFlags flags = ERL_NIF_RT_CREATE;
 
-    ResourceTypes.match =
-        enif_init_resource_type(caller_env, "cbroker.match", &callbacks, flags, &flags);
-    assert(ResourceTypes.match != NULL);
+    ResourceTypes.tag =
+        enif_init_resource_type(caller_env, "cbroker.tag", &callbacks, flags, &flags);
+    assert(ResourceTypes.tag != NULL);
 }
 
 static int on_load(ErlNifEnv* caller_env, void** priv_data, ERL_NIF_TERM load_info)
@@ -1906,7 +2021,7 @@ static int on_load(ErlNifEnv* caller_env, void** priv_data, ERL_NIF_TERM load_in
 
     memset(&ResourceTypes, 0, sizeof(ResourceTypes));
     broker_resource_load(caller_env);
-    match_resource_load(caller_env);
+    tag_resource_load(caller_env);
 
     return 0;
 }
