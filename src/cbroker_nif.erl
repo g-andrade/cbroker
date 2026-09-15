@@ -58,8 +58,9 @@ new() ->
 new(_Opts) ->
     not_loaded(?LINE).
 
-ask(_Broker, _Side, _Value) ->
-    not_loaded(?LINE).
+ask(Broker, Side, Value) ->
+    SizeArg = size_args(Value),
+    do_ask(Broker, Side, Value, SizeArg).
 
 -spec ask(Broker, Side, Value, AskType) ->
     {await, Tag}
@@ -73,8 +74,9 @@ when
     Value :: term(),
     AskType :: ask_type(),
     Tag :: tag().
-ask(_Broker, _Side, _Value, _WithStats) ->
-    not_loaded(?LINE).
+ask(Broker, Side, Value, AskType) ->
+    SizeArg = erts_debug:size(Value),
+    do_ask(Broker, Side, Value, SizeArg, AskType).
 
 -spec cancel(Tag) -> cancelled | too_late when
     Tag :: tag().
@@ -100,6 +102,20 @@ init() ->
                 filename:join(Dir, ?LIBNAME)
         end,
     erlang:load_nif(SoName, 0).
+
+-if(?OTP_RELEASE < 29).
+size_args(Value) ->
+    erts_debug:flat_size(Value).
+-else.
+size_args(_Value) ->
+    compute_from_nif.
+-endif.
+
+do_ask(_Broker, _Side, _Value, _SizeArg) ->
+    not_loaded(?LINE).
+
+do_ask(_Broker, _Side, _Value, _SizeArg, _AskType) ->
+    not_loaded(?LINE).
 
 not_loaded(Line) ->
     erlang:nif_error({not_loaded, [{module, ?MODULE}, {line, Line}]}).

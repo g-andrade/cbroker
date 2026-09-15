@@ -39,6 +39,7 @@
     X(_cancelled_nb,          "cancelled_nb") \
     X(_cells,                 "cells") \
     X(_closed,                "closed") \
+    X(_compute_from_nif,      "compute_from_nif") \
     X(_consumed_count,        "consumed_count") \
     X(_creator,               "creator") \
     X(_depends_on_creator,    "depends_on_creator") \
@@ -92,6 +93,8 @@
         fflush(stderr);                                                                            \
     } while (0)
 
+#define USES_FLAT_SIZE (ERL_NIF_MAJOR_VERSION == 2 && ERL_NIF_MINOR_VERSION < 18)
+
 /*********************************************************************/
 
 //
@@ -111,6 +114,7 @@ typedef struct {
     ErlNifPid pid;
     ErlNifEnv* env;
     ERL_NIF_TERM offer;
+    size_t offer_size;
     //
     ERL_NIF_TERM broker_term;
     batch_id_t batch_id;
@@ -227,6 +231,7 @@ typedef struct {
     ERL_NIF_TERM broker_term;
     ERL_NIF_TERM side;
     ERL_NIF_TERM offer;
+    size_t offer_size;
     //
     broker_t* broker;
     bool is_left;
@@ -258,7 +263,7 @@ static void tag_resource_load(ErlNifEnv* caller_env);
 //
 
 static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
-static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM nif_do_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM nif_to_list(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
@@ -407,6 +412,12 @@ static int get_broker(ErlNifEnv* env, ERL_NIF_TERM term, broker_t** out_broker);
 static int get_broker_opts(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM* out_bad_opt,
                            broker_opts_t* out_opts);
 
+static int get_offer_size(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM offer, size_t* out_size);
+
+#if USES_FLAT_SIZE
+static int get_size_t(ErlNifEnv* env, ERL_NIF_TERM term, size_t* out);
+#endif
+
 static int get_tag(ErlNifEnv* env, ERL_NIF_TERM term, tag_t** out_tag);
 
 //
@@ -425,6 +436,7 @@ static ERL_NIF_TERM raise_tuple2(ErlNifEnv* env, ERL_NIF_TERM reason_type,
 
 //
 
+static size_t term_size(ErlNifEnv* env, ERL_NIF_TERM term);
 static inline void consume_timeslice(ErlNifEnv* env, const size_t copied_bytes);
 static ErlNifTime monotonic_ts(void);
 
@@ -439,7 +451,7 @@ static struct {
 //
 
 static ErlNifFunc nif_funcs[] = {{"new", 0, nif_new},       {"new", 1, nif_new},
-                                 {"ask", 3, nif_ask},       {"ask", 4, nif_ask},
+                                 {"do_ask", 4, nif_do_ask}, {"do_ask", 5, nif_do_ask},
                                  {"cancel", 1, nif_cancel}, {"to_list", 1, nif_to_list}};
 
 static struct {
@@ -557,7 +569,7 @@ static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
 //
 
-static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+static ERL_NIF_TERM nif_do_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     ask_ctx_t ctx;
     memset(&ctx, 0, sizeof(ask_ctx_t));
@@ -574,7 +586,13 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     ctx.broker_term = argv[0];
     ctx.side = argv[1];
     ctx.offer = argv[2];
-    ERL_NIF_TERM ask_type = (argc >= 4 ? argv[3] : Atoms._regular);
+
+    if (!get_offer_size(env, argv[3], ctx.offer, &ctx.offer_size)) {
+        return make_badarg(env, argv[3]);
+    }
+    // LOG_UNCOND("Offer size: %llu", ctx.offer_size);
+
+    ERL_NIF_TERM ask_type = (argc >= 5 ? argv[4] : Atoms._regular);
 
     if (!get_broker(env, ctx.broker_term, &ctx.broker)) {
         return make_badarg(env, ctx.broker_term);
@@ -659,7 +677,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         }
         else {
             ERL_NIF_TERM opposite_offer = enif_make_copy(env, opposite_match->offer);
-            ctx.copied_bytes += enif_term_size(opposite_offer);
+            ctx.copied_bytes += opposite_match->offer_size;
             match_res = make_match(env, match_ref, opposite_offer, ctx.enqueue_ts);
         }
 
@@ -1236,10 +1254,11 @@ static match_t* ask_prepare_our_match(ask_ctx_t* ctx, batch_id_t batch_id, offse
 
     LOG("[%T] [ask_prepare_our_match] Copying offer", ctx->self_term);
     match->offer = enif_make_copy(match->env, ctx->offer);
-    ctx->copied_bytes += enif_term_size(ctx->offer);
+    match->offer_size = ctx->offer_size;
+    ctx->copied_bytes += ctx->offer_size;
 
     match->broker_term = enif_make_copy(match->env, ctx->broker_term);
-    ctx->copied_bytes += enif_term_size(ctx->broker_term);
+    ctx->copied_bytes += term_size(ctx->env, ctx->broker_term);
 
     match->batch_id = batch_id;
     match->offset = offset;
@@ -1751,7 +1770,7 @@ static void notify_other_of_match_v1(ask_ctx_t* ctx, match_t** our_match_ptr,
     ERL_NIF_TERM tag_term = enif_make_resource(msg_env, opposite_match->tag);
     ERL_NIF_TERM msg = enif_make_tuple2(msg_env, tag_term, msg_content);
 
-    ctx->copied_bytes += (enif_term_size(match_ref) + 5 + 3);
+    ctx->copied_bytes += (term_size(ctx->env, match_ref) + ((5 + 3) * sizeof(ERL_NIF_TERM)));
 
     either_notify_or_assert_not_alive(ctx->env, &opposite_match->pid, msg_env, msg);
 }
@@ -1767,7 +1786,6 @@ static void notify_other_of_match_v2(ask_ctx_t* ctx, match_t* opposite_match,
     ERL_NIF_TERM tag = enif_make_resource(env, opposite_match->tag);
     ERL_NIF_TERM msg = enif_make_tuple2(env, tag, msg_content);
 
-    ctx->copied_bytes += enif_term_size(msg);
     either_notify_or_assert_not_alive(ctx->env, &opposite_match->pid, NULL, msg);
 }
 
@@ -1780,7 +1798,6 @@ static void notify_self_of_match(ask_ctx_t* ctx, ERL_NIF_TERM our_tag, match_t* 
     ERL_NIF_TERM msg_content = make_match(env, match_ref, offer_copy, ctx->enqueue_ts);
     ERL_NIF_TERM msg = enif_make_tuple2(env, our_tag, msg_content);
 
-    ctx->copied_bytes += enif_term_size(msg);
     either_notify_or_assert_not_alive(ctx->env, &ctx->self, NULL, msg);
 }
 
@@ -2158,6 +2175,49 @@ static int get_broker_opts(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM* out_
     return -2;
 }
 
+//
+
+static int get_offer_size(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM offer, size_t* out_size)
+{
+#if USES_FLAT_SIZE
+    size_t size_in_words = 0;
+
+    if (get_size_t(env, term, &size_in_words)) {
+        *out_size = size_in_words << 3;
+        return 1;
+    }
+#else
+    if (term == Atoms._compute_from_nif) {
+        *out_size = enif_term_size(term);
+        return 1;
+    }
+#endif
+
+    return 0;
+}
+
+//
+
+#if USES_FLAT_SIZE
+static int get_size_t(ErlNifEnv* env, ERL_NIF_TERM term, size_t* out)
+{
+    ErlNifUInt64 value;
+
+    if (!enif_get_uint64(env, term, &value)) {
+        return 0;
+    }
+#if SIZE_MAX < UINT64_MAX
+    if (value > SIZE_MAX) {
+        return 0;
+    }
+#endif
+    *out = (size_t)value;
+    return 1;
+}
+#endif
+
+//
+
 static int get_tag(ErlNifEnv* env, ERL_NIF_TERM term, tag_t** out_tag)
 {
     return enif_get_resource(env, term, ResourceTypes.tag, (void**)out_tag);
@@ -2207,6 +2267,22 @@ static ERL_NIF_TERM raise_tuple2(ErlNifEnv* env, ERL_NIF_TERM reason_type,
 }
 
 /*********************************************************************/
+
+static size_t term_size(ErlNifEnv* env, ERL_NIF_TERM term)
+{
+#if USES_FLAT_SIZE
+    if (enif_is_ref(env, term)) {
+        return 7 * sizeof(ERL_NIF_TERM);
+    }
+    else {
+        return 0;
+    }
+#else
+    return enif_term_size(term);
+#endif
+}
+
+//
 
 static inline void consume_timeslice(ErlNifEnv* env, const size_t copied_bytes)
 {
