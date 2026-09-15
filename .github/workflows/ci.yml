@@ -114,5 +114,6 @@ jobs:
       - name: Compile
         run: rebar3 compile
 
+      # Quoted: in PowerShell, the default shell here, `eunit, ct` is an array
       - name: Run Tests
-        run: rebar3 do eunit, ct
+        run: rebar3 do 'eunit,ct'
