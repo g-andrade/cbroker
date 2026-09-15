@@ -242,7 +242,8 @@ typedef struct {
     batch_t* batch;
     offset_t offset;
     bool consume_slot;
-    match_t* our_match; // optional, reuse if we allocated it but ended up 2nd
+    // optional, reuse to send match if we allocated it but ended up in 2nd place
+    match_t* our_match;
     ERL_NIF_TERM our_tag;
     match_t* opposite_match;
 } ask_out_t;
