@@ -11,6 +11,18 @@
 
 /*********************************************************************/
 
+#define BATCH_POOL_INITIAL_COUNT 1
+#define BATCH_POOL_SIZE 4
+
+#define MATCH_POOLS_INITIAL_COUNT 8
+#define MATCH_POOLS_SIZE 8
+
+#define ENV_POOLS_INITIAL_COUNT 8
+#define ENV_POOLS_SIZE 8
+
+#define TAG_POOLS_INITIAL_COUNT 8
+#define TAG_POOLS_SIZE 8
+
 /* The columns below are aligned on purpose. */
 /* clang-format off */
 #define ATOM_LIST \
@@ -19,26 +31,31 @@
     X(_badarg,                "badarg") \
     X(_badopt,                "badopt") \
     X(_badopts,               "badopts") \
-    X(_batches,               "batches") \
     X(_batch_consumed,        "batch_consumed") \
     X(_batch_full,            "batch_full")  \
+    X(_batch_pool,            "batch_pool")  \
+    X(_batches,               "batches") \
     X(_cancelled,             "cancelled") \
     X(_cancelled_nb,          "cancelled_nb") \
     X(_cells,                 "cells") \
     X(_closed,                "closed") \
-    X(_creator,               "creator") \
     X(_consumed_count,        "consumed_count") \
+    X(_creator,               "creator") \
     X(_depends_on_creator,    "depends_on_creator") \
     X(_empty,                 "empty") \
+    X(_env_pool,              "env_pool") \
     X(_false,                 "false") \
+    X(_global_state,          "global_state") \
     X(_id,                    "id") \
     X(_left,                  "left")  \
     X(_left_count,            "left_count")  \
+    X(_local_states,          "local_states")  \
     X(_match,                 "match") \
+    X(_match_pool,            "match_pool") \
     X(_matched,               "matched") \
+    X(_nb,                    "nb") \
     X(_nr_of_cells_per_batch, "nr_of_cells_per_batch") \
     X(_nr_of_schedulers,      "nr_of_schedulers") \
-    X(_nb,                    "nb") \
     X(_ref_count,             "ref_count") \
     X(_regular,               "regular") \
     X(_retry,                 "retry") \
@@ -47,6 +64,7 @@
     X(_stopped,               "stopped") \
     X(_tag_batch_shift,       "tag_batch_shift") \
     X(_tag_offset_mask,       "tag_offset_mask") \
+    X(_tag_pool,              "tag_pool") \
     X(_too_late,              "too_late") \
     X(_true,                  "true") \
     X(_waiting,               "waiting") \
@@ -126,20 +144,27 @@ typedef struct {
 //
 
 typedef struct {
-    atomic_bool is_closed;
-    cbroker_omap_t* batches;
-} global_state_t;
+    void** array;
+    size_t count;
+    size_t size;
+    void* (*alloc_cb)(void*);
+    void (*clear_cb)(void*);
+    void (*free_cb)(void*);
+} mempool_t;
 
 //
 
 typedef struct {
-    void** array;
-    size_t count;
-    size_t size;
-    void* (*alloc_cb)();
-    void (*clear_cb)(void*);
-    void (*free_cb)(void*);
-} mempool_t;
+    size_t nr_of_cells;
+} batch_pool_alloc_ctx_t;
+
+//
+
+typedef struct {
+    atomic_bool is_closed;
+    cbroker_omap_t* batches;
+    mempool_t batch_pool;
+} global_state_t;
 
 //
 
@@ -149,7 +174,6 @@ typedef struct {
     batch_id_t left_id;
     batch_id_t right_id;
     //
-    batch_t* new_batch; // allocated outside critical section, ready to go
     mempool_t match_pool;
     mempool_t env_pool;
     mempool_t tag_pool;
@@ -242,6 +266,7 @@ static ERL_NIF_TERM nif_to_list(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
 static size_t new_broker_size(const size_t nr_of_schedulers);
 static batch_t* global_state_init(global_state_t* global_state, const size_t nr_of_cells_per_batch);
 static void global_state_close(global_state_t* global_state);
+static ERL_NIF_TERM global_state_to_term(ErlNifEnv* env, global_state_t* global_state);
 
 //
 
@@ -254,7 +279,8 @@ static local_state_t* broker_local_state(broker_t* broker);
 
 static batch_t* local_state_get_batch(local_state_t* local_state, const batch_id_t batch_id);
 
-static void local_state_release_batch(local_state_t* local_state, batch_t** batch_ptr);
+static ERL_NIF_TERM local_states_to_term(ErlNifEnv* env, local_state_t local_states[],
+                                         const size_t nr_of_schedulers);
 
 static thread_id_t get_or_assign_thread_id(const size_t nr_of_schedulers);
 
@@ -270,6 +296,8 @@ static match_t* ask_ensure_our_match(ask_ctx_t* ctx, const batch_id_t batch_id,
                                      const offset_t offset, ask_out_t* out);
 
 static match_t* ask_prepare_our_match(ask_ctx_t* ctx, batch_id_t batch_id, offset_t offset);
+
+static void ask_await_preemptively_fill_batch_pool(ask_ctx_t* ctx, ask_out_t* out);
 
 //
 
@@ -334,36 +362,42 @@ static void either_notify_or_assert_not_alive(ErlNifEnv* caller_env, ErlNifPid* 
 
 static size_t batch_size(const size_t nr_of_cells);
 static batch_t* batch_new(const batch_id_t id, const size_t nr_of_cells);
-static void batch_init(batch_t* batch, const batch_id_t id, const size_t nr_of_cells);
+static void batch_init(batch_t* batch, const batch_id_t id);
 static void batch_ref_count_inc(batch_t* batch);
 static ERL_NIF_TERM batch_to_term(ErlNifEnv* env, const batch_t* batch);
 
 //
 
-static void ensure_new_batch(batch_t** ptr, const size_t nr_of_cells_per_batch, ask_ctx_t* ask_ctx);
-static void ensure_one_entry_in_pool(mempool_t* pool);
+static void ensure_one_entry_in_pool(mempool_t* pool, void* alloc_ctx);
+
+static void batch_pool_init(mempool_t* pool, size_t nr_of_cells);
+static batch_t* batch_pool_get(mempool_t* pool, size_t nr_of_cells);
+static void* batch_pool_cb_alloc(void*);
+static void batch_pool_cb_clear(void* obj);
+static void batch_pool_cb_free(void* obj);
 
 static void match_pool_init(mempool_t* pool);
-static void* match_pool_cb_alloc(void);
+static void* match_pool_cb_alloc(void*);
 static void match_pool_cb_clear(void* obj);
 static void match_pool_cb_free(void* obj);
 
 static void tag_pool_init(mempool_t* pool);
-static void* tag_pool_cb_alloc(void);
+static void* tag_pool_cb_alloc(void*);
 static void tag_pool_cb_clear(void* obj);
 static void tag_pool_cb_free(void* obj);
 
 static void env_pool_init(mempool_t* pool);
-static void* env_pool_cb_alloc(void);
+static void* env_pool_cb_alloc(void*);
 static void env_pool_cb_clear(void* obj);
 static void env_pool_cb_free(void* obj);
 
 //
 
-static void mempool_init(mempool_t* pool);
-static void* mempool_get(mempool_t* pool);
+static void mempool_init(mempool_t* pool, size_t initial_count, size_t size, void* alloc_ctx);
+static void* mempool_get(mempool_t* pool, void* alloc_ctx);
 static void mempool_return(mempool_t* pool, void* obj);
 static void mempool_destroy(mempool_t* pool);
+static ERL_NIF_TERM mempool_to_term(ErlNifEnv* env, mempool_t* pool);
 
 //
 
@@ -572,10 +606,9 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         return Atoms._closed;
     }
 
-    ensure_new_batch(&ctx.local_state->new_batch, ctx.broker->nr_of_cells_per_batch, &ctx);
-    ensure_one_entry_in_pool(&ctx.local_state->match_pool);
-    ensure_one_entry_in_pool(&ctx.local_state->env_pool);
-    ensure_one_entry_in_pool(&ctx.local_state->tag_pool);
+    ensure_one_entry_in_pool(&ctx.local_state->match_pool, NULL);
+    ensure_one_entry_in_pool(&ctx.local_state->env_pool, NULL);
+    ensure_one_entry_in_pool(&ctx.local_state->tag_pool, NULL);
 
     ask_out_t out;
     memset(&out, 0, sizeof(ask_out_t));
@@ -587,13 +620,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     if (match_res == Atoms._await) {
         assert(out.batch != NULL);
         match_res = make_await(env, out.our_tag);
-
-        // TODO review
-        ensure_one_entry_in_pool(&ctx.local_state->match_pool);
-        ensure_one_entry_in_pool(&ctx.local_state->env_pool);
-        ensure_one_entry_in_pool(&ctx.local_state->tag_pool);
-
-        // batch_preemptively_ensure_next(ctx.broker, ctx.local_state, out.batch, out.offset);
+        ask_await_preemptively_fill_batch_pool(&ctx, &out);
     }
     else if (match_res == Atoms._matched) {
         match_t* our_match = out.our_match;
@@ -776,7 +803,12 @@ static ERL_NIF_TERM nif_to_list(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
     ERL_NIF_TERM batch_terms_list = enif_make_list_from_array(env, batch_terms, nr_of_batches);
     enif_free(batch_terms);
 
-    return enif_make_list6(
+    ERL_NIF_TERM global_state_term = global_state_to_term(env, &broker->global_state);
+
+    ERL_NIF_TERM local_state_terms_list =
+        local_states_to_term(env, broker->local_states, broker->nr_of_schedulers);
+
+    return enif_make_list8(
         env,
         //
         enif_make_tuple2(env, Atoms._creator, enif_make_pid(env, &broker->creator_pid)),
@@ -792,6 +824,10 @@ static ERL_NIF_TERM nif_to_list(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
         //
         enif_make_tuple2(env, Atoms._tag_offset_mask,
                          enif_make_uint64(env, broker->tag_offset_mask)),
+        //
+        enif_make_tuple2(env, Atoms._global_state, global_state_term),
+        //
+        enif_make_tuple2(env, Atoms._local_states, local_state_terms_list),
         //
         enif_make_tuple2(env, Atoms._batches, batch_terms_list));
 }
@@ -816,6 +852,8 @@ static batch_t* global_state_init(global_state_t* global_state, const size_t nr_
     map_res = cbroker_omap_insert(global_state->batches, first_batch->id, first_batch);
     assert(map_res == CBROKER_OMAP_OK);
 
+    batch_pool_init(&global_state->batch_pool, nr_of_cells_per_batch);
+
     return first_batch;
 }
 
@@ -825,6 +863,13 @@ static void global_state_close(global_state_t* global_state)
     assert(prev_value == false);
 }
 
+static ERL_NIF_TERM global_state_to_term(ErlNifEnv* env, global_state_t* global_state)
+{
+    return enif_make_list1(
+        env,
+        //
+        enif_make_tuple2(env, Atoms._batch_pool, mempool_to_term(env, &global_state->batch_pool)));
+}
 /*********************************************************************/
 
 static void local_states_init(local_state_t local_states[], const size_t nr_of_schedulers,
@@ -846,7 +891,6 @@ static void local_states_init(local_state_t local_states[], const size_t nr_of_s
         local_state->left_id = first_batch->id;
         local_state->right_id = first_batch->id;
 
-        ensure_new_batch(&local_state->new_batch, first_batch->nr_of_cells, NULL);
         match_pool_init(&local_state->match_pool);
         tag_pool_init(&local_state->tag_pool);
         env_pool_init(&local_state->env_pool);
@@ -881,19 +925,30 @@ static batch_t* local_state_get_batch(local_state_t* local_state, const batch_id
     return batch;
 }
 
-static void local_state_release_batch(local_state_t* local_state, batch_t** batch_ptr)
+static ERL_NIF_TERM local_states_to_term(ErlNifEnv* env, local_state_t local_states[],
+                                         const size_t nr_of_schedulers)
 {
-    batch_t* batch = *batch_ptr;
+    ERL_NIF_TERM* local_state_terms = enif_alloc(nr_of_schedulers * sizeof(ERL_NIF_TERM));
 
-    if (local_state->new_batch == NULL) {
-        memset(batch, 0, batch_size(batch->nr_of_cells));
-        local_state->new_batch = batch;
-    }
-    else {
-        enif_free(batch);
+    for (thread_id_t i = 0; i < nr_of_schedulers; i++) {
+        local_state_t* local_state = &local_states[i];
+
+        ERL_NIF_TERM local_state_term = enif_make_list3(
+            env,
+            //
+            enif_make_tuple2(env, Atoms._match_pool,
+                             mempool_to_term(env, &local_state->match_pool)),
+            //
+            enif_make_tuple2(env, Atoms._env_pool, mempool_to_term(env, &local_state->env_pool)),
+            //
+            enif_make_tuple2(env, Atoms._tag_pool, mempool_to_term(env, &local_state->tag_pool)));
+
+        local_state_terms[i] = local_state_term;
     }
 
-    *batch_ptr = NULL;
+    ERL_NIF_TERM list = enif_make_list_from_array(env, local_state_terms, nr_of_schedulers);
+    enif_free(local_state_terms);
+    return list;
 }
 
 static thread_id_t get_or_assign_thread_id(const size_t nr_of_schedulers)
@@ -979,7 +1034,6 @@ static ERL_NIF_TERM ask_loop(ask_ctx_t* ctx, ask_out_t* out)
 static batch_t* ask_get_next_batch(ask_ctx_t* ctx, const batch_id_t prev_batch_id)
 {
     local_state_t* local_state = ctx->local_state;
-    assert(local_state->new_batch != NULL);
 
     batch_id_t next_batch_id = 0;
     batch_t* next_batch = NULL;
@@ -1001,10 +1055,11 @@ static batch_t* ask_get_next_batch(ask_ctx_t* ctx, const batch_id_t prev_batch_i
         if (!cbroker_omap_next(global_state->batches, prev_batch_id, &next_batch_id,
                                (void**)&next_batch)) {
             next_batch_id = prev_batch_id + 1;
-            next_batch = local_state->new_batch;
-            local_state->new_batch = NULL;
+            next_batch =
+                batch_pool_get(&global_state->batch_pool, ctx->broker->nr_of_cells_per_batch);
             assert(next_batch != NULL);
-            batch_init(next_batch, next_batch_id, next_batch->nr_of_cells);
+            batch_init(next_batch, next_batch_id);
+
             map_res = cbroker_omap_insert(global_state->batches, next_batch_id, next_batch);
             assert(map_res == CBROKER_OMAP_OK);
             atomic_store_explicit(&next_batch->ref_count, 2, memory_order_relaxed);
@@ -1029,10 +1084,6 @@ static batch_t* ask_get_next_batch(ask_ctx_t* ctx, const batch_id_t prev_batch_i
     }
     else {
         local_state->right_id = next_batch_id;
-    }
-
-    if (local_state->new_batch == NULL) {
-        local_state->new_batch = batch_new(0, ctx->broker->nr_of_cells_per_batch);
     }
 
     return next_batch;
@@ -1171,13 +1222,12 @@ static match_t* ask_prepare_our_match(ask_ctx_t* ctx, batch_id_t batch_id, offse
     local_state_t* local_state = ctx->local_state;
 
     LOG("[%T] [ask_prepare_our_match] Grabbing new match from local state", ctx->self_term);
-    match_t* match = mempool_get(&local_state->match_pool);
+    match_t* match = mempool_get(&local_state->match_pool, NULL);
     assert(match != NULL);
 
     match->enqueue_ts = ctx->enqueue_ts;
     match->pid = ctx->self;
-    match->env = mempool_get(&local_state->env_pool);
-    // TODO increment copied bytes?
+    match->env = mempool_get(&local_state->env_pool, NULL);
 
     LOG("[%T] [ask_prepare_our_match] Copying offer", ctx->self_term);
     match->offer = enif_make_copy(match->env, ctx->offer);
@@ -1189,7 +1239,7 @@ static match_t* ask_prepare_our_match(ask_ctx_t* ctx, batch_id_t batch_id, offse
     match->batch_id = batch_id;
     match->offset = offset;
 
-    tag_t* tag = mempool_get(&local_state->tag_pool);
+    tag_t* tag = mempool_get(&local_state->tag_pool, NULL);
     assert(tag != NULL);
     tag->match = match;
     match->tag = tag;
@@ -1199,6 +1249,25 @@ static match_t* ask_prepare_our_match(ask_ctx_t* ctx, batch_id_t batch_id, offse
     assert(mon_res == 0);
 
     return match;
+}
+
+static void ask_await_preemptively_fill_batch_pool(ask_ctx_t* ctx, ask_out_t* out)
+{
+    broker_t* broker = ctx->broker;
+    global_state_t* global_state = &broker->global_state;
+
+    const batch_t* batch = out->batch;
+    assert(batch != NULL);
+    const offset_t offset = out->offset;
+
+    if (offset == (batch->nr_of_cells >> 2) &&
+        global_state->batch_pool.count <= BATCH_POOL_INITIAL_COUNT // dirty read
+    ) {
+        batch_t* new_batch = batch_new(0, ctx->broker->nr_of_cells_per_batch);
+        enif_mutex_lock(broker->global_lock);
+        mempool_return(&global_state->batch_pool, new_batch);
+        enif_mutex_unlock(broker->global_lock);
+    }
 }
 
 /*********************************************************************/
@@ -1487,6 +1556,7 @@ static void broker_dtor(ErlNifEnv* caller_env, void* obj)
     enif_mutex_destroy(broker->global_lock);
 
     global_state_t* global_state = &broker->global_state;
+    mempool_destroy(&global_state->batch_pool);
 
     //
 
@@ -1495,12 +1565,6 @@ static void broker_dtor(ErlNifEnv* caller_env, void* obj)
         void* destroy_ctx = global_state;
         cbroker_omap_destroy(local_state->batches, broker_dtor_cb_local_batch, destroy_ctx);
         local_state->batches = NULL;
-
-        batch_t* new_batch = local_state->new_batch;
-        if (new_batch != NULL) {
-            broker_dtor_cb_global_batch(new_batch->id, new_batch, NULL);
-            local_state->new_batch = NULL;
-        }
 
         mempool_destroy(&local_state->match_pool);
         mempool_destroy(&local_state->env_pool);
@@ -1594,7 +1658,6 @@ static void lease_ref_count_dec(lease_t* lease)
 
     batch_id_t batch_id = batch->id;
     cbroker_omap_result_t map_res = CBROKER_OMAP_NOMEM;
-    batch_t* returnable_batch = NULL;
 
     /* acq_rel, not relaxed: release so this thread's cell writes precede the
      * free below; acquire so the thread that observes 1 sees every other
@@ -1626,13 +1689,13 @@ static void lease_ref_count_dec(lease_t* lease)
                 LOG("CONSUME: batch %u removed", batch_id);
 
                 if (has_next) {
-                    returnable_batch = batch;
+                    mempool_return(&global_state->batch_pool, batch);
                 }
                 else {
                     // We reuse the batch right away, ensuring batch IDs are not reused
                     // by a thread that lagged behind
                     const batch_id_t next_batch_id = batch_id + 1;
-                    batch_init(batch, next_batch_id, batch->nr_of_cells);
+                    batch_init(batch, next_batch_id);
                     map_res = cbroker_omap_insert(global_state->batches, next_batch_id, batch);
                     assert(map_res == CBROKER_OMAP_OK);
                     batch = NULL;
@@ -1644,16 +1707,6 @@ static void lease_ref_count_dec(lease_t* lease)
     }
 
     lease->batch = NULL;
-
-    if (returnable_batch != NULL) {
-        if (opt_local_state == NULL) {
-            enif_free(returnable_batch);
-        }
-        else {
-            local_state_release_batch(opt_local_state, &returnable_batch);
-        }
-        assert(returnable_batch == NULL);
-    }
 }
 
 //
@@ -1766,12 +1819,14 @@ static batch_t* batch_new(const batch_id_t id, const size_t nr_of_cells)
 {
     const size_t size = batch_size(nr_of_cells);
     batch_t* batch = enif_alloc(size);
-    batch_init(batch, id, nr_of_cells);
+    batch->nr_of_cells = nr_of_cells;
+    batch_init(batch, id);
     return batch;
 }
 
-static void batch_init(batch_t* batch, const batch_id_t id, const size_t nr_of_cells)
+static void batch_init(batch_t* batch, const batch_id_t id)
 {
+    const size_t nr_of_cells = batch->nr_of_cells;
     memset(batch, 0, batch_size(nr_of_cells));
     batch->id = id;
     atomic_store(&batch->ref_count, 1);
@@ -1837,23 +1892,59 @@ static ERL_NIF_TERM batch_to_term(ErlNifEnv* env, const batch_t* batch)
 
 /*********************************************************************/
 
-static void ensure_new_batch(batch_t** ptr, const size_t nr_of_cells_per_batch, ask_ctx_t* ask_ctx)
-{
-    if (*ptr == NULL) {
-        *ptr = batch_new(0, nr_of_cells_per_batch);
-        if (ask_ctx != NULL) {
-            ask_ctx->copied_bytes += batch_size((*ptr)->nr_of_cells);
-        }
-    }
-}
-
-static void ensure_one_entry_in_pool(mempool_t* pool)
+static void ensure_one_entry_in_pool(mempool_t* pool, void* alloc_ctx)
 {
     if (pool->count == 0) {
         assert(pool->size > 0);
-        pool->array[pool->count++] = pool->alloc_cb();
+        pool->array[pool->count++] = pool->alloc_cb(alloc_ctx);
     }
 }
+
+//
+
+static void batch_pool_init(mempool_t* pool, size_t nr_of_cells)
+{
+    memset(pool, 0, sizeof(mempool_t));
+    pool->alloc_cb = batch_pool_cb_alloc;
+    pool->clear_cb = batch_pool_cb_clear;
+    pool->free_cb = batch_pool_cb_free;
+
+    batch_pool_alloc_ctx_t alloc_ctx;
+    memset(&alloc_ctx, 0, sizeof(batch_pool_alloc_ctx_t));
+    alloc_ctx.nr_of_cells = nr_of_cells;
+
+    mempool_init(pool, BATCH_POOL_INITIAL_COUNT, BATCH_POOL_SIZE, &nr_of_cells);
+}
+
+static batch_t* batch_pool_get(mempool_t* pool, size_t nr_of_cells)
+{
+    batch_pool_alloc_ctx_t alloc_ctx;
+    memset(&alloc_ctx, 0, sizeof(batch_pool_alloc_ctx_t));
+    alloc_ctx.nr_of_cells = nr_of_cells;
+    return mempool_get(pool, &alloc_ctx);
+}
+
+static void* batch_pool_cb_alloc(void* alloc_ctx)
+{
+    batch_pool_alloc_ctx_t* ctx = (batch_pool_alloc_ctx_t*)alloc_ctx;
+    const size_t size = batch_size(ctx->nr_of_cells);
+
+    batch_t* batch = enif_alloc(size);
+    memset(batch, 0, size);
+
+    batch->nr_of_cells = ctx->nr_of_cells;
+    return batch;
+}
+
+static void batch_pool_cb_clear(void* obj)
+{
+    batch_t* batch = (batch_t*)obj;
+    const size_t nr_of_cells = batch->nr_of_cells;
+    memset(batch, 0, sizeof(batch_t));
+    batch->nr_of_cells = nr_of_cells;
+}
+
+static void batch_pool_cb_free(void* obj) { enif_free(obj); }
 
 //
 
@@ -1863,11 +1954,12 @@ static void match_pool_init(mempool_t* pool)
     pool->alloc_cb = match_pool_cb_alloc;
     pool->clear_cb = match_pool_cb_clear;
     pool->free_cb = match_pool_cb_free;
-    mempool_init(pool);
+    mempool_init(pool, MATCH_POOLS_INITIAL_COUNT, MATCH_POOLS_SIZE, NULL);
 }
 
-static void* match_pool_cb_alloc()
+static void* match_pool_cb_alloc(void* ctx)
 {
+    assert(ctx == NULL);
     match_t* match = enif_alloc(sizeof(match_t));
     memset(match, 0, sizeof(match_t));
     return match;
@@ -1889,11 +1981,12 @@ static void tag_pool_init(mempool_t* pool)
     pool->alloc_cb = tag_pool_cb_alloc;
     pool->clear_cb = tag_pool_cb_clear;
     pool->free_cb = tag_pool_cb_free;
-    mempool_init(pool);
+    mempool_init(pool, TAG_POOLS_INITIAL_COUNT, TAG_POOLS_SIZE, NULL);
 }
 
-static void* tag_pool_cb_alloc()
+static void* tag_pool_cb_alloc(void* ctx)
 {
+    assert(ctx == NULL);
     tag_t* tag = enif_alloc_resource(ResourceTypes.tag, sizeof(tag_t));
     memset(tag, 0, sizeof(tag_t));
     return tag;
@@ -1915,10 +2008,14 @@ static void env_pool_init(mempool_t* pool)
     pool->alloc_cb = env_pool_cb_alloc;
     pool->clear_cb = env_pool_cb_clear;
     pool->free_cb = env_pool_cb_free;
-    mempool_init(pool);
+    mempool_init(pool, ENV_POOLS_INITIAL_COUNT, ENV_POOLS_SIZE, NULL);
 }
 
-static void* env_pool_cb_alloc() { return enif_alloc_env(); }
+static void* env_pool_cb_alloc(void* ctx)
+{
+    assert(ctx == NULL);
+    return enif_alloc_env();
+}
 
 static void env_pool_cb_clear(void* obj)
 {
@@ -1930,23 +2027,25 @@ static void env_pool_cb_free(void* obj) { enif_free_env(obj); }
 
 /*********************************************************************/
 
-static void mempool_init(mempool_t* pool)
+static void mempool_init(mempool_t* pool, size_t initial_count, size_t size, void* alloc_ctx)
 {
-    pool->count = 8;
-    pool->size = 8;
+    assert(initial_count <= size);
+    assert(size > 0);
+    pool->count = initial_count;
+    pool->size = size;
     pool->array = enif_alloc(pool->size * sizeof(void*));
 
     for (size_t i = 0; i < pool->count; i++) {
-        pool->array[i] = pool->alloc_cb();
+        pool->array[i] = pool->alloc_cb(alloc_ctx);
     }
 }
 
-static void* mempool_get(mempool_t* pool)
+static void* mempool_get(mempool_t* pool, void* alloc_ctx)
 {
     void* obj = NULL;
 
     if (pool->count == 0) {
-        obj = pool->alloc_cb();
+        obj = pool->alloc_cb(alloc_ctx);
     }
     else {
         size_t count = --pool->count;
@@ -1983,6 +2082,11 @@ static void mempool_destroy(mempool_t* pool)
     pool->array = NULL;
     pool->count = 0;
     pool->size = 0;
+}
+
+static ERL_NIF_TERM mempool_to_term(ErlNifEnv* env, mempool_t* pool)
+{
+    return enif_make_uint64(env, pool->count);
 }
 
 /*********************************************************************/
