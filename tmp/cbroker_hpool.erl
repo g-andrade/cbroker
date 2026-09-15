@@ -1,4 +1,4 @@
--module(cbroker_wpool).
+-module(cbroker_hpool).
 
 -ifdef(E48).
 -moduledoc false.
@@ -11,27 +11,17 @@
 -export([
     child_spec/4,
     start_link/4,
-    %
-    checkout/1,
-    checkout/2,
-    checkout/3,
-    %
-    checkin/1,
-    %
-    transaction/2,
-    transaction/3
+    request/2,
+    request/3
 ]).
-
--ignore_xref([start_link/0]).
 
 %% ------------------------------------------------------------------
 %% Macro Definitions
 %% ------------------------------------------------------------------
 
--define(MOD_TYPE, worker).
+-define(MOD_TYPE, handler).
 
--define(DEFAULT_CHECKOUT_TIMEOUT, (5_000)).
--define(DEFAULT_TRANSACTION_TIMEOUT, (5_000)).
+-define(DEFAULT_REQ_TIMEOUT, (5_000)).
 
 %% ------------------------------------------------------------------
 %% API Type Definitions
@@ -87,121 +77,69 @@ start_link(Name, Module, Args, Opts) ->
 
 %%
 
-checkout(Name) ->
-    checkout(Name, true).
+request(Name, Request) ->
+    request(Name, Request, ?DEFAULT_REQ_TIMEOUT).
 
-checkout(Name, Block) ->
-    checkout(Name, Block, ?DEFAULT_CHECKOUT_TIMEOUT).
-
-checkout(Name, Block, Timeout) ->
+request(Name, Request, Timeout) ->
     {ok, Broker} = cbroker_pool:get_broker(Name, ?MOD_TYPE),
-
-    case Block of
-        true ->
-            Deadline = timeout_deadline(Timeout),
-            blocking_checkout_recur(Broker, Deadline);
-        %
-        false ->
-            nb_checkout(Broker)
-    end.
-
-checkin(Handle) ->
-    WrapperPid = Handle,
-    cbroker_worker:checkin(WrapperPid).
-
-transaction(Name, Fun) ->
-    transaction(Name, Fun, ?DEFAULT_TRANSACTION_TIMEOUT).
-
-transaction(Name, Fun, Timeout) ->
-    case checkout(Name, true, Timeout) of
-        {ok, Handle, WorkerPid} ->
-            try
-                Fun(WorkerPid)
-            after
-                checkin(Handle)
-            end
-    end.
+    ExchangeValue = {self(), Request},
+    Deadline = timeout_deadline(Timeout),
+    request_recur(Broker, ExchangeValue, Deadline).
 
 %% ------------------------------------------------------------------
 %% Internal Function Definitions
 %% ------------------------------------------------------------------
 
-%% blocking check-out
-
-blocking_checkout_recur(Broker, Deadline) ->
-    ExchangeValue = {checkout, self()},
-
+request_recur(Broker, ExchangeValue, Deadline) ->
     case cbroker_nif:ask(Broker, left, ExchangeValue, false) of
         {await, Tag} ->
-            blocking_checkout_await(Broker, Tag, Deadline);
-        %
-        {match, _MatchRef, {WrapperPid, WorkerPid}} ->
-            Handle = WrapperPid,
-            {ok, Handle, WorkerPid};
+            request_await_match(Tag, Deadline);
         %
         retry ->
-            blocking_checkout_recur(Broker, Deadline)
+            request_recur(Broker, ExchangeValue, Deadline);
+        %
+        Result ->
+            request_handle_match_result(Result, Deadline)
     end.
 
-blocking_checkout_await(Broker, Tag, Deadline) ->
+request_await_match(Tag, Deadline) ->
     Timeout = millis_left_to_deadline(Deadline),
 
     receive
         {Tag, Result} ->
-            {match, _MatchRef, {WrapperPid, WorkerPid}} = Result,
-            Handle = WrapperPid,
-            {ok, Handle, WorkerPid}
+            request_handle_match_result(Result, Deadline)
     after Timeout ->
-        blocking_checkout_timeout(Broker, Tag)
+        request_await_match_timeout(Tag, Deadline)
     end.
 
-blocking_checkout_timeout(Broker, Tag) ->
-    case cbroker_nif:cancel(Broker, Tag) of
+request_await_match_timeout(Tag, Deadline) ->
+    case cbroker_nif:cancel(Tag) of
         cancelled ->
             error(timeout);
         %
         too_late ->
             receive
                 {Tag, Result} ->
-                    blocking_checkout_timeout_concurrent_result(Result)
+                    request_handle_match_result(Result, Deadline)
             end
     end.
 
-blocking_checkout_timeout_concurrent_result(Result) ->
-    case Result of
-        {match, _MatchRef, {WrapperPid, WorkerPid}} ->
-            Handle = WrapperPid,
-            {ok, Handle, WorkerPid}
-    end.
+request_handle_match_result({match, MatchRef, WorkerPid}, Deadline) ->
+    WorkerMon = monitor(process, WorkerPid),
+    request_await_reply(MatchRef, WorkerPid, WorkerMon, Deadline).
 
-%%%%%%%%%%%%
-%% non-blocking check-out
+request_await_reply(MatchRef, _WorkerPid, WorkerMon, Deadline) ->
+    Timeout = millis_left_to_deadline(Deadline),
 
-nb_checkout(Broker) ->
-    ExchangeValue = {checkout, self()},
-
-    case cbroker_nif:ask(Broker, left, ExchangeValue, false, nb) of
-        {await, Tag} ->
-            nb_checkout_await(Tag);
-        %
-        {match, _, {WrapperPid, WorkerPid}} ->
-            Handle = WrapperPid,
-            {ok, Handle, WorkerPid};
-        %
-        retry ->
-            full;
-        %
-        cancelled ->
-            full
-    end.
-
-nb_checkout_await(Tag) ->
     receive
-        {Tag, Result} ->
-            case Result of
-                {match, _, WorkerPid} ->
-                    WorkerPid
-            end
+        {MatchRef, Reply} ->
+            % TODO streaming
+            demonitor(WorkerMon, [flush]),
+            Reply
+    after Timeout ->
+        %cbroker_handler:cancel(WorkerPid, WorkerMon),
+        % FIXME
+        error(timeout)
     end.
 
 %%%%%%%%%%%%

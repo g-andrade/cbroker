@@ -17,7 +17,10 @@
     ask/3
 ]).
 
--ignore_xref([start_link/0]).
+-ignore_xref([
+    start_link/0,
+    ask/3
+]).
 
 %% ------------------------------------------------------------------
 %% sys Function Exports

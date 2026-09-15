@@ -18,7 +18,7 @@
     get_shared_state/1
 ]).
 
--ignore_xref([start_link/0]).
+-ignore_xref([start_link/1]).
 
 %% ------------------------------------------------------------------
 %% gen_server Function Exports

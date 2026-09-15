@@ -31,6 +31,30 @@
 %% ------------------------------------------------------------------
 
 -export([
+    new/0,
+    new/1,
+    %
+    ask/1,
+    ask/2,
+    ask/3,
+    ask_r/1,
+    ask_r/2,
+    ask_r/3,
+    %
+    async_ask/1,
+    async_ask/2,
+    async_ask_r/1,
+    async_ask_r/2,
+    %
+    to_list/1,
+    %
+    bench1/4
+]).
+
+-ignore_xref([
+    new/0,
+    new/1,
+    %
     ask/1,
     ask/2,
     ask/3,
@@ -82,6 +106,12 @@
 %     -spec add(integer(), integer()) -> integer().
 %     add(A, B) ->
 %         A + B.
+
+new() ->
+    cbroker_nif:new().
+
+new(Opts) ->
+    cbroker_nif:new(Opts).
 
 ask(Name) ->
     ask(Name, self()).

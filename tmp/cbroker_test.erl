@@ -99,7 +99,7 @@ flush_inbox(Requests, RequestsPerLoop) ->
     end.
 
 async_ask(Broker, Requests) ->
-    case cbroker_nif:ask(Broker, left, {self(), {sleep_between, 50, 100}}, false, fully_async) of
+    case cbroker_nif:ask(Broker, left, {self(), {sleep_between, 50, 100}}, async) of
         {await, Tag} ->
             Requests#{Tag => v};
         %
