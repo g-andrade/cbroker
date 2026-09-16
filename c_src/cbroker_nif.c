@@ -2335,7 +2335,7 @@ static int get_offer_size(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM offer,
     }
 #else
     if (term == Atoms._compute_from_nif) {
-        *out_size = enif_term_size(term);
+        *out_size = enif_term_size(offer);
         return 1;
     }
 #endif
