@@ -94,12 +94,15 @@
 -type drop() :: {drop, drop_reason(), sojourn_time()}.
 -export_type([drop/0]).
 
--type drop_reason() ::
-    (match_unavailable
-    | broker_overloaded
-    | broker_closed
-    | Other :: term()).
+-type drop_reason() :: known_drop_reason() | Other :: term().
 -export_type([drop_reason/0]).
+
+-type known_drop_reason() ::
+    (cancelled
+    | match_unavailable
+    | broker_overloaded
+    | broker_closed).
+-export_type([known_drop_reason/0]).
 
 -type sojourn_time() :: non_neg_integer().
 -export_type([sojourn_time/0]).
