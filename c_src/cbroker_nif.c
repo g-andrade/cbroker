@@ -2330,7 +2330,7 @@ static int get_offer_size(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM offer,
     size_t size_in_words = 0;
 
     if (get_size_t(env, term, &size_in_words)) {
-        *out_size = size_in_words << 3;
+        *out_size = size_in_words * sizeof(ERL_NIF_TERM);
         return 1;
     }
 #else
