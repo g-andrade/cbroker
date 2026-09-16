@@ -51,7 +51,7 @@
 
 -spec child_spec(Name, Opts) -> supervisor:child_spec() when
     Name :: reg_name(),
-    Opts :: cbroker:broker_opts().
+    Opts :: [cbroker:broker_opt()].
 child_spec(Name, Opts) ->
     #{
         id => {?MODULE, Name},
@@ -60,7 +60,7 @@ child_spec(Name, Opts) ->
 
 -spec start_link(Name, Opts) -> {ok, pid()} | {error, term()} when
     Name :: reg_name(),
-    Opts :: cbroker:broker_opts().
+    Opts :: [cbroker:broker_opt()].
 start_link(Name, Opts) ->
     gen_server:start_link(Name, ?MODULE, [Name, Opts], []).
 
@@ -83,7 +83,7 @@ get(Name) ->
 -spec init([InitArg, ...]) -> {ok, state()} when
     InitArg :: Name | Opts,
     Name :: reg_name(),
-    Opts :: cbroker:broker_opts().
+    Opts :: [cbroker:broker_opt()].
 init([Name, Opts]) ->
     % always call `terminate/2` unless killed
     _ = process_flag(trap_exit, true),

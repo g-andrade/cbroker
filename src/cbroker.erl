@@ -75,8 +75,24 @@
 -type side() :: left | right.
 -export_type([side/0]).
 
+-type msg() :: {tag(), reply()}.
+-export_type([msg/0]).
+
 -type tag() :: reference().
 -export_type([tag/0]).
+
+-type reply() :: (match() | drop()).
+-export_type([reply/0]).
+
+-type match() :: match(term()).
+-type match(CounterOffer) :: {match, match_ref(), CounterOffer, sojourn_time()}.
+-export_type([match/0, match/1]).
+
+-type match_ref() :: reference().
+-export_type([match_ref/0]).
+
+-type drop() :: {drop, drop_reason(), sojourn_time()}.
+-export_type([drop/0]).
 
 -type drop_reason() ::
     (match_unavailable
@@ -84,6 +100,9 @@
     | broker_closed
     | Other :: term()).
 -export_type([drop_reason/0]).
+
+-type sojourn_time() :: non_neg_integer().
+-export_type([sojourn_time/0]).
 
 %% ------------------------------------------------------------------
 %% API Function Definitions
@@ -95,10 +114,10 @@
 when
     Broker :: broker(),
     Side :: side(),
-    MatchRef :: reference(),
+    MatchRef :: match_ref(),
     CounterOffer :: term(),
     DropReason :: timeout | drop_reason(),
-    SojournTime :: non_neg_integer().
+    SojournTime :: sojourn_time().
 
 ask(Broker, Side) ->
     ask(Broker, Side, self()).
@@ -112,10 +131,10 @@ when
     Broker :: broker(),
     Side :: side(),
     Offer :: term(),
-    MatchRef :: reference(),
+    MatchRef :: match_ref(),
     CounterOffer :: term(),
     DropReason :: timeout | drop_reason(),
-    SojournTime :: non_neg_integer().
+    SojournTime :: sojourn_time().
 
 ask(Broker, Side, Offer) ->
     ask(Broker, Side, Offer, ?DEFAULT_TIMEOUT).
@@ -130,10 +149,10 @@ when
     Side :: side(),
     Offer :: term(),
     Timeout :: timeout(),
-    MatchRef :: reference(),
+    MatchRef :: match_ref(),
     CounterOffer :: term(),
     DropReason :: timeout | drop_reason(),
-    SojournTime :: non_neg_integer().
+    SojournTime :: sojourn_time().
 
 ask(Broker, Side, Offer, Timeout) ->
     case dynamic_ask(Broker, Side, Offer) of
@@ -149,7 +168,7 @@ ask(Broker, Side, Offer, Timeout) ->
 -spec async_ask(Broker, Side) -> {await, Tag} when
     Broker :: broker(),
     Side :: side(),
-    Tag :: term().
+    Tag :: tag().
 
 async_ask(Broker, Side) ->
     async_ask(Broker, Side, self()).
@@ -160,7 +179,7 @@ async_ask(Broker, Side) ->
     Broker :: broker(),
     Side :: side(),
     Offer :: term(),
-    Tag :: term().
+    Tag :: tag().
 
 async_ask(Broker, Side, Offer) ->
     BrokerRef = resolve_broker(Broker),
@@ -173,10 +192,10 @@ async_ask(Broker, Side, Offer) ->
     | {drop, DropReason, SojournTime}
 when
     Tag :: tag(),
-    MatchRef :: reference(),
+    MatchRef :: match_ref(),
     CounterOffer :: term(),
     DropReason :: timeout | drop_reason(),
-    SojournTime :: non_neg_integer().
+    SojournTime :: sojourn_time().
 
 await(Tag) ->
     await(Tag, ?DEFAULT_TIMEOUT).
@@ -189,10 +208,10 @@ await(Tag) ->
 when
     Tag :: tag(),
     Timeout :: timeout(),
-    MatchRef :: reference(),
+    MatchRef :: match_ref(),
     CounterOffer :: term(),
     DropReason :: timeout | drop_reason(),
-    SojournTime :: non_neg_integer().
+    SojournTime :: sojourn_time().
 
 await(Tag, Timeout) ->
     receive
@@ -215,9 +234,9 @@ await(Tag, Timeout) ->
     | {cancelled, SojournTime}
 when
     Tag :: tag(),
-    MatchRef :: reference(),
+    MatchRef :: match_ref(),
     CounterOffer :: term(),
-    SojournTime :: non_neg_integer().
+    SojournTime :: sojourn_time().
 
 cancel(Tag) ->
     case nif_cancel(Tag) of
@@ -271,10 +290,10 @@ when
     Broker :: broker(),
     Side :: side(),
     Tag :: tag(),
-    MatchRef :: reference(),
+    MatchRef :: match_ref(),
     CounterOffer :: term(),
     DropReason :: drop_reason(),
-    SojournTime :: non_neg_integer().
+    SojournTime :: sojourn_time().
 
 dynamic_ask(Broker, Side) ->
     dynamic_ask(Broker, Side, self()).
@@ -290,10 +309,10 @@ when
     Side :: side(),
     Offer :: term(),
     Tag :: tag(),
-    MatchRef :: reference(),
+    MatchRef :: match_ref(),
     CounterOffer :: term(),
     DropReason :: drop_reason(),
-    SojournTime :: non_neg_integer().
+    SojournTime :: sojourn_time().
 
 dynamic_ask(Broker, Side, Offer) ->
     BrokerRef = resolve_broker(Broker),
@@ -307,10 +326,10 @@ dynamic_ask(Broker, Side, Offer) ->
 when
     Broker :: broker(),
     Side :: side(),
-    MatchRef :: reference(),
+    MatchRef :: match_ref(),
     CounterOffer :: term(),
     DropReason :: drop_reason(),
-    SojournTime :: non_neg_integer().
+    SojournTime :: sojourn_time().
 
 nb_ask(Broker, Side) ->
     nb_ask(Broker, Side, self()).
@@ -322,10 +341,10 @@ when
     Broker :: broker(),
     Side :: side(),
     Offer :: term(),
-    MatchRef :: reference(),
+    MatchRef :: match_ref(),
     CounterOffer :: term(),
     DropReason :: drop_reason(),
-    SojournTime :: non_neg_integer().
+    SojournTime :: sojourn_time().
 
 nb_ask(Broker, Side, Offer) ->
     BrokerRef = resolve_broker(Broker),
@@ -366,9 +385,9 @@ resolve_name(BrokerName) ->
 when
     Broker :: broker(),
     Side :: side(),
-    MatchRef :: reference(),
+    MatchRef :: match_ref(),
     CounterOffer :: term(),
-    SojournTime :: non_neg_integer(),
+    SojournTime :: sojourn_time(),
     DropReason :: drop_reason(),
     Tag :: tag().
 
@@ -385,9 +404,9 @@ when
     Broker :: broker(),
     Side :: side(),
     Offer :: term(),
-    MatchRef :: reference(),
+    MatchRef :: match_ref(),
     CounterOffer :: term(),
-    SojournTime :: non_neg_integer(),
+    SojournTime :: sojourn_time(),
     DropReason :: drop_reason(),
     Tag :: tag().
 
@@ -405,9 +424,9 @@ when
     Side :: side(),
     Offer :: term(),
     Timeout :: timeout(),
-    MatchRef :: reference(),
+    MatchRef :: match_ref(),
     CounterOffer :: term(),
-    SojournTime :: non_neg_integer(),
+    SojournTime :: sojourn_time(),
     DropReason :: drop_reason(),
     Tag :: tag().
 
@@ -416,7 +435,7 @@ resumable_ask(Broker, Side, Offer, Timeout) ->
         {await, Tag} ->
             case resumable_await(Tag, Timeout) of
                 timeout ->
-                    {timeout, Timeout};
+                    {timeout, Tag};
                 %
                 Result ->
                     Result
@@ -434,10 +453,10 @@ resumable_ask(Broker, Side, Offer, Timeout) ->
     | timeout
 when
     Tag :: tag(),
-    MatchRef :: reference(),
+    MatchRef :: match_ref(),
     CounterOffer :: term(),
     DropReason :: drop_reason(),
-    SojournTime :: non_neg_integer().
+    SojournTime :: sojourn_time().
 
 resumable_await(Tag) ->
     resumable_await(Tag, ?DEFAULT_TIMEOUT).
@@ -451,10 +470,10 @@ resumable_await(Tag) ->
 when
     Tag :: tag(),
     Timeout :: timeout(),
-    MatchRef :: reference(),
+    MatchRef :: match_ref(),
     CounterOffer :: term(),
     DropReason :: drop_reason(),
-    SojournTime :: non_neg_integer().
+    SojournTime :: sojourn_time().
 
 resumable_await(Tag, Timeout) ->
     receive
@@ -513,7 +532,7 @@ offer_size_arg(_Value) ->
 
 -spec nif_cancel(Tag) -> too_late | {cancelled, SojournTime} when
     Tag :: tag(),
-    SojournTime :: non_neg_integer().
+    SojournTime :: sojourn_time().
 
 nif_cancel(_Tag) ->
     not_loaded(?LINE).
