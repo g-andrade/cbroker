@@ -29,6 +29,12 @@
 #define TAG_POOLS_INITIAL_COUNT 8
 #define TAG_POOLS_SIZE 8
 
+//
+
+#define MAX_ASK_RETRIES 10
+
+//
+
 /* The columns below are aligned on purpose. */
 /* clang-format off */
 #define ATOM_LIST \
@@ -41,16 +47,19 @@
     X(_batch_full,            "batch_full")  \
     X(_batch_pool,            "batch_pool")  \
     X(_batches,               "batches") \
+    X(_broker_closed,         "broker_closed") \
+    X(_broker_overloaded,     "broker_overloaded") \
     X(_cancelled,             "cancelled") \
-    X(_cancelled_nb,          "cancelled_nb") \
     X(_cells,                 "cells") \
-    X(_closed,                "closed") \
     X(_compute_from_nif,      "compute_from_nif") \
     X(_consumed_count,        "consumed_count") \
     X(_creator,               "creator") \
     X(_depends_on_creator,    "depends_on_creator") \
+    X(_drop,                  "drop") \
+    X(_dynamic,               "dynamic") \
     X(_empty,                 "empty") \
     X(_env_pool,              "env_pool") \
+    X(_error,                 "error") \
     X(_false,                 "false") \
     X(_global_state,          "global_state") \
     X(_id,                    "id") \
@@ -59,12 +68,13 @@
     X(_local_states,          "local_states")  \
     X(_match,                 "match") \
     X(_match_pool,            "match_pool") \
+    X(_match_unavailable,     "match_unavailable") \
     X(_matched,               "matched") \
-    X(_nb,                    "nb") \
+    X(_non_blocking,          "non_blocking") \
+    X(_none,                  "none") \
     X(_nr_of_cells_per_batch, "nr_of_cells_per_batch") \
     X(_nr_of_schedulers,      "nr_of_schedulers") \
     X(_ref_count,             "ref_count") \
-    X(_regular,               "regular") \
     X(_retry,                 "retry") \
     X(_right,                 "right") \
     X(_right_count,           "right_count") \
@@ -74,6 +84,7 @@
     X(_tag_pool,              "tag_pool") \
     X(_too_late,              "too_late") \
     X(_true,                  "true") \
+    X(_unavailable,           "unavailable") \
     X(_waiting,               "waiting") \
     X(_zzzzzz,                "zzzzzzz")
 /* clang-format on */
@@ -219,6 +230,16 @@ typedef ptrdiff_t thread_id_t;
 
 /*********************************************************************/
 
+typedef enum {
+    DROP_REASON_NONE,
+    DROP_REASON_CANCELLED,
+    DROP_REASON_NON_BLOCKING,
+    DROP_REASON_TOO_MANY_RETRIES,
+    DROP_REASON_CLOSED
+} drop_reason_t;
+
+//
+
 typedef struct {
     batch_t* batch;
     bool found_locally;
@@ -231,6 +252,7 @@ typedef struct {
 typedef struct {
     ErlNifEnv* env;
     ErlNifTime enqueue_ts;
+    int retry_nr;
     ErlNifPid self;
     ERL_NIF_TERM self_term;
     //
@@ -242,7 +264,7 @@ typedef struct {
     broker_t* broker;
     bool is_left;
     bool is_async;
-    bool is_nb;
+    bool is_non_blocking;
     local_state_t* local_state;
     size_t copied_bytes;
 } ask_ctx_t;
@@ -257,6 +279,7 @@ typedef struct {
     match_t* our_match;
     ERL_NIF_TERM our_tag;
     match_t* opposite_match;
+    drop_reason_t drop_reason;
 } ask_out_t;
 
 /*********************************************************************/
@@ -269,9 +292,9 @@ static void tag_resource_load(ErlNifEnv* caller_env);
 //
 
 static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
-static ERL_NIF_TERM nif_do_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
-static ERL_NIF_TERM nif_to_list(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM nif_debug_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
 //
 
@@ -365,7 +388,8 @@ static void notify_other_of_match_v2(ask_ctx_t* ctx, match_t* opposite_match,
 static void notify_self_of_match(ask_ctx_t* ctx, ERL_NIF_TERM our_tag, match_t* opposite_match,
                                  ERL_NIF_TERM match_ref);
 
-static void notify_of_cancellation(ErlNifEnv* env, match_t* match, bool did_broker_close);
+static void notify_of_cancellation(ErlNifEnv* env, match_t* match, const drop_reason_t reason);
+static ERL_NIF_TERM notify_of_faux_cancellation(ask_ctx_t* ctx, const drop_reason_t reason);
 
 static void either_notify_or_assert_not_alive(ErlNifEnv* caller_env, ErlNifPid* pid,
                                               ErlNifEnv* msg_env, ERL_NIF_TERM msg);
@@ -432,7 +456,13 @@ static ERL_NIF_TERM make_badarg(ErlNifEnv* env, ERL_NIF_TERM term);
 static ERL_NIF_TERM make_badopts(ErlNifEnv* env, ERL_NIF_TERM term);
 static ERL_NIF_TERM make_badopt(ErlNifEnv* env, ERL_NIF_TERM term);
 static ERL_NIF_TERM make_await(ErlNifEnv* env, ERL_NIF_TERM tag);
-static ERL_NIF_TERM make_cancelled(ErlNifEnv* env, bool did_broker_close, int64_t sojourn_time);
+static ERL_NIF_TERM make_cancelled(ErlNifEnv* env, const int64_t sojourn_time);
+
+static ERL_NIF_TERM make_drop(ErlNifEnv* env, const drop_reason_t reason,
+                              const int64_t sojourn_time);
+
+static ERL_NIF_TERM make_drop_reason(ErlNifEnv* env, const drop_reason_t reason);
+static ERL_NIF_TERM make_error(ErlNifEnv* env, ERL_NIF_TERM reason);
 
 static ERL_NIF_TERM make_match(ErlNifEnv* env, ERL_NIF_TERM match_ref, ERL_NIF_TERM offer,
                                ErlNifTime enqueue_ts);
@@ -457,9 +487,11 @@ static struct {
 
 //
 
-static ErlNifFunc nif_funcs[] = {{"new", 0, nif_new, 0},       {"new", 1, nif_new, 0},
-                                 {"do_ask", 4, nif_do_ask, 0}, {"do_ask", 5, nif_do_ask, 0},
-                                 {"cancel", 1, nif_cancel, 0}, {"to_list", 1, nif_to_list, 0}};
+static ErlNifFunc nif_funcs[] = {{"new", 0, nif_new, 0},
+                                 {"new", 1, nif_new, 0},
+                                 {"nif_ask", 7, nif_ask, 0},
+                                 {"nif_cancel", 1, nif_cancel, 0},
+                                 {"nif_debug_info", 1, nif_debug_info, 0}};
 
 static struct {
     ErlNifResourceType* broker;
@@ -471,6 +503,7 @@ static _Thread_local thread_id_t my_thread_id = -1;
 
 // Sentinel values used in batch cells
 static match_t sentinel_match_cancelled;
+static match_t sentinel_match_closed;
 static match_t sentinel_match_success;
 
 /*********************************************************************/
@@ -484,6 +517,7 @@ static int on_load(ErlNifEnv* caller_env, void** priv_data, ERL_NIF_TERM load_in
     tag_resource_load(caller_env);
 
     memset(&sentinel_match_cancelled, 0, sizeof(match_t));
+    memset(&sentinel_match_closed, 0, sizeof(match_t));
     memset(&sentinel_match_success, 0, sizeof(match_t));
 
     return 0;
@@ -517,7 +551,7 @@ static void tag_resource_load(ErlNifEnv* caller_env)
     assert(ResourceTypes.tag != NULL);
 }
 
-ERL_NIF_INIT(cbroker_nif, nif_funcs, on_load, NULL, NULL, NULL);
+ERL_NIF_INIT(cbroker, nif_funcs, on_load, NULL, NULL, NULL);
 
 /*********************************************************************/
 
@@ -576,12 +610,11 @@ static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
 //
 
-static ERL_NIF_TERM nif_do_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     ask_ctx_t ctx;
     memset(&ctx, 0, sizeof(ask_ctx_t));
     ctx.env = env;
-    ctx.enqueue_ts = monotonic_ts();
 
     if (enif_self(env, &ctx.self)) {
         ctx.self_term = enif_make_pid(env, &ctx.self);
@@ -590,6 +623,8 @@ static ERL_NIF_TERM nif_do_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
         return enif_make_badarg(env);
     }
 
+    assert(argc == 7);
+
     ctx.broker_term = argv[0];
     ctx.side = argv[1];
     ctx.offer = argv[2];
@@ -597,9 +632,12 @@ static ERL_NIF_TERM nif_do_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
     if (!get_offer_size(env, argv[3], ctx.offer, &ctx.offer_size)) {
         return make_badarg(env, argv[3]);
     }
-    // LOG_UNCOND("Offer size: %llu", ctx.offer_size);
 
-    ERL_NIF_TERM ask_type = (argc >= 5 ? argv[4] : Atoms._regular);
+    ERL_NIF_TERM ask_type = argv[4];
+    ERL_NIF_TERM enqueue_ts_term = argv[5];
+    ERL_NIF_TERM retry_nr_term = argv[6];
+
+    //
 
     if (!get_broker(env, ctx.broker_term, &ctx.broker)) {
         return make_badarg(env, ctx.broker_term);
@@ -615,11 +653,20 @@ static ERL_NIF_TERM nif_do_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
     if (ask_type == Atoms._async) {
         ctx.is_async = true;
     }
-    else if (ask_type == Atoms._nb) {
-        ctx.is_nb = true;
+    else if (ask_type == Atoms._non_blocking) {
+        ctx.is_non_blocking = true;
     }
-    else if (ask_type != Atoms._regular) {
+    else if (ask_type != Atoms._dynamic) {
         return make_badarg(env, ask_type);
+    }
+
+    if (!enif_get_int64(env, enqueue_ts_term, &ctx.enqueue_ts)) {
+        return make_badarg(env, enqueue_ts_term);
+    }
+    LOG("[ask] enqueue_ts: %lld", ctx.enqueue_ts);
+
+    if (!enif_get_int(env, retry_nr_term, &ctx.retry_nr) || ctx.retry_nr < 0) {
+        return make_badarg(env, retry_nr_term);
     }
 
     /////////
@@ -629,7 +676,7 @@ static ERL_NIF_TERM nif_do_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
     assert(ctx.local_state != NULL);
 
     if (ctx.local_state->is_closed) {
-        return Atoms._closed;
+        return make_error(env, Atoms._broker_closed);
     }
 
     ensure_one_entry_in_pool(&ctx.local_state->match_pool, NULL);
@@ -643,16 +690,21 @@ static ERL_NIF_TERM nif_do_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
 
     ////
 
+    //
+
     if (match_res == Atoms._await) {
+        assert(!ctx.is_non_blocking);
         assert(out.batch != NULL);
         match_res = make_await(env, out.our_tag);
+        out.our_match = NULL;
+        out.our_tag = Atoms._none;
 
         /* TODO do it as well for non-blocking cancellations
          * that hit the very same offset
          */
         ask_await_preemptively_fill_batch_pool(&ctx, &out);
     }
-    else if (match_res == Atoms._matched) {
+    else if (match_res == Atoms._match) {
         match_t* our_match = out.our_match;
         match_t* opposite_match = out.opposite_match;
         out.opposite_match = NULL;
@@ -671,27 +723,44 @@ static ERL_NIF_TERM nif_do_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
 
         //
 
-        if (out.consume_slot) {
-            LOG("match: about to consume slot");
-            broker_consume_batch_slot(ctx.broker, ctx.local_state, out.batch);
-        }
-
-        //
-
         if (ctx.is_async) {
-            notify_self_of_match(&ctx, out.our_tag, opposite_match, match_ref);
-            match_res = make_await(env, out.our_tag);
+            LOG("match: about to notify self");
+            // If we didn't allocate a match, use a faux tag
+            ERL_NIF_TERM our_tag = (our_match == NULL ? enif_make_ref(env) : out.our_tag);
+            notify_self_of_match(&ctx, our_tag, opposite_match, match_ref);
+            match_res = make_await(env, our_tag);
         }
         else {
+            LOG("match: about to copy offer to return it");
             ERL_NIF_TERM opposite_offer = enif_make_copy(env, opposite_match->offer);
             ctx.copied_bytes += opposite_match->offer_size;
             match_res = make_match(env, match_ref, opposite_offer, ctx.enqueue_ts);
         }
 
+        LOG("match: about to reclaim match");
         match_reclaim(opposite_match, true, ctx.local_state);
     }
-    else if (out.consume_slot) {
-        assert(out.batch != NULL);
+    else if (match_res == Atoms._drop) {
+        if (out.drop_reason == DROP_REASON_CLOSED) {
+            match_res = make_error(env, Atoms._broker_closed);
+        }
+        else if (ctx.is_async) {
+            ERL_NIF_TERM faux_tag = notify_of_faux_cancellation(&ctx, out.drop_reason);
+            match_res = make_await(env, faux_tag);
+        }
+        else {
+            int64_t sojourn_time = monotonic_ts() - ctx.enqueue_ts;
+            match_res = make_drop(env, out.drop_reason, sojourn_time);
+        }
+    }
+    else {
+        assert(match_res == Atoms._retry);
+    }
+
+    //
+
+    if (out.consume_slot) {
+        LOG("match: about to consume slot");
         broker_consume_batch_slot(ctx.broker, ctx.local_state, out.batch);
     }
 
@@ -706,18 +775,32 @@ static ERL_NIF_TERM nif_do_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
 
     //
 
-    if (match_res == Atoms._cancelled) {
-        match_res = Atoms._retry;
-    }
-    else if (match_res == Atoms._cancelled_nb) {
-        int64_t sojourn_time = monotonic_ts() - ctx.enqueue_ts;
-        match_res = make_cancelled(env, false, sojourn_time);
-    }
-
-    //
-
     consume_timeslice(env, ctx.copied_bytes);
-    return match_res;
+
+    if (match_res == Atoms._retry) {
+        if (ctx.retry_nr >= MAX_ASK_RETRIES) {
+            if (ctx.is_async) {
+                ERL_NIF_TERM faux_tag =
+                    notify_of_faux_cancellation(&ctx, DROP_REASON_TOO_MANY_RETRIES);
+                return make_await(env, faux_tag);
+            }
+            else {
+                int64_t sojourn_time = monotonic_ts() - ctx.enqueue_ts;
+                return make_drop(env, DROP_REASON_TOO_MANY_RETRIES, sojourn_time);
+            }
+        }
+
+        LOG_UNCOND("RETRYING");
+
+        int retry_argc = 7;
+        ERL_NIF_TERM retry_argv[7];
+        memcpy(retry_argv, argv, 6 * sizeof(ERL_NIF_TERM));
+        retry_argv[6] = enif_make_int(env, ctx.retry_nr + 1);
+        return enif_schedule_nif(env, "nif_ask", 0, nif_ask, retry_argc, retry_argv);
+    }
+    else {
+        return match_res;
+    }
 }
 
 //
@@ -733,10 +816,16 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
 
     ERL_NIF_TERM tag_term = argv[0];
 
+    LOG("[cancel] Resolving tag");
     if (!get_tag(env, tag_term, &tag)) {
+        if (enif_is_ref(env, tag_term)) {
+            // assume this to be a faux tag
+            return Atoms._too_late;
+        }
         return make_badarg(env, tag_term);
     }
 
+    LOG("[cancel] demonitoring process");
     if (enif_demonitor_process(env, tag, &tag->mon) != 0) {
         // too late
         return Atoms._too_late;
@@ -745,6 +834,9 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
     match_t* match = tag->match;
     assert(match != NULL);
     assert(match->tag == tag);
+    LOG("[cancel] Got match %p", match);
+    LOG("[cancel] Match batch id: %llu", match->batch_id);
+    LOG("[cancel] Match offset: %llu", match->offset);
 
     broker_t* broker = NULL;
     int get_broker_res = get_broker(match->env, match->broker_term, &broker);
@@ -760,6 +852,7 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
         return Atoms._too_late;
     }
 
+    LOG("[cancel] Checking out batch");
     if (!broker_checkout_batch(broker, local_state, match->batch_id, &lease)) {
         return Atoms._too_late;
     }
@@ -767,26 +860,36 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
     batch_t* batch = lease.batch;
     ERL_NIF_TERM res;
 
+    LOG("[cancel] asserting offset within bounds");
     assert(match->offset < batch->nr_of_cells);
 
+    LOG("[cancel] Retrieving cell");
     cell_t* cell = &batch->cells[match->offset];
 
     //
 
     if (atomic_compare_exchange_strong(cell, &match, &sentinel_match_cancelled)) {
+        LOG("[cancel] Consuming lease slot");
         lease_consume_slot(&lease);
-        match_reclaim(match, true, local_state);
 
+        LOG("[cancel] Reclaiming match %p", match);
         ErlNifPid cancelled_pid = match->pid;
-        int64_t sojourn_time = monotonic_ts() - match->enqueue_ts;
-        res = make_cancelled(env, false, sojourn_time);
+        ErlNifTime enqueue_ts = match->enqueue_ts;
+        match_reclaim(match, true, local_state);
+        match = NULL;
+
+        LOG("enqueue_ts=%lld, monotonic_ts=%lld", enqueue_ts, monotonic_ts());
+
+        int64_t sojourn_time = monotonic_ts() - enqueue_ts;
+        res = make_cancelled(env, sojourn_time);
 
         if (enif_compare_pids(&cancelled_pid, &self)) {
-            notify_of_cancellation(env, match, false);
+            notify_of_cancellation(env, match, DROP_REASON_CANCELLED);
         }
     }
     else {
-        assert(match == &sentinel_match_cancelled || match == &sentinel_match_success);
+        assert(match == &sentinel_match_cancelled || match == &sentinel_match_closed ||
+               match == &sentinel_match_success);
         res = Atoms._too_late;
     }
 
@@ -800,7 +903,7 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
 
 //
 
-static ERL_NIF_TERM nif_to_list(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+static ERL_NIF_TERM nif_debug_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     broker_t* broker = NULL;
     ERL_NIF_TERM broker_term = argv[0];
@@ -1029,18 +1132,18 @@ static ERL_NIF_TERM ask_loop(ask_ctx_t* ctx, ask_out_t* out)
                 batch = NULL;
                 match_res = Atoms._retry;
             }
-            else if (match_res == Atoms._cancelled) {
-                match_res = Atoms._retry;
+            else if (match_res == Atoms._retry) {
                 continue;
             }
-            else {
+            else if (match_res != Atoms._drop) {
                 out->batch = batch;
             }
         }
 
         if (batch == NULL) {
             if ((batch = ask_get_next_batch(ctx, batch_id)) == NULL) {
-                return Atoms._closed;
+                match_res = Atoms._drop;
+                out->drop_reason = DROP_REASON_CLOSED;
             }
         }
 
@@ -1143,7 +1246,7 @@ static ERL_NIF_TERM ask_batch(ask_ctx_t* ctx, batch_t* batch, ask_out_t* out)
     else {
         ERL_NIF_TERM match_res = ask_batch_offset(ctx, batch, offset, offset_counter, out);
 
-        if (match_res == Atoms._cancelled) {
+        if (match_res == Atoms._retry || match_res == Atoms._drop) {
             return match_res;
         }
         else {
@@ -1170,16 +1273,18 @@ static ERL_NIF_TERM ask_batch_offset(ask_ctx_t* ctx, batch_t* batch, offset_t of
     // First
 
     if (match == NULL) {
-        if (ctx->is_nb) {
+        if (ctx->is_non_blocking) {
             offset_t expected_offset = offset + 1;
             if (atomic_compare_exchange_strong(offset_counter, &expected_offset, offset)) {
                 // counter reverted to previous position
-                return Atoms._cancelled_nb;
+                out->drop_reason = DROP_REASON_NON_BLOCKING;
+                return Atoms._drop;
             }
             else if (atomic_compare_exchange_strong(cell, &match, &sentinel_match_cancelled)) {
                 // too late to revert counter, slot filled with cancellation instead
                 out->consume_slot = true;
-                return Atoms._cancelled_nb;
+                out->drop_reason = DROP_REASON_NON_BLOCKING;
+                return Atoms._drop;
             }
         }
         else {
@@ -1199,7 +1304,11 @@ static ERL_NIF_TERM ask_batch_offset(ask_ctx_t* ctx, batch_t* batch, offset_t of
 
     if (match == &sentinel_match_cancelled) {
         LOG("[%T] Match is too late: cancelled", ctx->self_term);
-        return Atoms._cancelled;
+        return Atoms._retry;
+    }
+    else if (match == &sentinel_match_closed) {
+        out->drop_reason = DROP_REASON_CLOSED;
+        return Atoms._drop;
     }
 
     assert(match != &sentinel_match_success);
@@ -1213,18 +1322,18 @@ static ERL_NIF_TERM ask_batch_offset(ask_ctx_t* ctx, batch_t* batch, offset_t of
         if (match_demonitor(ctx->env, match)) {
             out->opposite_match = match;
             out->consume_slot = true;
-            return Atoms._matched;
+            return Atoms._match;
         }
         else {
             // Too late, opposite monitor triggered or cancelled
-            return Atoms._cancelled;
+            return Atoms._retry;
         }
     }
 
     // Cancelled
 
-    assert(match == &sentinel_match_cancelled);
-    return Atoms._cancelled;
+    assert(match == &sentinel_match_cancelled || match == &sentinel_match_closed);
+    return Atoms._retry;
 }
 
 //
@@ -1256,6 +1365,7 @@ static match_t* ask_prepare_our_match(ask_ctx_t* ctx, batch_id_t batch_id, offse
     LOG("[%T] [ask_prepare_our_match] Grabbing new match from local state", ctx->self_term);
     match_t* match = mempool_get(&local_state->match_pool, NULL);
     assert(match != NULL);
+    LOG("[%T] match addr: %p", ctx->self_term, match);
 
     match->enqueue_ts = ctx->enqueue_ts;
     match->pid = ctx->self;
@@ -1423,7 +1533,8 @@ static void tag_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMon
         }
         else {
             LOG("[match DOWN %T] Too late to cancel match", pid_term);
-            assert((match == &sentinel_match_cancelled) || (match == &sentinel_match_success));
+            assert((match == &sentinel_match_cancelled) || (match == &sentinel_match_closed) ||
+                   (match == &sentinel_match_success));
         }
 
         if (lease.batch != NULL && !lease.found_locally) {
@@ -1503,13 +1614,16 @@ static void broker_cancel_all_batch_cells(ErlNifEnv* env, broker_t* broker,
         if (match == &sentinel_match_cancelled || match == &sentinel_match_success) {
             continue;
         }
-        else if (atomic_compare_exchange_strong(cell, &match, &sentinel_match_cancelled)) {
+
+        assert(match != &sentinel_match_closed);
+
+        if (atomic_compare_exchange_strong(cell, &match, &sentinel_match_closed)) {
             if (match != NULL) {
                 tag_t* tag = (tag_t*)match->tag;
                 assert(tag != NULL);
 
                 if (enif_demonitor_process(env, tag, &tag->mon) == 0) {
-                    notify_of_cancellation(env, match, true);
+                    notify_of_cancellation(env, match, DROP_REASON_CLOSED);
                     tag->match = NULL;
 
                     enif_free_env(match->env);
@@ -1574,7 +1688,9 @@ static void broker_checkin_many_batches(broker_t* broker, lease_t** array_ptr,
 
     for (size_t i = 0; i < nr_of_batches; i++) {
         lease_t* lease = &array[i];
-        lease_ref_count_dec(lease);
+        if (!lease->found_locally) {
+            lease_ref_count_dec(lease);
+        }
     }
 
     enif_free(array);
@@ -1628,7 +1744,7 @@ static void broker_dtor_cb_global_batch(batch_id_t key, void* obj, void* ctx)
         cell_t* cell = &batch->cells[i];
         match_t* match = atomic_load(cell);
         assert(match == NULL || match == &sentinel_match_cancelled ||
-               match == &sentinel_match_success);
+               match == &sentinel_match_closed || match == &sentinel_match_success);
     }
 
     enif_free(batch);
@@ -1639,7 +1755,6 @@ static void broker_dtor_cb_global_batch(batch_id_t key, void* obj, void* ctx)
 static void broker_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon)
 {
     broker_t* broker = (broker_t*)obj;
-    ERL_NIF_TERM broker_term = enif_make_resource(caller_env, broker);
 
     if (!broker->opts.depends_on_creator) {
         return;
@@ -1655,10 +1770,20 @@ static void broker_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNif
 
     //
 
+    ERL_NIF_TERM broker_term = enif_make_resource(caller_env, broker);
+
     for (size_t i = 0; i < nr_of_batches; i++) {
         lease_t* lease = &leases[i];
         batch_t* batch = lease->batch;
         broker_cancel_all_batch_cells(caller_env, broker, broker_term, local_state, batch, true);
+
+        if (lease->found_locally) {
+            batch_t* taken_batch = NULL;
+            cbroker_omap_take(local_state->batches, batch->id, (void**)&taken_batch);
+            assert(taken_batch != NULL);
+            assert(taken_batch == batch);
+            lease->found_locally = false;
+        }
     }
 
     //
@@ -1757,8 +1882,6 @@ static bool lease_consume_slot(lease_t* lease)
         return false;
     }
     else {
-        // assert(consumed_count == batch->nr_of_cells); // no longer true due to
-        // broker_cancel_all_batch_cells()
         lease_ref_count_dec(lease);
         return true;
     }
@@ -1810,15 +1933,26 @@ static void notify_self_of_match(ask_ctx_t* ctx, ERL_NIF_TERM our_tag, match_t* 
     either_notify_or_assert_not_alive(ctx->env, &ctx->self, NULL, msg);
 }
 
-static void notify_of_cancellation(ErlNifEnv* env, match_t* match, bool did_broker_close)
+static void notify_of_cancellation(ErlNifEnv* env, match_t* match, const drop_reason_t reason)
 {
     assert(match->tag != NULL);
 
     ERL_NIF_TERM tag = enif_make_resource(env, match->tag);
     int64_t sojourn_time = monotonic_ts() - match->enqueue_ts;
-    ERL_NIF_TERM cancelled = make_cancelled(env, did_broker_close, sojourn_time);
+    ERL_NIF_TERM cancelled = make_drop(env, reason, sojourn_time);
     ERL_NIF_TERM msg = enif_make_tuple2(env, tag, cancelled);
     either_notify_or_assert_not_alive(env, &match->pid, NULL, msg);
+}
+
+static ERL_NIF_TERM notify_of_faux_cancellation(ask_ctx_t* ctx, const drop_reason_t reason)
+{
+    ErlNifEnv* env = ctx->env;
+    int64_t sojourn_time = monotonic_ts() - ctx->enqueue_ts;
+    ERL_NIF_TERM faux_tag = enif_make_ref(env);
+    ERL_NIF_TERM cancelled = make_drop(env, reason, sojourn_time);
+    ERL_NIF_TERM msg = enif_make_tuple2(env, faux_tag, cancelled);
+    either_notify_or_assert_not_alive(env, &ctx->self, NULL, msg);
+    return faux_tag;
 }
 
 //
@@ -1888,6 +2022,9 @@ static ERL_NIF_TERM batch_to_term(ErlNifEnv* env, const batch_t* batch)
         }
         else if (match == &sentinel_match_cancelled) {
             cell_terms[i] = Atoms._cancelled;
+        }
+        else if (match == &sentinel_match_closed) {
+            cell_terms[i] = Atoms._broker_closed;
         }
         else if (match == &sentinel_match_success) {
             cell_terms[i] = Atoms._matched;
@@ -2255,10 +2392,38 @@ static ERL_NIF_TERM make_badopt(ErlNifEnv* env, ERL_NIF_TERM term)
     return raise_tuple2(env, Atoms._badopt, term);
 }
 
-static ERL_NIF_TERM make_cancelled(ErlNifEnv* env, bool did_broker_close, int64_t sojourn_time)
+static ERL_NIF_TERM make_cancelled(ErlNifEnv* env, const int64_t sojourn_time)
 {
-    ERL_NIF_TERM name = (did_broker_close ? Atoms._stopped : Atoms._cancelled);
-    return enif_make_tuple2(env, name, enif_make_int64(env, sojourn_time));
+    return enif_make_tuple2(env, Atoms._cancelled, enif_make_int64(env, sojourn_time));
+}
+
+static ERL_NIF_TERM make_drop(ErlNifEnv* env, const drop_reason_t reason, int64_t sojourn_time)
+{
+    ERL_NIF_TERM reason_term = make_drop_reason(env, reason);
+    return enif_make_tuple3(env, Atoms._drop, reason_term, enif_make_int64(env, sojourn_time));
+}
+
+static ERL_NIF_TERM make_drop_reason(ErlNifEnv* env, const drop_reason_t reason)
+{
+    switch (reason) {
+    case DROP_REASON_CANCELLED:
+        return Atoms._cancelled;
+
+    case DROP_REASON_NON_BLOCKING:
+        return Atoms._match_unavailable;
+
+    case DROP_REASON_TOO_MANY_RETRIES:
+        return Atoms._broker_overloaded;
+
+    default:
+        assert(reason == DROP_REASON_CLOSED);
+        return Atoms._broker_closed;
+    }
+}
+
+static ERL_NIF_TERM make_error(ErlNifEnv* env, ERL_NIF_TERM reason)
+{
+    return enif_make_tuple2(env, Atoms._error, reason);
 }
 
 static ERL_NIF_TERM make_match(ErlNifEnv* env, ERL_NIF_TERM match_ref, ERL_NIF_TERM offer,
@@ -2316,7 +2481,7 @@ static inline void consume_timeslice(ErlNifEnv* env, const size_t copied_bytes)
     }
 }
 
-static ErlNifTime monotonic_ts() { return enif_monotonic_time(ERL_NIF_USEC); }
+static ErlNifTime monotonic_ts() { return enif_monotonic_time(ERL_NIF_NSEC); }
 
 static unsigned ceil_log2(size_t value)
 {

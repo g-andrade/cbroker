@@ -1,80 +1,54 @@
-%% @copyright 2026 Guilherme Andrade
-%%
-%% Permission is hereby granted, free of charge, to any person obtaining a
-%% copy  of this software and associated documentation files (the "Software"),
-%% to deal in the Software without restriction, including without limitation
-%% the rights to use, copy, modify, merge, publish, distribute, sublicense,
-%% and/or sell copies of the Software, and to permit persons to whom the
-%% Software is furnished to do so, subject to the following conditions:
-%%
-%% The above copyright notice and this permission notice shall be included in
-%% all copies or substantial portions of the Software.
-%%
-%% THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-%% IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-%% FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-%% AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-%% LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-%% FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-%% DEALINGS IN THE SOFTWARE.
-
 -module(cbroker).
 
--ifdef(E48).
--moduledoc "FIXME: one-line summary of the `cbroker` public API.".
--endif.
-
--include("src/cbroker_shared_state.hrl").
+-on_load(init/0).
 
 %% ------------------------------------------------------------------
 %% API Function Exports
 %% ------------------------------------------------------------------
 
 -export([
+    ask/2,
+    ask/3,
+    ask/4,
+    %
+    async_ask/2,
+    async_ask/3,
+    %
+    await/1,
+    await/2,
+    %
+    cancel/1,
+    %
+    child_spec/1,
+    child_spec/2,
+    %
+    debug_info/1,
+    %
+    dynamic_ask/2,
+    dynamic_ask/3,
+    %
+    nb_ask/2,
+    nb_ask/3,
+    %
     new/0,
     new/1,
     %
-    ask/1,
-    ask/2,
-    ask/3,
-    ask_r/1,
-    ask_r/2,
-    ask_r/3,
+    resolve_name/1,
     %
-    async_ask/1,
-    async_ask/2,
-    async_ask_r/1,
-    async_ask_r/2,
+    resumable_ask/2,
+    resumable_ask/3,
+    resumable_ask/4,
     %
-    to_list/1,
-    %
-    bench1/4
-]).
-
--ignore_xref([
-    new/0,
-    new/1,
-    %
-    ask/1,
-    ask/2,
-    ask/3,
-    ask_r/1,
-    ask_r/2,
-    ask_r/3,
-    %
-    async_ask/1,
-    async_ask/2,
-    async_ask_r/1,
-    async_ask_r/2,
-    %
-    to_list/1,
-    %
-    bench1/4
+    resumable_await/1,
+    resumable_await/2
 ]).
 
 %% ------------------------------------------------------------------
 %% Macro Definitions
 %% ------------------------------------------------------------------
+
+-define(APPNAME, cbroker).
+-define(LIBNAME, cbroker).
 
 -define(DEFAULT_TIMEOUT, 5_000).
 
@@ -82,451 +56,479 @@
 %% Type Definitions
 %% ------------------------------------------------------------------
 
--record(proc_stats, {
-    samples :: [term()]
-}).
+-type broker() :: broker_name() | broker_ref().
+-export_type([broker/0]).
+
+-type broker_name() :: (atom() | {global, term()} | {via, module(), term()}).
+-export_type([broker_name/0]).
+
+-opaque broker_ref() :: reference().
+-export_type([broker_ref/0]).
+
+-type broker_opt() ::
+    (boolean_opt(depends_on_creator)).
+-export_type([broker_opt/0]).
+
+-type boolean_opt(Name) :: Name | {Name, boolean()}.
+-export_type([boolean_opt/1]).
+
+-type side() :: left | right.
+-export_type([side/0]).
+
+-type tag() :: reference().
+-export_type([tag/0]).
+
+-type drop_reason() ::
+    (match_unavailable
+    | broker_overloaded
+    | broker_closed
+    | Other :: term()).
+-export_type([drop_reason/0]).
 
 %% ------------------------------------------------------------------
 %% API Function Definitions
 %% ------------------------------------------------------------------
 
-% Documented public API functions follow the pattern below. Doc attributes are
-% guarded by `-ifdef(E48)` so the source still compiles on OTP < 27, which lacks
-% EEP-48 `-doc`/`-moduledoc`. Hide internals with `-doc false` / `-moduledoc
-% false` (NOT `@private`, which ex_doc ignores). A public function that isn't
-% called internally needs `-ignore_xref/1` to satisfy the `exports_not_used`
-% xref check.
-%
-%     -export([add/2]).
-%     -ignore_xref([add/2]).
-%
-%     -ifdef(E48).
-%     -doc "Adds two integers.".
-%     -endif.
-%     -spec add(integer(), integer()) -> integer().
-%     add(A, B) ->
-%         A + B.
+-spec ask(Broker, Side) ->
+    {match, MatchRef, CounterOffer, SojournTime}
+    | {drop, DropReason, SojournTime}
+when
+    Broker :: broker(),
+    Side :: side(),
+    MatchRef :: reference(),
+    CounterOffer :: term(),
+    DropReason :: timeout | drop_reason(),
+    SojournTime :: non_neg_integer().
 
-new() ->
-    cbroker_nif:new().
-
-new(Opts) ->
-    cbroker_nif:new(Opts).
-
-ask(Name) ->
-    ask(Name, self()).
-
-ask(Name, Value) ->
-    ask(Name, Value, ?DEFAULT_TIMEOUT).
-
-ask(Name, Value, Timeout) ->
-    ask_side(Name, left, Value, Timeout).
-
-ask_r(Name) ->
-    ask_r(Name, self()).
-
-ask_r(Name, Value) ->
-    ask_r(Name, Value, ?DEFAULT_TIMEOUT).
-
-ask_r(Name, Value, Timeout) ->
-    ask_side(Name, right, Value, Timeout).
+ask(Broker, Side) ->
+    ask(Broker, Side, self()).
 
 %%
 
-async_ask(Name) ->
-    async_ask(Name, self()).
+-spec ask(Broker, Side, Offer) ->
+    {match, MatchRef, CounterOffer, SojournTime}
+    | {drop, DropReason, SojournTime}
+when
+    Broker :: broker(),
+    Side :: side(),
+    Offer :: term(),
+    MatchRef :: reference(),
+    CounterOffer :: term(),
+    DropReason :: timeout | drop_reason(),
+    SojournTime :: non_neg_integer().
 
-async_ask(Name, Value) ->
-    async_ask_side(Name, left, Value).
+ask(Broker, Side, Offer) ->
+    ask(Broker, Side, Offer, ?DEFAULT_TIMEOUT).
 
-async_ask_r(Name) ->
-    async_ask_r(Name, self()).
+%%
 
-async_ask_r(Name, Value) ->
-    async_ask_side(Name, right, Value).
+-spec ask(Broker, Side, Offer, Timeout) ->
+    {match, MatchRef, CounterOffer, SojournTime}
+    | {drop, DropReason, SojournTime}
+when
+    Broker :: broker(),
+    Side :: side(),
+    Offer :: term(),
+    Timeout :: timeout(),
+    MatchRef :: reference(),
+    CounterOffer :: term(),
+    DropReason :: timeout | drop_reason(),
+    SojournTime :: non_neg_integer().
 
-to_list(Name) ->
-    case cbroker_serv:get_shared_state(Name) of
-        #shared_state{broker = Broker} ->
-            cbroker_nif:to_list(Broker)
+ask(Broker, Side, Offer, Timeout) ->
+    case dynamic_ask(Broker, Side, Offer) of
+        {await, Tag} ->
+            await(Tag, Timeout);
+        %
+        Result ->
+            Result
     end.
 
-%%%%%%%%%%%%%%%%%%%%%%%%
+%%
 
-bench1(Impl, ExchangeValueName, TotalIterations, TotalPidsAmount) ->
-    LeftFun = left_fun(Impl),
-    RightFun = right_fun(Impl),
+-spec async_ask(Broker, Side) -> {await, Tag} when
+    Broker :: broker(),
+    Side :: side(),
+    Tag :: term().
 
-    ExchangeValue = generate_exchange_value(ExchangeValueName),
-
-    true = (TotalPidsAmount >= 2),
-    LeftPidsAmount = TotalPidsAmount div 2,
-    RightPidsAmount = TotalPidsAmount - LeftPidsAmount,
-
-    LeftIterationsList = iterations_list(TotalIterations, LeftPidsAmount),
-    RightIterationsList = iterations_list(TotalIterations, RightPidsAmount),
-
-    LeftPids = launch_processes(LeftFun, ExchangeValue, LeftIterationsList),
-    RightPids = launch_processes(RightFun, ExchangeValue, RightIterationsList),
-
-    Pids = pids_join(LeftPids, RightPids),
-    PidSet = maps:from_keys(Pids, v),
-
-    lists:foreach(fun erlang:garbage_collect/1, processes()),
-    erlang:garbage_collect(),
-    %logger:notice("Starting..."),
-    StartTs = erlang:monotonic_time(),
-    processes_send(Pids, go),
-    receive_done(PidSet),
-    FinishTs = erlang:monotonic_time(),
-
-    logger:debug("Collecting stats!"),
-    timer:sleep(100),
-
-    processes_send(Pids, stats),
-    Samples = receive_results(PidSet),
-
-    TotalSamples = length(Samples),
-    GroupedSamples = maps:groups_from_list(fun sample_group/1, Samples),
-
-    SortedGroups = lists:keysort(
-        1, lists:map(fun group_with_sorting_key/1, maps:to_list(GroupedSamples))
-    ),
-
-    TotalDurationSecs =
-        round(
-            (FinishTs - StartTs) /
-                erlang:convert_time_unit(1, millisecond, native)
-        ) / 1000,
-
-    [
-        {total_duration_secs, TotalDurationSecs},
-        {delays_per_group,
-            lists:map(fun(Group) -> group_stats(Group, TotalSamples) end, SortedGroups)}
-    ].
-
-iterations_list(TotalIterations, PidsAmount) ->
-    Base = TotalIterations div PidsAmount,
-    Rem = TotalIterations rem PidsAmount,
-    true = Base >= 1,
-    [
-        Base +
-            (if
-                I =< Rem -> 1;
-                true -> 0
-            end)
-     || I <- lists:seq(1, PidsAmount)
-    ].
-
-sample_group({blocked, _}) ->
-    blocked;
-sample_group({instant, _, _}) ->
-    instant;
-sample_group({instant, _}) ->
-    instant;
-sample_group({retried, RetryCount, _}) ->
-    {retried, RetryCount}.
-
-group_with_sorting_key({GroupKey, _} = Pair) ->
-    {group_sorting_key(GroupKey), Pair}.
-
-group_sorting_key(instant) ->
-    [1];
-group_sorting_key({retried, RetryCount}) ->
-    [2, RetryCount];
-group_sorting_key(blocked) ->
-    [3].
-
-group_stats({_SortingKey, {GroupKey, Samples}}, TotalSamples) ->
-    Delays = lists:map(fun last_element/1, Samples),
-    Count = length(Delays),
-    PercentageOfTotal = round(1000 * Count / TotalSamples) / 10,
-
-    Bag = xb5_bag:from_list(Delays),
-
-    Stats = [
-        {percentage, PercentageOfTotal},
-        {average, native_to_us(lists:sum(Delays) / Count)},
-        {percentiles, [
-            {median, percentile_us(0.50, Bag)},
-            {p95, percentile_us(0.95, Bag)},
-            {p99, percentile_us(0.99, Bag)}
-        ]}
-    ],
-
-    {GroupKey, Stats}.
-
-last_element(Tuple) ->
-    Size = tuple_size(Tuple),
-    element(Size, Tuple).
-
-percentile_us(Percentile, Bag) ->
-    {value, Value} = xb5_bag:percentile(Percentile, Bag),
-    native_to_us(Value).
-
-%    DelaysBag = xb5_bag:from_list(Delays),
-%    RpsList = rps_list(StartTss),
-%    RpsBag = xb5_bag:from_list(RpsList),
-
-%    [
-%     {rps, [
-%        {average, floor(lists:sum(RpsList) / length(RpsList))},
-%        {percentiles, [
-%           {median, floor(element(2, xb5_bag:percentile(0.50, RpsBag)))},
-%           {p95, floor(element(2, xb5_bag:percentile(0.95, RpsBag)))},
-%           {p99, floor(element(2, xb5_bag:percentile(0.99, RpsBag)))}
-%        ]}
-%     ]},
-%     {delays, [
-%        {average, native_to_us(lists:sum(Delays) / length(Delays))},
-%        {percentiles, [
-%           {median, native_to_us(xb5_bag:percentile(0.50, DelaysBag))},
-%           {p95, native_to_us(xb5_bag:percentile(0.95, DelaysBag))},
-%           {p99, native_to_us(xb5_bag:percentile(0.99, DelaysBag))}
-%        ]}
-%     ]}
-%    ].
-
-generate_exchange_value(smallest) ->
-    self();
-generate_exchange_value(tuple128) ->
-    L = lists:seq(1, 128),
-    list_to_tuple(L);
-generate_exchange_value(tuple1024) ->
-    L = lists:seq(1, 1024),
-    list_to_tuple(L);
-generate_exchange_value(tuple10_000) ->
-    L = lists:seq(1, 10_000),
-    list_to_tuple(L).
-
-native_to_us({value, Value}) ->
-    native_to_us(Value);
-native_to_us(Interval) when is_number(Interval) ->
-    round(Interval / erlang:convert_time_unit(1, microsecond, native)).
+async_ask(Broker, Side) ->
+    async_ask(Broker, Side, self()).
 
 %%
 
-%rps_list(StartTss) ->
-%    Bag = xb5_bag:from_list(StartTss),
-%    Sorted = lists:usort(xb5_bag:to_list(Bag)),
-%    rps_list_recur(Sorted, Bag).
-%
-%rps_list_recur([WindowEnd | Next], Bag) ->
-%    WindowStart = WindowEnd - erlang:convert_time_unit(1, second, native),
-%
-%    case xb5_bag:larger(WindowStart, Bag) of
-%        {found, StartTs} ->
-%            case WindowEnd - StartTs of
-%                0 ->
-%                    rps_list_recur(Next, Bag);
-%                %
-%                Duration ->
-%                    {rank, StartRank} = xb5_bag:rank(StartTs, Bag),
-%                    {rank, EndRank} = xb5_bag:rank(WindowEnd, Bag),
-%                    InstantRps = (EndRank - StartRank + 1) / (Duration / erlang:convert_time_unit(1, second, native)),
-%                    [InstantRps | rps_list_recur(Next, Bag)]
-%            end;
-%        %
-%        none ->
-%            rps_list_recur(Next, Bag)
-%    end;
-%rps_list_recur([], _) ->
-%    [].
+-spec async_ask(Broker, Side, Offer) -> {await, Tag} when
+    Broker :: broker(),
+    Side :: side(),
+    Offer :: term(),
+    Tag :: term().
+
+async_ask(Broker, Side, Offer) ->
+    BrokerRef = resolve_broker(Broker),
+    {await, _} = do_ask(BrokerRef, Side, Offer, async).
 
 %%
 
-left_fun(simple) ->
-    fun simple_left_iteration/1;
-left_fun(cbroker) ->
-    fun cbroker_left_iteration/1.
+-spec await(Tag) ->
+    {match, MatchRef, CounterOffer, SojournTime}
+    | {drop, DropReason, SojournTime}
+when
+    Tag :: tag(),
+    MatchRef :: reference(),
+    CounterOffer :: term(),
+    DropReason :: timeout | drop_reason(),
+    SojournTime :: non_neg_integer().
 
-right_fun(simple) ->
-    fun simple_right_iteration/1;
-right_fun(cbroker) ->
-    fun cbroker_right_iteration/1.
+await(Tag) ->
+    await(Tag, ?DEFAULT_TIMEOUT).
 
 %%
 
-simple_left_iteration(ExchangeValue) ->
-    simple_iteration(left, ExchangeValue).
+-spec await(Tag, Timeout) ->
+    {match, MatchRef, CounterOffer, SojournTime}
+    | {drop, DropReason, SojournTime}
+when
+    Tag :: tag(),
+    Timeout :: timeout(),
+    MatchRef :: reference(),
+    CounterOffer :: term(),
+    DropReason :: timeout | drop_reason(),
+    SojournTime :: non_neg_integer().
 
-simple_right_iteration(ExchangeValue) ->
-    simple_iteration(right, ExchangeValue).
-
-simple_iteration(Side, ExchangeValue) ->
-    StartTs = erlang:monotonic_time(),
-    {await, Pid, Tag} = cbroker_simple:async_ask(Side, self(), ExchangeValue),
-
+await(Tag, Timeout) ->
     receive
         {Ref, Reply} when Ref =:= Tag ->
-            FinalTs = erlang:monotonic_time(),
-            {match, _MatchRef, _, _} = Reply,
-            {blocked, FinalTs - StartTs};
-        %
-        {'DOWN', Ref, _, _, Reason} when Ref =:= Tag ->
-            exit({queue_down, Pid, Reason})
-    end.
-
-%%
-
-cbroker_left_iteration(ExchangeValue) ->
-    cbroker_iteration(left, ExchangeValue).
-
-cbroker_right_iteration(ExchangeValue) ->
-    cbroker_iteration(right, ExchangeValue).
-
-cbroker_iteration(Side, ExchangeValue) ->
-    StartTs = erlang:monotonic_time(),
-
-    case cbroker_serv:get_shared_state(test) of
-        #shared_state{broker = Broker} ->
-            cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, 0)
-    end.
-
-cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
-    case cbroker_nif:ask(Broker, Side, ExchangeValue) of
-        {await, Tag} ->
-            cbroker_iteration_await(StartTs, Tag);
-        %
-        {match, _, _, Sojourn} ->
-            FinalTs = erlang:monotonic_time(),
-
-            case RetryCount of
-                0 ->
-                    {instant, FinalTs - StartTs};
-                _ ->
-                    {retried, RetryCount, FinalTs - StartTs}
-            end;
-        %
-        retry ->
-            cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount + 1)
-    end.
-
-cbroker_iteration_await(StartTs, Tag) ->
-    receive
-        {T, Result} when T =:= Tag ->
-            FinalTs = erlang:monotonic_time(),
-            {match, _, _, _} = Result,
-            {blocked, FinalTs - StartTs}
-    end.
-
-%%
-
-receive_done(PidSet) when map_size(PidSet) > 0 ->
-    receive
-        {done, Pid} when is_map_key(Pid, PidSet) ->
-            RemainingPidSet = maps:remove(Pid, PidSet),
-            receive_done(RemainingPidSet)
-    end;
-receive_done(#{}) ->
-    ok.
-
-receive_results(PidSet) when map_size(PidSet) > 0 ->
-    receive
-        {finished, Pid, Stats} when is_map_key(Pid, PidSet) ->
-            RemainingPidSet = maps:remove(Pid, PidSet),
-            #proc_stats{samples = Samples} = Stats,
-            Samples ++ receive_results(RemainingPidSet)
-    end;
-receive_results(#{}) ->
-    [].
-
-pids_join([LeftPid | NextLeft], [RightPid | NextRight]) ->
-    [LeftPid, RightPid | pids_join(NextLeft, NextRight)];
-pids_join([], Right) ->
-    Right;
-pids_join(Left, []) ->
-    Left.
-
-processes_send([Pid | Next], Msg) ->
-    Pid ! Msg,
-    processes_send(Next, Msg);
-processes_send([], _) ->
-    ok.
-
-launch_processes(RunFun, ExchangeValue, [Iterations | Next]) ->
-    Parent = self(),
-    [
-        spawn_link(fun() -> start_process(Parent, RunFun, ExchangeValue, Iterations) end)
-        | launch_processes(RunFun, ExchangeValue, Next)
-    ];
-launch_processes(_, _, []) ->
-    [].
-
-start_process(Parent, RunFun, ExchangeValue, Iterations) ->
-    receive
-        go ->
-            erlang:yield(),
-            Samples = run_process(RunFun, ExchangeValue, Iterations),
-            _ = Parent ! {done, self()},
-
-            receive
-                stats ->
-                    Stats = #proc_stats{
-                        samples = Samples
-                    },
-                    _ = Parent ! {finished, self(), Stats},
-                    exit(normal)
-            end
-    end.
-
-run_process(RunFun, ExchangeValue, Iterations) when Iterations > 0 ->
-    Timestamps = RunFun(ExchangeValue),
-    [Timestamps | run_process(RunFun, ExchangeValue, Iterations - 1)];
-run_process(_, _, 0) ->
-    [].
-
-%% ------------------------------------------------------------------
-%% Internal Function Definitions
-%% ------------------------------------------------------------------
-
-ask_side(Name, Side, Value, Timeout) ->
-    case cbroker_serv:get_shared_state(Name) of
-        #shared_state{broker = Broker} ->
-            %
-            case cbroker_nif:ask(Broker, Side, Value) of
-                {await, Tag} ->
-                    await_after_ask(Broker, Tag, Timeout);
-                %
-                {match, _, _, _} = Match ->
-                    Match;
-                %
-                retry ->
-                    ask_side(Name, Side, Value, Timeout)
-            end;
-        %
-        none ->
-            not_running
-    end.
-
-await_after_ask(Broker, Tag, Timeout) ->
-    receive
-        {T, Result} when T =:= Tag ->
-            Result
+            Reply
     after Timeout ->
-        case cbroker_nif:cancel(Tag) of
-            cancelled ->
-                timeout;
+        case cancel(Tag) of
+            {cancelled, SojournTime} ->
+                {drop, timeout, SojournTime};
             %
-            too_late ->
-                receive
-                    {T, Result} when T =:= Tag ->
-                        Result
-                end
+            Reply ->
+                Reply
         end
     end.
 
-async_ask_side(Name, Side, Value) ->
-    case cbroker_serv:get_shared_state(Name) of
-        #shared_state{broker = Broker} ->
-            case cbroker_nif:ask(Broker, Side, Value, async) of
-                retry ->
-                    async_ask_side(Name, Side, Value);
+%%
+
+-spec cancel(Tag) ->
+    {match, MatchRef, CounterOffer, SojournTime}
+    | {cancelled, SojournTime}
+when
+    Tag :: tag(),
+    MatchRef :: reference(),
+    CounterOffer :: term(),
+    SojournTime :: non_neg_integer().
+
+cancel(Tag) ->
+    case nif_cancel(Tag) of
+        too_late ->
+            %
+            case await(Tag, infinity) of
+                {drop, _, SojournTime} ->
+                    {cancelled, SojournTime};
+                %
+                Match ->
+                    Match
+            end;
+        %
+        Cancelled ->
+            Cancelled
+    end.
+
+%%
+
+-spec child_spec(RegName) -> supervisor:child_spec() when
+    RegName :: {local, atom()} | {global, term()} | {via, module(), term()}.
+
+child_spec(Name) ->
+    child_spec(Name, []).
+
+%%
+
+-spec child_spec(RegName, Opts) -> supervisor:child_spec() when
+    RegName :: {local, atom()} | {global, term()} | {via, module(), term()},
+    Opts :: [broker_opt()].
+
+child_spec(Name, Opts) ->
+    cbroker_persistent:child_spec(Name, Opts).
+
+%%
+
+-spec debug_info(Broker) -> term() when
+    Broker :: broker().
+
+debug_info(Broker) ->
+    BrokerRef = resolve_broker(Broker),
+    nif_debug_info(BrokerRef).
+
+%%
+
+-spec dynamic_ask(Broker, Side) ->
+    {await, Tag}
+    | {match, MatchRef, CounterOffer, SojournTime}
+    | {drop, DropReason, SojournTime}
+when
+    Broker :: broker(),
+    Side :: side(),
+    Tag :: tag(),
+    MatchRef :: reference(),
+    CounterOffer :: term(),
+    DropReason :: drop_reason(),
+    SojournTime :: non_neg_integer().
+
+dynamic_ask(Broker, Side) ->
+    dynamic_ask(Broker, Side, self()).
+
+%%
+
+-spec dynamic_ask(Broker, Side, Offer) ->
+    {await, Tag}
+    | {match, MatchRef, CounterOffer, SojournTime}
+    | {drop, DropReason, SojournTime}
+when
+    Broker :: broker(),
+    Side :: side(),
+    Offer :: term(),
+    Tag :: tag(),
+    MatchRef :: reference(),
+    CounterOffer :: term(),
+    DropReason :: drop_reason(),
+    SojournTime :: non_neg_integer().
+
+dynamic_ask(Broker, Side, Offer) ->
+    BrokerRef = resolve_broker(Broker),
+    do_ask(BrokerRef, Side, Offer, dynamic).
+
+%%
+
+-spec nb_ask(Broker, Side) ->
+    {match, MatchRef, CounterOffer, SojournTime}
+    | {drop, DropReason, SojournTime}
+when
+    Broker :: broker(),
+    Side :: side(),
+    MatchRef :: reference(),
+    CounterOffer :: term(),
+    DropReason :: drop_reason(),
+    SojournTime :: non_neg_integer().
+
+nb_ask(Broker, Side) ->
+    nb_ask(Broker, Side, self()).
+
+-spec nb_ask(Broker, Side, Offer) ->
+    {match, MatchRef, CounterOffer, SojournTime}
+    | {drop, DropReason, SojournTime}
+when
+    Broker :: broker(),
+    Side :: side(),
+    Offer :: term(),
+    MatchRef :: reference(),
+    CounterOffer :: term(),
+    DropReason :: drop_reason(),
+    SojournTime :: non_neg_integer().
+
+nb_ask(Broker, Side, Offer) ->
+    BrokerRef = resolve_broker(Broker),
+    do_ask(BrokerRef, Side, Offer, non_blocking).
+
+%%
+
+-spec new() -> Broker when
+    Broker :: broker_ref().
+
+new() ->
+    not_loaded(?LINE).
+
+%%
+
+-spec new(Opts) -> Broker when
+    Opts :: [broker_opt()],
+    Broker :: broker_ref().
+
+new(_Opts) ->
+    not_loaded(?LINE).
+
+%%
+
+-spec resolve_name(BrokerName) -> BrokerRef when
+    BrokerName :: broker_name(),
+    BrokerRef :: broker_ref().
+
+resolve_name(BrokerName) ->
+    cbroker_persistent:get(BrokerName).
+
+%%
+
+-spec resumable_ask(Broker, Side) ->
+    {match, MatchRef, CounterOffer, SojournTime}
+    | {drop, DropReason, SojournTime}
+    | {timeout, Tag}
+when
+    Broker :: broker(),
+    Side :: side(),
+    MatchRef :: reference(),
+    CounterOffer :: term(),
+    SojournTime :: non_neg_integer(),
+    DropReason :: drop_reason(),
+    Tag :: tag().
+
+resumable_ask(Broker, Side) ->
+    resumable_ask(Broker, Side, self()).
+
+%%
+
+-spec resumable_ask(Broker, Side, Offer) ->
+    {match, MatchRef, CounterOffer, SojournTime}
+    | {drop, DropReason, SojournTime}
+    | {timeout, Tag}
+when
+    Broker :: broker(),
+    Side :: side(),
+    Offer :: term(),
+    MatchRef :: reference(),
+    CounterOffer :: term(),
+    SojournTime :: non_neg_integer(),
+    DropReason :: drop_reason(),
+    Tag :: tag().
+
+resumable_ask(Broker, Side, Offer) ->
+    resumable_ask(Broker, Side, Offer, ?DEFAULT_TIMEOUT).
+
+%%
+
+-spec resumable_ask(Broker, Side, Offer, Timeout) ->
+    {match, MatchRef, CounterOffer, SojournTime}
+    | {drop, DropReason, SojournTime}
+    | {timeout, Tag}
+when
+    Broker :: broker(),
+    Side :: side(),
+    Offer :: term(),
+    Timeout :: timeout(),
+    MatchRef :: reference(),
+    CounterOffer :: term(),
+    SojournTime :: non_neg_integer(),
+    DropReason :: drop_reason(),
+    Tag :: tag().
+
+resumable_ask(Broker, Side, Offer, Timeout) ->
+    case dynamic_ask(Broker, Side, Offer) of
+        {await, Tag} ->
+            case resumable_await(Tag, Timeout) of
+                timeout ->
+                    {timeout, Timeout};
                 %
                 Result ->
                     Result
             end;
         %
-        none ->
-            not_running
+        Result ->
+            Result
     end.
+
+%%
+
+-spec resumable_await(Tag) ->
+    {match, MatchRef, CounterOffer, SojournTime}
+    | {drop, DropReason, SojournTime}
+    | timeout
+when
+    Tag :: tag(),
+    MatchRef :: reference(),
+    CounterOffer :: term(),
+    DropReason :: drop_reason(),
+    SojournTime :: non_neg_integer().
+
+resumable_await(Tag) ->
+    resumable_await(Tag, ?DEFAULT_TIMEOUT).
+
+%%
+
+-spec resumable_await(Tag, Timeout) ->
+    {match, MatchRef, CounterOffer, SojournTime}
+    | {drop, DropReason, SojournTime}
+    | timeout
+when
+    Tag :: tag(),
+    Timeout :: timeout(),
+    MatchRef :: reference(),
+    CounterOffer :: term(),
+    DropReason :: drop_reason(),
+    SojournTime :: non_neg_integer().
+
+resumable_await(Tag, Timeout) ->
+    receive
+        {T, Reply} when T =:= Tag ->
+            Reply
+    after Timeout ->
+        timeout
+    end.
+
+%% ------------------------------------------------------------------
+%% Internal Function Definitions
+%% ------------------------------------------------------------------
+
+init() ->
+    SoName =
+        case code:priv_dir(?APPNAME) of
+            {error, bad_name} ->
+                case filelib:is_dir(filename:join(["..", priv])) of
+                    true ->
+                        filename:join(["..", priv, ?LIBNAME]);
+                    _ ->
+                        filename:join([priv, ?LIBNAME])
+                end;
+            Dir ->
+                filename:join(Dir, ?LIBNAME)
+        end,
+    erlang:load_nif(SoName, 0).
+
+%%
+
+do_ask(BrokerRef, Side, Offer, AskType) ->
+    OfferSizeArg = offer_size_arg(Offer),
+    EnqueueTs = erlang:monotonic_time(nanosecond),
+    RetryNr = 0,
+
+    case nif_ask(BrokerRef, Side, Offer, OfferSizeArg, AskType, EnqueueTs, RetryNr) of
+        {error, Reason} ->
+            error(Reason);
+        %
+        Result ->
+            Result
+    end.
+
+nif_ask(_BrokerRef, _Side, _Offer, _OffersizeArg, _AskType, _EnqueueTs, _RetryNr) ->
+    not_loaded(?LINE).
+
+-if(?OTP_RELEASE < 29).
+offer_size_arg(Value) ->
+    erts_debug:flat_size(Value).
+-else.
+offer_size_arg(_Value) ->
+    compute_from_nif.
+-endif.
+
+%%
+
+-spec nif_cancel(Tag) -> too_late | {cancelled, SojournTime} when
+    Tag :: tag(),
+    SojournTime :: non_neg_integer().
+
+nif_cancel(_Tag) ->
+    not_loaded(?LINE).
+
+%%
+
+nif_debug_info(_BrokerRef) ->
+    not_loaded(?LINE).
+
+%%
+
+not_loaded(Line) ->
+    erlang:nif_error({not_loaded, [{module, ?MODULE}, {line, Line}]}).
+
+resolve_broker(BrokerRef) when is_reference(BrokerRef) ->
+    BrokerRef;
+resolve_broker(BrokerName) ->
+    cbroker_persistent:get(BrokerName).
