@@ -245,7 +245,7 @@ cancel(Tag) ->
     case nif_cancel(Tag) of
         too_late ->
             %
-            case await(Tag, infinity) of
+            case resumable_await(Tag, infinity) of
                 {drop, _, SojournTime} ->
                     {cancelled, SojournTime};
                 %
