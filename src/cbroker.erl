@@ -225,8 +225,8 @@ await(Tag, Timeout) ->
             {cancelled, SojournTime} ->
                 {drop, timeout, SojournTime};
             %
-            Reply ->
-                Reply
+            {match, _, _, _} = Match ->
+                Match
         end
     end.
 
@@ -249,11 +249,11 @@ cancel(Tag) ->
                 {drop, _, SojournTime} ->
                     {cancelled, SojournTime};
                 %
-                Match ->
+                {match, _, _, _} = Match ->
                     Match
             end;
         %
-        Cancelled ->
+        {cancelled, _} = Cancelled ->
             Cancelled
     end.
 
@@ -539,8 +539,6 @@ offer_size_arg(_Value) ->
 
 nif_cancel(_Tag) ->
     not_loaded(?LINE).
-
-%%
 
 nif_debug_info(_BrokerRef) ->
     not_loaded(?LINE).
