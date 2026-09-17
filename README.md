@@ -11,7 +11,7 @@ applications.
 Rather than provide a single process that does that (commonly a `gen_server`),
 `cbroker` runs concurrently through NIF code that uses [C atomics](https://en.cppreference.com/c/header/stdatomic).
 
-It's inspired by [`sbroker`](https://hex.pm/packages/sbroker).
+It took inspiration from [`sbroker`](https://hex.pm/packages/sbroker).
 
 ## Usage
 
