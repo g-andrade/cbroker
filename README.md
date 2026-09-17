@@ -4,9 +4,9 @@
 [![](https://github.com/g-andrade/cbroker/actions/workflows/ci.yml/badge.svg)](https://github.com/g-andrade/cbroker/actions/workflows/ci.yml)
 [![Erlang Versions](https://img.shields.io/badge/Supported%20Erlang%2FOTP-24%20to%2029-blue)](https://www.erlang.org)
 
-cbroker provides brokers: known execution points through which BEAM processes
-can message each other. These are useful for worker pools and suchlike
-applications.
+cbroker provides brokers: shared execution paths through which BEAM processes
+can message each other. These are useful for producer-consumer problems like
+worker pools.
 
 Rather than provide a single process that does that (commonly a `gen_server`),
 `cbroker` runs concurrently through NIF code that uses [C atomics](https://en.cppreference.com/c/header/stdatomic).
