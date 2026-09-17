@@ -1966,7 +1966,7 @@ static void either_notify_or_assert_not_alive(ErlNifEnv* caller_env, ErlNifPid* 
         /* We assert that the recipient is no longer alive
          * to ensure we're not running from a dirty NIF.
          *
-         * Otherwise, the recipient could never be notified
+         * Otherwise, the recipient may never be notified
          * of a cancellation (or a match) after the caller
          * had been killed while running the NIF - which
          * would be Very Bad.
