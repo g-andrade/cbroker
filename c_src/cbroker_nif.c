@@ -58,7 +58,6 @@
     X(_drop,                  "drop") \
     X(_dynamic,               "dynamic") \
     X(_empty,                 "empty") \
-    X(_env_pool,              "env_pool") \
     X(_error,                 "error") \
     X(_false,                 "false") \
     X(_global_state,          "global_state") \
@@ -197,7 +196,6 @@ typedef struct {
     batch_id_t right_id;
     //
     mempool_t request_pool;
-    mempool_t env_pool;
     mempool_t tag_pool;
 } local_state_t;
 
@@ -421,11 +419,6 @@ static void tag_pool_init(mempool_t* pool);
 static void* tag_pool_cb_alloc(void*);
 static void tag_pool_cb_clear(void* obj);
 static void tag_pool_cb_free(void* obj);
-
-static void env_pool_init(mempool_t* pool);
-static void* env_pool_cb_alloc(void*);
-static void env_pool_cb_clear(void* obj);
-static void env_pool_cb_free(void* obj);
 
 //
 
@@ -679,7 +672,6 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     }
 
     ensure_one_entry_in_pool(&ctx.local_state->request_pool, NULL);
-    ensure_one_entry_in_pool(&ctx.local_state->env_pool, NULL);
     ensure_one_entry_in_pool(&ctx.local_state->tag_pool, NULL);
 
     ask_out_t out;
@@ -1027,7 +1019,6 @@ static void local_states_init(local_state_t local_states[], const size_t nr_of_s
 
         request_pool_init(&local_state->request_pool);
         tag_pool_init(&local_state->tag_pool);
-        env_pool_init(&local_state->env_pool);
     }
 }
 
@@ -1067,13 +1058,11 @@ static ERL_NIF_TERM local_states_to_term(ErlNifEnv* env, local_state_t local_sta
     for (size_t thread_id = 0; thread_id < nr_of_schedulers; thread_id++) {
         local_state_t* local_state = &local_states[thread_id];
 
-        ERL_NIF_TERM local_state_term = enif_make_list3(
+        ERL_NIF_TERM local_state_term = enif_make_list2(
             env,
             //
             enif_make_tuple2(env, Atoms._request_pool,
                              mempool_to_term(env, &local_state->request_pool)),
-            //
-            enif_make_tuple2(env, Atoms._env_pool, mempool_to_term(env, &local_state->env_pool)),
             //
             enif_make_tuple2(env, Atoms._tag_pool, mempool_to_term(env, &local_state->tag_pool)));
 
@@ -1367,7 +1356,6 @@ static request_t* ask_prepare_our_request(ask_ctx_t* ctx, batch_id_t batch_id, o
 
     request->enqueue_ts = ctx->enqueue_ts;
     request->pid = ctx->self;
-    request->env = mempool_get(&local_state->env_pool, NULL);
 
     LOG("[%T] [ask_prepare_our_request] Copying offer", ctx->self_term);
     request->offer = enif_make_copy(request->env, ctx->offer);
@@ -1431,10 +1419,6 @@ static void request_reclaim(request_t* request, bool tag_used, local_state_t* op
 {
     assert(request != NULL);
 
-    ErlNifEnv* env = request->env;
-    assert(env != NULL);
-    request->env = NULL;
-
     tag_t* tag = request->tag;
     assert(tag != NULL);
     assert(tag->request == request);
@@ -1443,7 +1427,6 @@ static void request_reclaim(request_t* request, bool tag_used, local_state_t* op
 
     if (opt_local_state != NULL) {
         mempool_return(&opt_local_state->request_pool, request);
-        mempool_return(&opt_local_state->env_pool, env);
 
         if (tag_used) {
             enif_release_resource(tag);
@@ -1453,8 +1436,8 @@ static void request_reclaim(request_t* request, bool tag_used, local_state_t* op
         }
     }
     else {
+        enif_free_env(request->env);
         enif_free(request);
-        enif_free_env(env);
         enif_release_resource(tag);
     }
 }
@@ -1478,13 +1461,9 @@ static void tag_dtor(ErlNifEnv* caller_env, void* obj)
 
     if (request != NULL) {
         ErlNifEnv* env = request->env;
+        assert(env != NULL);
 
-        if (env != NULL) {
-            enif_free_env(env);
-            request->env = NULL;
-        }
-
-        memset(request, 0, sizeof(request_t));
+        enif_free_env(env);
         enif_free(request);
         tag->request = NULL;
     }
@@ -1626,8 +1605,6 @@ static void broker_cancel_all_batch_cells(ErlNifEnv* env, broker_t* broker,
                     tag->request = NULL;
 
                     enif_free_env(request->env);
-                    request->env = NULL;
-                    request->tag = NULL;
                     enif_free(request);
                 }
                 enif_release_resource(tag);
@@ -1717,7 +1694,6 @@ static void broker_dtor(ErlNifEnv* caller_env, void* obj)
         local_state->batches = NULL;
 
         mempool_destroy(&local_state->request_pool);
-        mempool_destroy(&local_state->env_pool);
         mempool_destroy(&local_state->tag_pool);
     }
 
@@ -2133,16 +2109,30 @@ static void* request_pool_cb_alloc(void* ctx)
     assert(ctx == NULL);
     request_t* request = enif_alloc(sizeof(request_t));
     memset(request, 0, sizeof(request_t));
+    request->env = enif_alloc_env();
     return request;
 }
 
 static void request_pool_cb_clear(void* obj)
 {
     request_t* request = (request_t*)obj;
+    ErlNifEnv* env = request->env;
+    assert(env != NULL);
+
     memset(request, 0, sizeof(request_t));
+    enif_clear_env(env);
+    request->env = env;
 }
 
-static void request_pool_cb_free(void* obj) { enif_free(obj); }
+static void request_pool_cb_free(void* obj)
+{
+    request_t* request = (request_t*)obj;
+    ErlNifEnv* env = request->env;
+    assert(env != NULL);
+
+    enif_free_env(request->env);
+    enif_free(obj);
+}
 
 //
 
@@ -2172,29 +2162,6 @@ static void tag_pool_cb_clear(void* obj)
 static void tag_pool_cb_free(void* obj) { enif_release_resource(obj); }
 
 //
-
-static void env_pool_init(mempool_t* pool)
-{
-    memset(pool, 0, sizeof(mempool_t));
-    pool->alloc_cb = env_pool_cb_alloc;
-    pool->clear_cb = env_pool_cb_clear;
-    pool->free_cb = env_pool_cb_free;
-    mempool_init(pool, ENV_POOLS_INITIAL_COUNT, ENV_POOLS_SIZE, NULL);
-}
-
-static void* env_pool_cb_alloc(void* ctx)
-{
-    assert(ctx == NULL);
-    return enif_alloc_env();
-}
-
-static void env_pool_cb_clear(void* obj)
-{
-    ErlNifEnv* env = (ErlNifEnv*)obj;
-    enif_clear_env(env);
-}
-
-static void env_pool_cb_free(void* obj) { enif_free_env(obj); }
 
 /*********************************************************************/
 

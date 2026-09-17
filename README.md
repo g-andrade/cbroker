@@ -82,7 +82,7 @@ A local state contains:
 * a sorted collection of **batches** currently **checked-out** of the global state;
 * the batch ID of the left tail;
 * the batch ID of the right tail;
-* pools of free **requests**, environments (`ErlNifEnv`), and **tags**.
+* pools of free **requests** and **tags**.
 
 Like in global state, the collection of batches keeps at least one entry at all
 times.
