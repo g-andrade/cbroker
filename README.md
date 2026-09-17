@@ -4,18 +4,40 @@
 [![](https://github.com/g-andrade/cbroker/actions/workflows/ci.yml/badge.svg)](https://github.com/g-andrade/cbroker/actions/workflows/ci.yml)
 [![Erlang Versions](https://img.shields.io/badge/Supported%20Erlang%2FOTP-24%20to%2029-blue)](https://www.erlang.org)
 
-cbroker provides brokers: shared execution paths through which BEAM processes
-can message each other. These are useful for producer-consumer problems like
-worker pools.
+cbroker provides **brokers** for Erlang/OTP: shared execution paths through
+which processes can message each other. Brokers are useful for
+producer-consumer problems like worker pools.
 
-Rather than provide a single process that does that (commonly a `gen_server`),
-`cbroker` runs concurrently through NIF code that uses [C atomics](https://en.cppreference.com/c/header/stdatomic).
+Rather than provide a single process as the broker (commonly a `gen_server`),
+`cbroker` **runs concurrently** through NIF code that uses [C
+atomics](https://en.cppreference.com/c/header/stdatomic).
 
-It took inspiration from [`sbroker`](https://hex.pm/packages/sbroker).
+It reduces contention to a few atomic counters and critical sections spaced in
+time, allowing for the copying of messages between processes to happen
+concurrently.
+
+`cbroker` took inspiration from [`sbroker`](https://hex.pm/packages/sbroker).
 
 ## Usage
 
-TODO
+```erlang
+% 1> Broker = cbroker:new().
+#Ref<0.1273379340.4036100100.216922>
+
+% 2> {await, Tag} = cbroker:async_ask(Broker, left, {self(), consumer}).
+{await,#Ref<0.1273379340.4036100100.216931>}
+
+% 3> cbroker:ask(Broker, right, {self(), producer}).
+{match,#Ref<0.1273379340.4035969028.217112>,
+       {<0.345.0>,consumer},
+       11734}
+
+% 4> flush().
+% Shell got {#Ref<0.1273379340.4036100100.216931>,
+%            {match,#Ref<0.1273379340.4035969028.217112>,
+%                   {<0.345.0>,producer},
+%                   10459904224}}
+```
 
 ## Architecture
 
