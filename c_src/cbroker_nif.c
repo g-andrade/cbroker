@@ -182,6 +182,7 @@ typedef struct {
 //
 
 typedef struct {
+    ErlNifMutex* lock;
     atomic_bool is_closed;
     cbroker_omap_t* batches;
     mempool_t batch_pool;
@@ -218,7 +219,6 @@ typedef struct {
     unsigned tag_batch_shift;
     uint64_t tag_offset_mask;
     //
-    ErlNifMutex* global_lock;
     global_state_t global_state;
     //
     local_state_t local_states[];
@@ -599,7 +599,6 @@ static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     broker->tag_batch_shift = ceil_log2(broker->nr_of_cells_per_batch);
     broker->tag_offset_mask = (1ull << broker->tag_batch_shift) - 1;
 
-    broker->global_lock = enif_mutex_create("cbroker.global_lock");
     batch_t* first_batch = global_state_init(&broker->global_state, broker->nr_of_cells_per_batch);
     local_states_init(broker->local_states, nr_of_schedulers, first_batch);
 
@@ -977,6 +976,7 @@ static batch_t* global_state_init(global_state_t* global_state, const size_t nr_
 {
     cbroker_omap_result_t map_res = CBROKER_OMAP_NOMEM;
 
+    global_state->lock = enif_mutex_create("cbroker.global_state.lock");
     global_state->is_closed = false;
     global_state->batches = cbroker_omap_new();
 
@@ -1178,10 +1178,10 @@ static batch_t* ask_get_next_batch(ask_ctx_t* ctx, const batch_id_t prev_batch_i
         broker_t* broker = ctx->broker;
         global_state_t* global_state = &broker->global_state;
 
-        enif_mutex_lock(broker->global_lock);
+        enif_mutex_lock(global_state->lock);
 
         if (atomic_load(&global_state->is_closed)) {
-            enif_mutex_unlock(broker->global_lock);
+            enif_mutex_unlock(global_state->lock);
             local_state->is_closed = true;
             return NULL;
         }
@@ -1205,7 +1205,7 @@ static batch_t* ask_get_next_batch(ask_ctx_t* ctx, const batch_id_t prev_batch_i
             assert(ref_count >= 1);
         }
 
-        enif_mutex_unlock(broker->global_lock);
+        enif_mutex_unlock(global_state->lock);
 
         map_res = cbroker_omap_insert(local_state->batches, next_batch_id, next_batch);
         assert(map_res == CBROKER_OMAP_OK);
@@ -1405,9 +1405,9 @@ static void ask_await_preemptively_fill_batch_pool(ask_ctx_t* ctx, ask_out_t* ou
         global_state->batch_pool.count <= BATCH_POOL_INITIAL_COUNT // dirty read
     ) {
         batch_t* new_batch = batch_new(0, ctx->broker->nr_of_cells_per_batch);
-        enif_mutex_lock(broker->global_lock);
+        enif_mutex_lock(global_state->lock);
         mempool_return(&global_state->batch_pool, new_batch);
-        enif_mutex_unlock(broker->global_lock);
+        enif_mutex_unlock(global_state->lock);
     }
 }
 
@@ -1558,11 +1558,11 @@ static bool broker_checkout_batch(broker_t* broker, local_state_t* opt_local_sta
     }
     else {
         global_state_t* global_state = &broker->global_state;
-        enif_mutex_lock(broker->global_lock);
+        enif_mutex_lock(global_state->lock);
 
         if (cbroker_omap_lookup(global_state->batches, batch_id, (void**)&batch)) {
             atomic_fetch_add_explicit(&batch->ref_count, 1, memory_order_relaxed);
-            enif_mutex_unlock(broker->global_lock);
+            enif_mutex_unlock(global_state->lock);
             out_lease->batch = batch;
             out_lease->found_locally = false;
             out_lease->broker = broker;
@@ -1570,7 +1570,7 @@ static bool broker_checkout_batch(broker_t* broker, local_state_t* opt_local_sta
             return true;
         }
         else {
-            enif_mutex_unlock(broker->global_lock);
+            enif_mutex_unlock(global_state->lock);
             return false;
         }
     }
@@ -1645,7 +1645,7 @@ static void broker_checkout_all_batches(broker_t* broker, local_state_t* opt_loc
                                         lease_t** out_array, size_t* out_nr_of_batches)
 {
     global_state_t* global_state = &broker->global_state;
-    enif_mutex_lock(broker->global_lock);
+    enif_mutex_lock(global_state->lock);
 
     const size_t nr_of_batches = cbroker_omap_size(global_state->batches);
     const size_t array_size = nr_of_batches * sizeof(lease_t);
@@ -1672,7 +1672,7 @@ static void broker_checkout_all_batches(broker_t* broker, local_state_t* opt_loc
         }
     }
 
-    enif_mutex_unlock(broker->global_lock);
+    enif_mutex_unlock(global_state->lock);
 
     *out_array = array;
     *out_nr_of_batches = nr_of_batches;
@@ -1701,9 +1701,11 @@ static void broker_checkin_many_batches(broker_t* broker, lease_t** array_ptr,
 static void broker_dtor(ErlNifEnv* caller_env, void* obj)
 {
     broker_t* broker = (broker_t*)obj;
-    enif_mutex_destroy(broker->global_lock);
 
     global_state_t* global_state = &broker->global_state;
+    enif_mutex_destroy(global_state->lock);
+    global_state->lock = NULL;
+
     mempool_destroy(&global_state->batch_pool);
 
     //
@@ -1832,7 +1834,7 @@ static void lease_ref_count_dec(lease_t* lease)
 
     if (ref_count == 1) {
         global_state_t* global_state = &broker->global_state;
-        enif_mutex_lock(broker->global_lock);
+        enif_mutex_lock(global_state->lock);
 
         if (cbroker_omap_lookup(global_state->batches, batch_id, (void**)&batch)) {
             ref_count = atomic_load_explicit(&batch->ref_count, memory_order_acquire);
@@ -1860,7 +1862,7 @@ static void lease_ref_count_dec(lease_t* lease)
             }
         }
 
-        enif_mutex_unlock(broker->global_lock);
+        enif_mutex_unlock(global_state->lock);
     }
 
     lease->batch = NULL;
