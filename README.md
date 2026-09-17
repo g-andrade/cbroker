@@ -9,7 +9,7 @@ can message each other. These are useful for worker pools and suchlike
 applications.
 
 Rather than provide a single process that does that (commonly a `gen_server`),
-it runs concurrently through NIF code that uses [C atomics](https://en.cppreference.com/c/header/stdatomic).
+`cbroker` runs concurrently through NIF code that uses [C atomics](https://en.cppreference.com/c/header/stdatomic).
 
 It's inspired by [`sbroker`](https://hex.pm/packages/sbroker).
 
@@ -23,23 +23,54 @@ TODO
 
 #### Asks
 
-TODO
+This represents a process that wishes to either enqueue its offer on one side
+of the **broker**, or instead get a counter-offer from the opposite side (a
+match).
 
 #### Broker
 
-A broker consists of a global state and one or more local states.
+A broker is a ref-counted NIF resource used by asks.
 
-The global state sits behind a mutex.
+It consists of:
+* a **global state**;
+* one or more **local states**.
 
-The local state is lock-free. There is one per regular scheduler.
+It will also optionally monitor the process that created it, and close the
+broker if that process dies; this will close the broker to new asks,
+and cancel all enqueued requests one at a time.
 
-Both global and local states contain ref-counted **batches** sorted by their ID.
+#### Global state
+
+The global state contains:
+* a mutex
+* a sorted collection of all checked-out **batches**
+* a pool of free batches
+
+The mutex guards all accesses to the global state.
+
+The collection of batches keeps at least one entry at all times.
+
+#### Local states
+
+The local state is picked based on the running thread.
+
+It's lock-free, and there is one per regular VM scheduler.
+
+A local state contains:
+* a sorted collection of **batches** currently **checked-out** of the global state;
+* the batch ID of the left tail;
+* the batch ID of the right tail;
+* pools of free **requests**, environments (`ErlNifEnv`), and **tags**.
+
+Like in global state, the collection of batches keeps at least one entry at all
+times.
 
 #### Batches and cells
 
 A batch consists of:
-* a few atomic counters;
-* many **cells**.
+* a `ref_count` to track **check-outs**;
+* a few other atomic counters;
+* an array of cells.
 
 Each cell is an atomically compare-exchanged (CAS) pointer to a **request**.
 
@@ -47,58 +78,59 @@ Each cell is an atomically compare-exchanged (CAS) pointer to a **request**.
 
 A request can be a sentinel value that signals a consumed cell.
 
-Otherwise, it will be either nothing (empty) or an enqueued request.
+Otherwise, it must be either nothing (empty), or an enqueued request.
 
 An enqueued request also points to a tag, and the tag monitors the calling process.
 
 ### Details (bottom-to-top)
 
-### Tags
+#### Tags
 
-These are C structs ([resource
+These are ref-counted ([resource
 objects](https://www.erlang.org/doc/apps/erts/erl_nif.html#functionality) used
 to monitor the calling process. They also provide a reference to cancel an
 enqueued request.
 
-They consist of:
+A tag consists of:
 * a monitor ([`ErlNifMonitor`](https://www.erlang.org/doc/apps/erts/erl_nif.html#data-types);
-* a pointer to a `request`
+* a pointer to a **request**.
 
-### Requests
+#### Requests
 
 These are C structs used to exchange offers from the `left` side with offers
 from the `right` side.
 
-They consist of:
+A request consists of:
 * the calling pid;
 * a copy of its `offer`;
 * a reference to the broker;
 * the location of the cell;
-* a pointer to `tag`.
+* a pointer to **tag**.
 
-### Cells
+#### Cells
 
 A cell is an [atomically
 compare-and-swapped](https://en.cppreference.com/c/atomic/atomic_compare_exchange)
 pointer to a request.
 
-Through this single point a request can either enqueue, or instead take
-ownership of a request from the opposite side.
+It's through this single point that a request can either enqueue, or instead
+take ownership of a request from the opposite side.
 
 At any given time, a cell is in one of five states:
-1) empty.
+1) empty;
 2) enqueued request;
 3) matched;
 4) cancelled;
 5) closed.
 
-The empty state is `NULL`.
+The 'empty' state is `NULL`.
 
-The matched, cancelled, and closed states are pointers to static sentinel values.
+The 'matched', 'cancelled', and 'closed' states are pointers to static sentinel
+values.
 
 Only the enqueued request is dynamically allocated.
 
-#### Swap algorithm
+##### Swap algorithm
 
 In pseudo-Python, with `load` and `compare_and_swap` being atomic operations:
 
@@ -110,7 +142,7 @@ counter_request = cell.load()
 if counter_request is None:
     if request is None:
         tag = new Tag(self)
-        request = new Request(self, tag, offer) # will copy offer
+        request = new Request(self, tag, offer) # will copy our offer
         tag.request = request
     else:
         request.location = cell_location
@@ -128,7 +160,7 @@ if counter_request in [SENTINEL_CANCELLED, SENTINELL_CLOSED]:
 
 cell_request = cell.compare_and_swap(counter_request, SENTINEL_MATCHED)
 
-if cell_request == counter_request:
+if cell_request is counter_request:
     # Matched
     counter_tag = counter_request.tag
 
@@ -158,11 +190,10 @@ if cell_request == counter_request:
 
 ### Batches
 
-A batch contains an array of cells. It also contains four counters:
+A batch contains an array of cells. In addition to the `ref_count`, it also contains:
 * `left_count`
 * `right_count`
 * `consumed_count`
-* `ref_count` (TODO?)
 
 #### Tracking batch tails
 
@@ -171,12 +202,12 @@ tail of its respective side.
 
 A position counter is atomically incremented for every ask. If its value is
 `>=` that of the amount of cells in the batch, this signals that the batch is
-full for that side.
+full on that side.
 
 #### Consuming a batch
 
 `consumed_count` indicates how many cells were used in that batch. It's
-atomically incremented when either of 3 things happen:
+atomically incremented when either of 2 things happen:
 1. a successful match;
 2. a successful cancellation.
 
@@ -226,7 +257,7 @@ Any remaining batches with ID lower than `min(left_id, right_id)` can be
 
 The global state contains:
 * a mutex
-* a sorted collection of _all_ batches with ref-count >= 2.
+* a sorted collection of _all_ batches with `ref_count` >= 2.
 * a pool of free batches
 
 All accesses to it are guarded by the mutex.
@@ -236,23 +267,23 @@ All accesses to it are guarded by the mutex.
 Using the previous batch ID from the local state, we look up for a batch
 with a larger ID.
 
-If we find one, we'll increment its ref-count and place a copy in the local state.
+If we find one, we'll increment its `ref_count` and place a copy in the local state.
 
 If we don't find one, we'll assign (previous ID + 1) to a free batch, set its
-ref-count to 2, and place in both global and local states.
+`ref_count` to 2, and place in both global and local states.
 
 To avoid allocating a batch in the critical section, the free batch will
 usually come from the pool.
 
 ##### Discarding a batch
 
-When a batch is discarded from a local state, its ref-count is lowered.
+When a batch is discarded from a local state, its `ref_count` is lowered.
 
-When ref-count reaches 1, we lock into the global state and re-check.
+When `ref_count` reaches 1, we lock into the global state and re-check.
 
 If the batch is already gone, that the batch ID was already removed everywhere.
 
-If the ID is present and its ref-count is still 1, we remove it from the collection.
+If the ID is present and the `ref_count` is still 1, we remove it from the collection.
 
 If, after removal, there's no larger ID left in the collection, we reset the
 discarded batch, assign it (ID + 1), and place it batck in the collection. This
@@ -260,6 +291,38 @@ both prevents batch IDs from being reused, as well as an additional allocation.
 
 Otherwise, we return the discarded batch to the pool, which free the batch if
 full, or retain it.
+
+### On cancellations
+
+Cancelling an enqueued request is done through a `tag`.
+
+We start by demonitoring: if this fails, it's too late.
+
+Otherwise, we now have implicit ownership of the tag. Now we try to CAS the
+original `cell` with the sentinel request signalling cancellation.
+
+If this succeeds, now we have ownership of the `request` and can return it to
+the pool, as well as release our own tag.
+
+If it fails, it is also too late: another thread tried taking ownership of the
+`match`, failed to demonitor, and therefore released the tag.
+
+### On triggered monitors
+
+It's similar to cancelling, with the caveat that the triggering of the monitor
+now gives the callback implicit ownership of the `tag`.
+
+Therefore, one of two things must now happen:
+
+#### A) we successfully CAS the original cell
+
+Therefore also taking ownership of the `match`, allowing us to release our own
+tag, and return the match to the pool.
+
+#### B) we're too late
+
+Whoever tried to take ownership of the `match` failed to then demonitor, and
+therefore released us (or is about to).
 
 ## License
 
