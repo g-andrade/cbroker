@@ -18,183 +18,39 @@
 %% FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 %% DEALINGS IN THE SOFTWARE.
 
--module(cbroker).
+-module(cbroker_bench).
 
 -ifdef(E48).
 -moduledoc "FIXME: one-line summary of the `cbroker` public API.".
 -endif.
-
--include("src/cbroker_shared_state.hrl").
 
 %% ------------------------------------------------------------------
 %% API Function Exports
 %% ------------------------------------------------------------------
 
 -export([
-    new/0,
-    new/1,
-    %
-    ask/1,
-    ask/2,
-    ask/3,
-    ask_r/1,
-    ask_r/2,
-    ask_r/3,
-    %
-    async_ask/1,
-    async_ask/2,
-    async_ask_r/1,
-    async_ask_r/2,
-    %
-    to_list/1,
-    %
     bench1/4
 ]).
 
 -ignore_xref([
-    new/0,
-    new/1,
-    %
-    ask/1,
-    ask/2,
-    ask/3,
-    ask_r/1,
-    ask_r/2,
-    ask_r/3,
-    %
-    async_ask/1,
-    async_ask/2,
-    async_ask_r/1,
-    async_ask_r/2,
-    %
-    to_list/1,
-    %
     bench1/4
 ]).
-
-%% ------------------------------------------------------------------
-%% Macro Definitions
-%% ------------------------------------------------------------------
-
--define(DEFAULT_TIMEOUT, 5_000).
 
 %% ------------------------------------------------------------------
 %% Type Definitions
 %% ------------------------------------------------------------------
 
--opaque broker() :: reference().
--export_type([broker/0]).
-
--type side() :: left | right.
--export_type([side/0]).
-
--type ask_type() :: regular | nb | fully_async.
--export_type([ask_type/0]).
-
--opaque tag() :: {side(), batch_id(), offset()}.
--export_type([tag/0]).
-
--type batch_id() :: pos_integer().
--type offset() :: pos_integer().
-
--type match() :: {match, match_ref(), ExchangeValue :: term()}.
--export_type([match/0]).
-
--type match_with_stats() ::
-    {match, match_ref(), ExchangeValue :: term(), SojournTime :: non_neg_integer()}.
--export_type([match_with_stats/0]).
-
--type match_ref() :: reference().
--export_type([match_ref/0]).
-
--type async_reply() :: {tag(), async_reply_content()}.
--export_type([async_reply/0]).
-
--type async_reply_content() ::
-    (match()
-    | match_with_stats()
-    | closed).
--export_type([async_reply_content/0]).
-
-%%
-
--record(proc_stats, {
-    samples :: [term()]
-}).
+-record(proc_stats, {samples}).
 
 %% ------------------------------------------------------------------
 %% API Function Definitions
 %% ------------------------------------------------------------------
 
-% Documented public API functions follow the pattern below. Doc attributes are
-% guarded by `-ifdef(E48)` so the source still compiles on OTP < 27, which lacks
-% EEP-48 `-doc`/`-moduledoc`. Hide internals with `-doc false` / `-moduledoc
-% false` (NOT `@private`, which ex_doc ignores). A public function that isn't
-% called internally needs `-ignore_xref/1` to satisfy the `exports_not_used`
-% xref check.
-%
-%     -export([add/2]).
-%     -ignore_xref([add/2]).
-%
-%     -ifdef(E48).
-%     -doc "Adds two integers.".
-%     -endif.
-%     -spec add(integer(), integer()) -> integer().
-%     add(A, B) ->
-%         A + B.
-
--spec new() -> 
-new() ->
-    cbroker_nif:new().
-
-new(Opts) ->
-    cbroker_nif:new(Opts).
-
-ask(Name) ->
-    ask(Name, self()).
-
-ask(Name, Value) ->
-    ask(Name, Value, ?DEFAULT_TIMEOUT).
-
-ask(Name, Value, Timeout) ->
-    ask_side(Name, left, Value, Timeout).
-
-ask_r(Name) ->
-    ask_r(Name, self()).
-
-ask_r(Name, Value) ->
-    ask_r(Name, Value, ?DEFAULT_TIMEOUT).
-
-ask_r(Name, Value, Timeout) ->
-    ask_side(Name, right, Value, Timeout).
-
-%%
-
-async_ask(Name) ->
-    async_ask(Name, self()).
-
-async_ask(Name, Value) ->
-    async_ask_side(Name, left, Value).
-
-async_ask_r(Name) ->
-    async_ask_r(Name, self()).
-
-async_ask_r(Name, Value) ->
-    async_ask_side(Name, right, Value).
-
-to_list(Name) ->
-    case cbroker_serv:get_shared_state(Name) of
-        #shared_state{broker = Broker} ->
-            cbroker_nif:to_list(Broker)
-    end.
-
-%%%%%%%%%%%%%%%%%%%%%%%%
-
-bench1(Impl, ExchangeValueName, TotalIterations, TotalPidsAmount) ->
+bench1(Impl, OfferName, TotalIterations, TotalPidsAmount) ->
     LeftFun = left_fun(Impl),
     RightFun = right_fun(Impl),
 
-    ExchangeValue = generate_exchange_value(ExchangeValueName),
+    Offer = generate_exchange_value(OfferName),
 
     true = (TotalPidsAmount >= 2),
     LeftPidsAmount = TotalPidsAmount div 2,
@@ -203,8 +59,8 @@ bench1(Impl, ExchangeValueName, TotalIterations, TotalPidsAmount) ->
     LeftIterationsList = iterations_list(TotalIterations, LeftPidsAmount),
     RightIterationsList = iterations_list(TotalIterations, RightPidsAmount),
 
-    LeftPids = launch_processes(LeftFun, ExchangeValue, LeftIterationsList),
-    RightPids = launch_processes(RightFun, ExchangeValue, RightIterationsList),
+    LeftPids = launch_processes(LeftFun, Offer, LeftIterationsList),
+    RightPids = launch_processes(RightFun, Offer, RightIterationsList),
 
     Pids = pids_join(LeftPids, RightPids),
     PidSet = maps:from_keys(Pids, v),
@@ -241,6 +97,10 @@ bench1(Impl, ExchangeValueName, TotalIterations, TotalPidsAmount) ->
         {delays_per_group,
             lists:map(fun(Group) -> group_stats(Group, TotalSamples) end, SortedGroups)}
     ].
+
+%% ------------------------------------------------------------------
+%% Internal Function Definitions
+%% ------------------------------------------------------------------
 
 iterations_list(TotalIterations, PidsAmount) ->
     Base = TotalIterations div PidsAmount,
@@ -384,15 +244,15 @@ right_fun(cbroker) ->
 
 %%
 
-simple_left_iteration(ExchangeValue) ->
-    simple_iteration(left, ExchangeValue).
+simple_left_iteration(Offer) ->
+    simple_iteration(left, Offer).
 
-simple_right_iteration(ExchangeValue) ->
-    simple_iteration(right, ExchangeValue).
+simple_right_iteration(Offer) ->
+    simple_iteration(right, Offer).
 
-simple_iteration(Side, ExchangeValue) ->
+simple_iteration(Side, Offer) ->
     StartTs = erlang:monotonic_time(),
-    {await, Pid, Tag} = cbroker_simple:async_ask(Side, self(), ExchangeValue),
+    {await, Pid, Tag} = cbroker_simple:async_ask(Side, self(), Offer),
 
     receive
         {Ref, Reply} when Ref =:= Tag ->
@@ -406,22 +266,20 @@ simple_iteration(Side, ExchangeValue) ->
 
 %%
 
-cbroker_left_iteration(ExchangeValue) ->
-    cbroker_iteration(left, ExchangeValue).
+cbroker_left_iteration(Offer) ->
+    cbroker_iteration(left, Offer).
 
-cbroker_right_iteration(ExchangeValue) ->
-    cbroker_iteration(right, ExchangeValue).
+cbroker_right_iteration(Offer) ->
+    cbroker_iteration(right, Offer).
 
-cbroker_iteration(Side, ExchangeValue) ->
+cbroker_iteration(Side, Offer) ->
     StartTs = erlang:monotonic_time(),
 
-    case cbroker_serv:get_shared_state(test) of
-        #shared_state{broker = Broker} ->
-            cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, 0)
-    end.
+    Broker = cbroker:resolve_name(test),
+    cbroker_iteration_recur(StartTs, Broker, Side, Offer, 0).
 
-cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
-    case cbroker_nif:ask(Broker, Side, ExchangeValue) of
+cbroker_iteration_recur(StartTs, Broker, Side, Offer, RetryCount) ->
+    case cbroker:dynamic_ask(Broker, Side, Offer) of
         {await, Tag} ->
             cbroker_iteration_await(StartTs, Tag);
         %
@@ -436,7 +294,7 @@ cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount) ->
             end;
         %
         retry ->
-            cbroker_iteration_recur(StartTs, Broker, Side, ExchangeValue, RetryCount + 1)
+            cbroker_iteration_recur(StartTs, Broker, Side, Offer, RetryCount + 1)
     end.
 
 cbroker_iteration_await(StartTs, Tag) ->
@@ -481,20 +339,20 @@ processes_send([Pid | Next], Msg) ->
 processes_send([], _) ->
     ok.
 
-launch_processes(RunFun, ExchangeValue, [Iterations | Next]) ->
+launch_processes(RunFun, Offer, [Iterations | Next]) ->
     Parent = self(),
     [
-        spawn_link(fun() -> start_process(Parent, RunFun, ExchangeValue, Iterations) end)
-        | launch_processes(RunFun, ExchangeValue, Next)
+        spawn_link(fun() -> start_process(Parent, RunFun, Offer, Iterations) end)
+        | launch_processes(RunFun, Offer, Next)
     ];
 launch_processes(_, _, []) ->
     [].
 
-start_process(Parent, RunFun, ExchangeValue, Iterations) ->
+start_process(Parent, RunFun, Offer, Iterations) ->
     receive
         go ->
             erlang:yield(),
-            Samples = run_process(RunFun, ExchangeValue, Iterations),
+            Samples = run_process(RunFun, Offer, Iterations),
             _ = Parent ! {done, self()},
 
             receive
@@ -507,63 +365,8 @@ start_process(Parent, RunFun, ExchangeValue, Iterations) ->
             end
     end.
 
-run_process(RunFun, ExchangeValue, Iterations) when Iterations > 0 ->
-    Timestamps = RunFun(ExchangeValue),
-    [Timestamps | run_process(RunFun, ExchangeValue, Iterations - 1)];
+run_process(RunFun, Offer, Iterations) when Iterations > 0 ->
+    Timestamps = RunFun(Offer),
+    [Timestamps | run_process(RunFun, Offer, Iterations - 1)];
 run_process(_, _, 0) ->
     [].
-
-%% ------------------------------------------------------------------
-%% Internal Function Definitions
-%% ------------------------------------------------------------------
-
-ask_side(Name, Side, Value, Timeout) ->
-    case cbroker_serv:get_shared_state(Name) of
-        #shared_state{broker = Broker} ->
-            %
-            case cbroker_nif:ask(Broker, Side, Value) of
-                {await, Tag} ->
-                    await_after_ask(Broker, Tag, Timeout);
-                %
-                {match, _, _, _} = Match ->
-                    Match;
-                %
-                retry ->
-                    ask_side(Name, Side, Value, Timeout)
-            end;
-        %
-        none ->
-            not_running
-    end.
-
-await_after_ask(Broker, Tag, Timeout) ->
-    receive
-        {T, Result} when T =:= Tag ->
-            Result
-    after Timeout ->
-        case cbroker_nif:cancel(Tag) of
-            cancelled ->
-                timeout;
-            %
-            too_late ->
-                receive
-                    {T, Result} when T =:= Tag ->
-                        Result
-                end
-        end
-    end.
-
-async_ask_side(Name, Side, Value) ->
-    case cbroker_serv:get_shared_state(Name) of
-        #shared_state{broker = Broker} ->
-            case cbroker_nif:ask(Broker, Side, Value, async) of
-                retry ->
-                    async_ask_side(Name, Side, Value);
-                %
-                Result ->
-                    Result
-            end;
-        %
-        none ->
-            not_running
-    end.

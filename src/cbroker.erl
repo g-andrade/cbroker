@@ -509,10 +509,8 @@ init() ->
 
 do_ask(BrokerRef, Side, Offer, AskType) ->
     OfferSizeArg = offer_size_arg(Offer),
-    EnqueueTs = erlang:monotonic_time(nanosecond),
-    RetryNr = 0,
 
-    case nif_ask(BrokerRef, Side, Offer, OfferSizeArg, AskType, EnqueueTs, RetryNr) of
+    case nif_ask(BrokerRef, Side, Offer, OfferSizeArg, AskType) of
         {error, Reason} ->
             error(Reason);
         %
@@ -520,7 +518,7 @@ do_ask(BrokerRef, Side, Offer, AskType) ->
             Result
     end.
 
-nif_ask(_BrokerRef, _Side, _Offer, _OffersizeArg, _AskType, _EnqueueTs, _RetryNr) ->
+nif_ask(_BrokerRef, _Side, _Offer, _OffersizeArg, _AskType) ->
     not_loaded(?LINE).
 
 -if(?OTP_RELEASE < 29).
