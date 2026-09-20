@@ -521,7 +521,7 @@ static ERL_NIF_TERM make_drop_reason(ErlNifEnv* env, const drop_reason_t reason)
 static ERL_NIF_TERM make_error(ErlNifEnv* env, ERL_NIF_TERM reason);
 
 static ERL_NIF_TERM make_match(ErlNifEnv* env, ERL_NIF_TERM match_ref, ERL_NIF_TERM offer,
-                               ErlNifTime enqueue_ts);
+                               int64_t sojourn_time);
 
 static ERL_NIF_TERM raise_tuple2(ErlNifEnv* env, ERL_NIF_TERM reason_type,
                                  ERL_NIF_TERM reason_content);
@@ -1412,20 +1412,20 @@ static void ask_reply_match_notify_other(ask_ctx_t* ctx, ERL_NIF_TERM match_ref)
     request_t* counter_request = ctx->counter_request;
     assert(counter_request != NULL);
 
-    const int64_t enqueue_ts = monotonic_ts() - counter_request->enqueue_ts;
+    const int64_t sojourn_time = monotonic_ts() - counter_request->enqueue_ts;
 
     if (request != NULL) {
         // We reuse our own request's env, which already contains our offer
         ErlNifEnv* msg_env = request->env;
         ERL_NIF_TERM tag = enif_make_resource(msg_env, counter_request->tag);
         ERL_NIF_TERM ref = enif_make_copy(msg_env, match_ref);
-        ERL_NIF_TERM match = make_match(msg_env, ref, request->offer, enqueue_ts);
+        ERL_NIF_TERM match = make_match(msg_env, ref, request->offer, sojourn_time);
         ERL_NIF_TERM msg = enif_make_tuple2(msg_env, tag, match);
         either_notify_or_assert_not_alive(ctx->env, &counter_request->pid, msg_env, msg);
     }
     else {
         ERL_NIF_TERM tag = enif_make_resource(ctx->env, counter_request->tag);
-        ERL_NIF_TERM match = make_match(ctx->env, match_ref, ctx->offer, enqueue_ts);
+        ERL_NIF_TERM match = make_match(ctx->env, match_ref, ctx->offer, sojourn_time);
         ERL_NIF_TERM msg = enif_make_tuple2(ctx->env, tag, match);
         either_notify_or_assert_not_alive(ctx->env, &counter_request->pid, NULL, msg);
     }
@@ -1436,7 +1436,7 @@ static ERL_NIF_TERM ask_reply_match_self(ask_ctx_t* ctx, ERL_NIF_TERM match_ref)
     request_t* counter_request = ctx->counter_request;
     assert(counter_request != NULL);
 
-    const int64_t enqueue_ts = monotonic_ts() - ctx->enqueue_ts;
+    const int64_t sojourn_time = monotonic_ts() - ctx->enqueue_ts;
 
     if (ctx->is_non_blocking) {
         ERL_NIF_TERM faux_tag_term = enif_make_ref(ctx->env);
@@ -1445,7 +1445,7 @@ static ERL_NIF_TERM ask_reply_match_self(ask_ctx_t* ctx, ERL_NIF_TERM match_ref)
         ErlNifEnv* msg_env = counter_request->env;
         ERL_NIF_TERM msg_tag = enif_make_copy(msg_env, faux_tag_term);
         ERL_NIF_TERM msg_ref = enif_make_copy(msg_env, match_ref);
-        ERL_NIF_TERM msg_match = make_match(msg_env, msg_ref, counter_request->offer, enqueue_ts);
+        ERL_NIF_TERM msg_match = make_match(msg_env, msg_ref, counter_request->offer, sojourn_time);
         ERL_NIF_TERM msg = enif_make_tuple2(msg_env, msg_tag, msg_match);
         either_notify_or_assert_not_alive(ctx->env, &ctx->self, msg_env, msg);
 
@@ -1455,7 +1455,7 @@ static ERL_NIF_TERM ask_reply_match_self(ask_ctx_t* ctx, ERL_NIF_TERM match_ref)
         ERL_NIF_TERM counter_offer = enif_make_copy(ctx->env, counter_request->offer);
         ctx->copied_bytes += counter_request->offer_size;
 
-        return make_match(ctx->env, match_ref, counter_offer, enqueue_ts);
+        return make_match(ctx->env, match_ref, counter_offer, sojourn_time);
     }
 }
 
@@ -2529,9 +2529,9 @@ static ERL_NIF_TERM make_error(ErlNifEnv* env, ERL_NIF_TERM reason)
 }
 
 static ERL_NIF_TERM make_match(ErlNifEnv* env, ERL_NIF_TERM match_ref, ERL_NIF_TERM offer,
-                               ErlNifTime enqueue_ts)
+                               int64_t sojourn_time)
 {
-    int_fast64_t sojourn_time = monotonic_ts() - enqueue_ts;
+    assert(sojourn_time >= 0);
     return enif_make_tuple4(env, Atoms._match, match_ref, offer,
                             enif_make_int64(env, sojourn_time));
 }
