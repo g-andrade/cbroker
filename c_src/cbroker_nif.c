@@ -78,8 +78,6 @@
     X(_right,                 "right") \
     X(_right_count,           "right_count") \
     X(_stopped,               "stopped") \
-    X(_tag_batch_shift,       "tag_batch_shift") \
-    X(_tag_offset_mask,       "tag_offset_mask") \
     X(_tag_pool,              "tag_pool") \
     X(_too_late,              "too_late") \
     X(_true,                  "true") \
@@ -215,8 +213,6 @@ typedef struct {
     //
     size_t nr_of_schedulers;
     size_t nr_of_cells_per_batch;
-    unsigned tag_batch_shift;
-    uint64_t tag_offset_mask;
     //
     global_state_t global_state;
     //
@@ -535,7 +531,6 @@ static ERL_NIF_TERM raise_tuple2(ErlNifEnv* env, ERL_NIF_TERM reason_type,
 static size_t term_size(ErlNifEnv* env, ERL_NIF_TERM term);
 static inline void consume_timeslice(ErlNifEnv* env, const size_t copied_bytes);
 static ErlNifTime monotonic_ts(void);
-static unsigned ceil_log2(size_t value);
 
 /*********************************************************************/
 
@@ -666,8 +661,6 @@ static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     broker->nr_of_schedulers = nr_of_schedulers;
     broker->nr_of_cells_per_batch = 32 * nr_of_schedulers;
-    broker->tag_batch_shift = ceil_log2(broker->nr_of_cells_per_batch);
-    broker->tag_offset_mask = (1ull << broker->tag_batch_shift) - 1;
 
     batch_t* first_batch = global_state_init(&broker->global_state, broker->nr_of_cells_per_batch);
     local_states_init(broker->local_states, nr_of_schedulers, first_batch);
@@ -947,7 +940,7 @@ static ERL_NIF_TERM nif_debug_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM 
     ERL_NIF_TERM local_state_terms_list =
         local_states_to_term(env, broker->local_states, broker->nr_of_schedulers);
 
-    return enif_make_list8(
+    return enif_make_list6(
         env,
         //
         enif_make_tuple2(env, Atoms._creator, enif_make_pid(env, &broker->creator_pid)),
@@ -957,12 +950,6 @@ static ERL_NIF_TERM nif_debug_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM 
         //
         enif_make_tuple2(env, Atoms._nr_of_cells_per_batch,
                          enif_make_uint64(env, broker->nr_of_cells_per_batch)),
-        //
-        enif_make_tuple2(env, Atoms._tag_batch_shift,
-                         enif_make_uint64(env, broker->tag_batch_shift)),
-        //
-        enif_make_tuple2(env, Atoms._tag_offset_mask,
-                         enif_make_uint64(env, broker->tag_offset_mask)),
         //
         enif_make_tuple2(env, Atoms._global_state, global_state_term),
         //
@@ -2597,12 +2584,3 @@ static inline void consume_timeslice(ErlNifEnv* env, const size_t copied_bytes)
 }
 
 static ErlNifTime monotonic_ts() { return enif_monotonic_time(ERL_NIF_NSEC); }
-
-static unsigned ceil_log2(size_t value)
-{
-    unsigned shift = 0;
-    while (((size_t)1 << shift) < value) {
-        shift++;
-    }
-    return shift;
-}
