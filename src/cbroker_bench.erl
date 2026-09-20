@@ -288,7 +288,8 @@ cbroker_iteration_recur(StartTs, Broker, Side, Offer, RetryCount) ->
 
             case RetryCount of
                 0 ->
-                    {instant, FinalTs - StartTs};
+                    % FIXME
+                    {instant, FinalTs - StartTs, Sojourn};
                 _ ->
                     {retried, RetryCount, FinalTs - StartTs}
             end;

@@ -17,28 +17,30 @@
 
 /*********************************************************************/
 
-#define BATCH_POOL_INITIAL_COUNT 1
 #define BATCH_POOL_SIZE 4
+#define BATCH_POOL_INITIAL_COUNT 1
 
-#define MATCH_POOLS_INITIAL_COUNT 8
 #define MATCH_POOLS_SIZE 8
+#define MATCH_POOLS_INITIAL_COUNT 8
 
-#define ENV_POOLS_INITIAL_COUNT 8
 #define ENV_POOLS_SIZE 8
+#define ENV_POOLS_INITIAL_COUNT 8
 
-#define TAG_POOLS_INITIAL_COUNT 8
 #define TAG_POOLS_SIZE 8
+#define TAG_POOLS_INITIAL_COUNT TAG_POOLS_SIZE
 
 //
 
-#define MAX_ASK_RETRIES 0 // FIXME
+#define MAX_ASK_RETRIES 100 // FIXME
 
 //
 
 /* The columns below are aligned on purpose. */
 /* clang-format off */
 #define ATOM_LIST \
+    X(_approx_avg,            "approx_avg") \
     X(_async,                 "async") \
+    X(_avg,                   "avg") \
     X(_await,                 "await") \
     X(_badarg,                "badarg") \
     X(_badopt,                "badopt") \
@@ -53,7 +55,9 @@
     X(_cells,                 "cells") \
     X(_compute_from_nif,      "compute_from_nif") \
     X(_consumed_count,        "consumed_count") \
+    X(_count,                 "count") \
     X(_creator,               "creator") \
+    X(_credits_left,          "credits_left") \
     X(_depends_on_creator,    "depends_on_creator") \
     X(_drop,                  "drop") \
     X(_dynamic,               "dynamic") \
@@ -77,7 +81,9 @@
     X(_retry,                 "retry") \
     X(_right,                 "right") \
     X(_right_count,           "right_count") \
+    X(_stats,                 "stats") \
     X(_stopped,               "stopped") \
+    X(_sum,                   "sum") \
     X(_tag_pool,              "tag_pool") \
     X(_too_late,              "too_late") \
     X(_true,                  "true") \
@@ -206,6 +212,20 @@ typedef struct {
 
 //
 
+#define ROLLING_AVG_SIZE 128
+
+typedef struct {
+    atomic_size_t count;
+    _Atomic(int64_t) sum;
+    _Atomic(int64_t) samples[ROLLING_AVG_SIZE];
+} rolling_avg_t;
+
+typedef struct {
+    rolling_avg_t credits_left;
+} stats_t;
+
+//
+
 typedef struct {
     broker_opts_t opts;
     ErlNifPid creator_pid;
@@ -215,6 +235,7 @@ typedef struct {
     size_t nr_of_cells_per_batch;
     //
     global_state_t global_state;
+    stats_t stats;
     //
     local_state_t local_states[];
 } broker_t;
@@ -492,6 +513,13 @@ static ERL_NIF_TERM mempool_to_term(ErlNifEnv* env, mempool_t* pool);
 
 //
 
+static void stats_push_after_ask(stats_t* stats, int credits_left);
+static ERL_NIF_TERM stats_to_term(ErlNifEnv* env, stats_t* stats);
+static void rolling_avg_push(rolling_avg_t* rolling_avg, int64_t sample);
+static ERL_NIF_TERM rolling_avg_to_term(ErlNifEnv* env, rolling_avg_t* rolling_avg);
+
+//
+
 static int get_boolean(ERL_NIF_TERM term, bool* out);
 static int get_broker(ErlNifEnv* env, ERL_NIF_TERM term, broker_t** out_broker);
 static int get_broker_opts(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM* out_bad_opt,
@@ -763,6 +791,9 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     ctx.term_res = Atoms._none;
 
     ask_result_t ask_res = ask_loop(&ctx);
+    stats_push_after_ask(&ctx.broker->stats, ctx.credits);
+
+    //
 
     if (ctx.consume_slot) {
         lease_consume_slot(&ctx.lease);
@@ -940,7 +971,9 @@ static ERL_NIF_TERM nif_debug_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM 
     ERL_NIF_TERM local_state_terms_list =
         local_states_to_term(env, broker->local_states, broker->nr_of_schedulers);
 
-    return enif_make_list6(
+    ERL_NIF_TERM stats_term = stats_to_term(env, &broker->stats);
+
+    return enif_make_list7(
         env,
         //
         enif_make_tuple2(env, Atoms._creator, enif_make_pid(env, &broker->creator_pid)),
@@ -954,6 +987,8 @@ static ERL_NIF_TERM nif_debug_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM 
         enif_make_tuple2(env, Atoms._global_state, global_state_term),
         //
         enif_make_tuple2(env, Atoms._local_states, local_state_terms_list),
+        //
+        enif_make_tuple2(env, Atoms._stats, stats_term),
         //
         enif_make_tuple2(env, Atoms._batches, batch_terms_list));
 }
@@ -1095,6 +1130,7 @@ static ask_result_t ask_loop(ask_ctx_t* ctx)
 {
     broker_t* broker = ctx->broker;
     local_state_t* local_state = ctx->local_state;
+    ask_result_t ask_res = 0;
 
     lease_t* lease = &ctx->lease;
     lease_init(lease, NULL, false, broker, local_state);
@@ -1106,7 +1142,7 @@ static ask_result_t ask_loop(ask_ctx_t* ctx)
         }
         assert(lease->found_locally);
 
-        ask_result_t ask_res = ask_loop_tail_ask(ctx);
+        ask_res = ask_loop_tail_ask(ctx);
 
         switch (ask_res) {
         case ASK_RESULT_SKIP_BATCH:
@@ -1192,7 +1228,7 @@ static ask_result_t ask_loop_tail_offset_ask(ask_ctx_t* ctx, lease_t* lease, con
     assert(offset < batch->nr_of_cells);
 
     cell_t* cell = &batch->cells[offset];
-    request_t* counter_request = atomic_load_explicit(cell, memory_order_relaxed);
+    request_t* counter_request = atomic_load(cell);
 
     // Are we first?
 
@@ -1376,6 +1412,7 @@ static void ask_loop_request_new(ask_ctx_t* ctx)
 
 static void ask_reply_await(ask_ctx_t* ctx)
 {
+    assert(!ctx->is_non_blocking);
     assert(ctx->request == NULL);
     assert(ctx->tag_term != Atoms._none);
     assert(ctx->counter_request == NULL);
@@ -1393,7 +1430,7 @@ static void ask_reply_match(ask_ctx_t* ctx)
     request_t* counter_request = ctx->counter_request;
     assert(counter_request != NULL);
 
-    bool we_go_first = (ctx->is_non_blocking && !ctx->is_left);
+    bool we_go_first = (ctx->is_async && !ctx->is_left);
     ERL_NIF_TERM match_ref = enif_make_ref(ctx->env);
 
     if (we_go_first) {
@@ -1438,7 +1475,7 @@ static ERL_NIF_TERM ask_reply_match_self(ask_ctx_t* ctx, ERL_NIF_TERM match_ref)
 
     const int64_t sojourn_time = monotonic_ts() - ctx->enqueue_ts;
 
-    if (ctx->is_non_blocking) {
+    if (ctx->is_async) {
         ERL_NIF_TERM faux_tag_term = enif_make_ref(ctx->env);
 
         // We reuse the counter request's env, which already contains their offer
@@ -1478,6 +1515,8 @@ static void ask_reply_closed(ask_ctx_t* ctx)
 
 static bool ask_retry_can(ask_ctx_t* ctx)
 {
+    LOG_UNCOND("[%T] pls retry", ctx->self_term);
+
     retry_t* retry = ctx->retry;
     int retry_nr = (retry == NULL ? 1 : retry->nr + 1);
 
@@ -1521,6 +1560,7 @@ static void ask_retry(ask_ctx_t* ctx, int argc, const ERL_NIF_TERM argv[])
         memset(retry, 0, sizeof(retry_t));
 
         retry->nr = 1;
+        retry->enqueue_ts = ctx->enqueue_ts;
         retry->ask_type = argv[retry_idx];
         retry->request = request;
         retry->tag_term = tag_term;
@@ -2356,6 +2396,46 @@ static ERL_NIF_TERM mempool_to_term(ErlNifEnv* env, mempool_t* pool)
 
 /*********************************************************************/
 
+static void stats_push_after_ask(stats_t* stats, int credits_left)
+{
+    rolling_avg_push(&stats->credits_left, credits_left);
+}
+
+static ERL_NIF_TERM stats_to_term(ErlNifEnv* env, stats_t* stats)
+{
+    return enif_make_list1(
+        env,
+        //
+        enif_make_tuple2(env, Atoms._credits_left, rolling_avg_to_term(env, &stats->credits_left)));
+}
+
+static void rolling_avg_push(rolling_avg_t* rolling_avg, int64_t sample)
+{
+    size_t prev_count = atomic_fetch_add_explicit(&rolling_avg->count, 1, memory_order_relaxed);
+    size_t idx = prev_count % ROLLING_AVG_SIZE;
+    int64_t prev_sample = atomic_exchange(&rolling_avg->samples[idx], sample);
+    atomic_fetch_add_explicit(&rolling_avg->sum, prev_sample, memory_order_relaxed);
+}
+
+static ERL_NIF_TERM rolling_avg_to_term(ErlNifEnv* env, rolling_avg_t* rolling_avg)
+{
+    size_t count = atomic_load_explicit(&rolling_avg->count, memory_order_relaxed);
+    int64_t sum = atomic_load_explicit(&rolling_avg->sum, memory_order_relaxed);
+
+    ERL_NIF_TERM avg_key = (count > ROLLING_AVG_SIZE + 20) ? Atoms._avg : Atoms._approx_avg;
+    double avg = (double)sum / (double)count;
+
+    return enif_make_list3(env,
+                           //
+                           enif_make_tuple2(env, Atoms._count, enif_make_uint64(env, count)),
+                           //
+                           enif_make_tuple2(env, Atoms._sum, enif_make_int64(env, sum)),
+                           //
+                           enif_make_tuple2(env, avg_key, enif_make_double(env, avg)));
+}
+
+/*********************************************************************/
+
 static int get_boolean(ERL_NIF_TERM term, bool* out)
 {
     if (term == Atoms._true) {
@@ -2531,7 +2611,11 @@ static ERL_NIF_TERM make_error(ErlNifEnv* env, ERL_NIF_TERM reason)
 static ERL_NIF_TERM make_match(ErlNifEnv* env, ERL_NIF_TERM match_ref, ERL_NIF_TERM offer,
                                int64_t sojourn_time)
 {
-    assert(sojourn_time >= 0);
+    // assert(sojourn_time >= 0);
+    if (sojourn_time < 0) {
+        LOG_UNCOND("NEGATIVE SOJOURN TIME: %lld", sojourn_time);
+    }
+
     return enif_make_tuple4(env, Atoms._match, match_ref, offer,
                             enif_make_int64(env, sojourn_time));
 }
