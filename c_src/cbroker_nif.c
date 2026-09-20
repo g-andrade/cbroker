@@ -31,7 +31,7 @@
 
 //
 
-#define MAX_ASK_RETRIES 10
+#define MAX_ASK_RETRIES 0 // FIXME
 
 //
 
