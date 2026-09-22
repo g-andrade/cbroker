@@ -317,7 +317,7 @@ typedef struct {
     ERL_NIF_TERM broker_term;
     ERL_NIF_TERM side;
     ERL_NIF_TERM offer;
-    ssize_t offer_size; // negative when it hasn't been computed yet
+    ptrdiff_t offer_size; // negative when it hasn't been computed yet
     retry_t* retry;
     //
     broker_t* broker;
@@ -526,7 +526,8 @@ static int get_broker(ErlNifEnv* env, ERL_NIF_TERM term, broker_t** out_broker);
 static int get_broker_opts(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM* out_bad_opt,
                            broker_opts_t* out_opts);
 
-static int get_offer_size(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM offer, ssize_t* out_size);
+static int get_offer_size(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM offer,
+                          ptrdiff_t* out_size);
 static int get_retry(ErlNifEnv* env, ERL_NIF_TERM term, retry_t** out_retry);
 
 #if USES_FLAT_SIZE
@@ -1421,7 +1422,7 @@ static void ask_loop_request_new(ask_ctx_t* ctx)
     else {
         assert(!USES_FLAT_SIZE);
         request->offer_size = (size_t)term_size(request->env, request->offer);
-        ctx->offer_size = (ssize_t)request->offer_size;
+        ctx->offer_size = (ptrdiff_t)request->offer_size;
     }
 
     request->broker_term = enif_make_copy(request->env, ctx->broker_term);
@@ -2544,13 +2545,14 @@ static int get_retry(ErlNifEnv* env, ERL_NIF_TERM term, retry_t** out_retry)
 
 //
 
-static int get_offer_size(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM offer, ssize_t* out_size)
+static int get_offer_size(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM offer,
+                          ptrdiff_t* out_size)
 {
 #if USES_FLAT_SIZE
     size_t size_in_words = 0;
 
     if (get_size_t(env, term, &size_in_words)) {
-        *out_size = size_in_words * sizeof(ERL_NIF_TERM);
+        *out_size = (ptrdiff_t)(size_in_words * sizeof(ERL_NIF_TERM));
         return 1;
     }
 #else
