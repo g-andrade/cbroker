@@ -21,7 +21,13 @@ make check-slow      # dialyzer
 make format          # auto-format sources with erlfmt
 make doc             # build docs with ex_doc (downloads the ex_doc escript to tmp/)
 make shell           # interactive REPL with the app started
+make bench-shell     # same, plus the benchmarks in bench/
 ```
+
+Benchmarks live in `bench/` (`cbroker_bench`, plus the `cbroker_simple` baseline it
+compares against), compiled only by the `bench` profile together with their
+bench-only deps (`xb5`). Run e.g. `cbroker_bench:bench1(cbroker, smallest, 1_000_000, 64)`
+from `make bench-shell`; each run sets up and tears down what it measures.
 
 All checks run sequentially (`.NOTPARALLEL`). CI runs `make check-fast`, `make test`,
 and `make check-slow` over OTP 24–29 on Linux, plus a Windows job that only builds

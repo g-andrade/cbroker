@@ -128,6 +128,11 @@ shell:
 	@rebar3 as shell shell
 .PHONY: shell
 
+bench-shell: export ERL_FLAGS = +pc unicode
+bench-shell:
+	@rebar3 as shell,bench shell
+.PHONY: bench-shell
+
 doc: SOURCE_REF := $(shell git describe --tags --exact-match 2>/dev/null || git rev-parse --short HEAD)
 doc: tmp/ex_doc
 doc:

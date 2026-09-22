@@ -2,7 +2,6 @@
     {description, "FIXME"},
     {vsn, git},
     {registered, []},
-    {mod, {cbroker_app, []}},
     {applications, [
         % stdlib deps
         kernel,

@@ -47,8 +47,20 @@
 %% ------------------------------------------------------------------
 
 bench1(Impl, OfferName, TotalIterations, TotalPidsAmount) ->
-    LeftFun = left_fun(Impl),
-    RightFun = right_fun(Impl),
+    Target = setup(Impl),
+    try
+        run_bench1(Impl, Target, OfferName, TotalIterations, TotalPidsAmount)
+    after
+        teardown(Impl, Target)
+    end.
+
+%% ------------------------------------------------------------------
+%% Internal Function Definitions
+%% ------------------------------------------------------------------
+
+run_bench1(Impl, Target, OfferName, TotalIterations, TotalPidsAmount) ->
+    LeftFun = left_fun(Impl, Target),
+    RightFun = right_fun(Impl, Target),
 
     Offer = generate_exchange_value(OfferName),
 
@@ -97,10 +109,6 @@ bench1(Impl, OfferName, TotalIterations, TotalPidsAmount) ->
         {delays_per_group,
             lists:map(fun(Group) -> group_stats(Group, TotalSamples) end, SortedGroups)}
     ].
-
-%% ------------------------------------------------------------------
-%% Internal Function Definitions
-%% ------------------------------------------------------------------
 
 iterations_list(TotalIterations, PidsAmount) ->
     Base = TotalIterations div PidsAmount,
@@ -232,15 +240,28 @@ native_to_us(Interval) when is_number(Interval) ->
 
 %%
 
-left_fun(simple) ->
-    fun simple_left_iteration/1;
-left_fun(cbroker) ->
-    fun cbroker_left_iteration/1.
+% The bench owns what it measures: a fresh broker, or the `cbroker_simple`
+% baseline server
+setup(simple) ->
+    {ok, Pid} = cbroker_simple:start_link(),
+    Pid;
+setup(cbroker) ->
+    cbroker:new().
 
-right_fun(simple) ->
+teardown(simple, Pid) ->
+    ok = sys:terminate(Pid, normal);
+teardown(cbroker, _Broker) ->
+    ok.
+
+left_fun(simple, _Pid) ->
+    fun simple_left_iteration/1;
+left_fun(cbroker, Broker) ->
+    fun(Offer) -> cbroker_iteration(Broker, left, Offer) end.
+
+right_fun(simple, _Pid) ->
     fun simple_right_iteration/1;
-right_fun(cbroker) ->
-    fun cbroker_right_iteration/1.
+right_fun(cbroker, Broker) ->
+    fun(Offer) -> cbroker_iteration(Broker, right, Offer) end.
 
 %%
 
@@ -266,16 +287,8 @@ simple_iteration(Side, Offer) ->
 
 %%
 
-cbroker_left_iteration(Offer) ->
-    cbroker_iteration(left, Offer).
-
-cbroker_right_iteration(Offer) ->
-    cbroker_iteration(right, Offer).
-
-cbroker_iteration(Side, Offer) ->
+cbroker_iteration(Broker, Side, Offer) ->
     StartTs = erlang:monotonic_time(),
-
-    Broker = cbroker:resolve_name(test),
     cbroker_iteration_recur(StartTs, Broker, Side, Offer, 0).
 
 cbroker_iteration_recur(StartTs, Broker, Side, Offer, RetryCount) ->
