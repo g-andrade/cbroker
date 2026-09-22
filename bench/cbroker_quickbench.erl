@@ -18,7 +18,7 @@
 %% FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 %% DEALINGS IN THE SOFTWARE.
 
--module(cbroker_bench).
+-module(cbroker_quickbench).
 
 -ifdef(E48).
 -moduledoc "FIXME: one-line summary of the `cbroker` public API.".
@@ -46,10 +46,13 @@
 %% API Function Definitions
 %% ------------------------------------------------------------------
 
-bench1(Impl, OfferName, TotalIterations, TotalPidsAmount) ->
+bench1(Impl, OfferName, TotalIterations, TotalPidsAmount) when is_atom(OfferName) ->
+    Offer = generate_exchange_value(OfferName),
+    bench1(Impl, Offer, TotalIterations, TotalPidsAmount);
+bench1(Impl, Offer, TotalIterations, TotalPidsAmount) ->
     Target = setup(Impl),
     try
-        run_bench1(Impl, Target, OfferName, TotalIterations, TotalPidsAmount)
+        run_bench1(Impl, Target, Offer, TotalIterations, TotalPidsAmount)
     after
         teardown(Impl, Target)
     end.
@@ -58,11 +61,9 @@ bench1(Impl, OfferName, TotalIterations, TotalPidsAmount) ->
 %% Internal Function Definitions
 %% ------------------------------------------------------------------
 
-run_bench1(Impl, Target, OfferName, TotalIterations, TotalPidsAmount) ->
+run_bench1(Impl, Target, Offer, TotalIterations, TotalPidsAmount) ->
     LeftFun = left_fun(Impl, Target),
     RightFun = right_fun(Impl, Target),
-
-    Offer = generate_exchange_value(OfferName),
 
     true = (TotalPidsAmount >= 2),
     LeftPidsAmount = TotalPidsAmount div 2,
@@ -86,7 +87,7 @@ run_bench1(Impl, Target, OfferName, TotalIterations, TotalPidsAmount) ->
     FinishTs = erlang:monotonic_time(),
 
     logger:debug("Collecting stats!"),
-    timer:sleep(100),
+    %timer:sleep(100),
 
     processes_send(Pids, stats),
     Samples = receive_results(PidSet),
@@ -296,13 +297,12 @@ cbroker_iteration_recur(StartTs, Broker, Side, Offer, RetryCount) ->
         {await, Tag} ->
             cbroker_iteration_await(StartTs, Tag);
         %
-        {match, _, _, Sojourn} ->
+        {match, _, _, _} ->
             FinalTs = erlang:monotonic_time(),
 
             case RetryCount of
                 0 ->
-                    % FIXME
-                    {instant, FinalTs - StartTs, Sojourn};
+                    {instant, FinalTs - StartTs};
                 _ ->
                     {retried, RetryCount, FinalTs - StartTs}
             end;
