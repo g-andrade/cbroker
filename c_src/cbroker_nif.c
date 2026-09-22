@@ -1414,18 +1414,27 @@ static void ask_loop_request_new(ask_ctx_t* ctx)
 
     request->enqueue_ts = ctx->enqueue_ts;
     request->pid = ctx->self;
-    request->offer = enif_make_copy(request->env, ctx->offer);
 
     if (ctx->offer_size >= 0) {
         request->offer_size = (size_t)ctx->offer_size;
     }
     else {
         assert(!USES_FLAT_SIZE);
-        request->offer_size = (size_t)term_size(request->env, request->offer);
+        request->offer_size = (size_t)term_size(ctx->env, ctx->offer);
         ctx->offer_size = (ptrdiff_t)request->offer_size;
     }
 
     request->broker_term = enif_make_copy(request->env, ctx->broker_term);
+
+    if (ctx->offer_size == 0) {
+        // immediate term
+        request->offer = ctx->offer;
+        ctx->copied_bytes += term_size(request->env, ctx->broker_term);
+    }
+    else {
+        request->offer = enif_make_copy(request->env, ctx->offer);
+        ctx->copied_bytes += (request->offer_size + term_size(request->env, ctx->broker_term));
+    }
 
     //
 
@@ -1441,7 +1450,6 @@ static void ask_loop_request_new(ask_ctx_t* ctx)
 
     ctx->request = request;
     ctx->tag_term = enif_make_resource(ctx->env, tag);
-    ctx->copied_bytes += (request->offer_size + term_size(request->env, ctx->broker_term));
 }
 
 //
@@ -1525,8 +1533,16 @@ static ERL_NIF_TERM ask_reply_match_self(ask_ctx_t* ctx, ERL_NIF_TERM match_ref)
         return make_await(ctx->env, faux_tag_term);
     }
     else {
-        ERL_NIF_TERM counter_offer = enif_make_copy(ctx->env, counter_request->offer);
-        ctx->copied_bytes += counter_request->offer_size;
+        ERL_NIF_TERM counter_offer;
+
+        if (counter_request->offer_size == 0) {
+            // immediate term
+            counter_offer = counter_request->offer;
+        }
+        else {
+            counter_offer = enif_make_copy(ctx->env, counter_request->offer);
+            ctx->copied_bytes += counter_request->offer_size;
+        }
 
         return make_match(ctx->env, match_ref, counter_offer, sojourn_time);
     }
