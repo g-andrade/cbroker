@@ -31,7 +31,7 @@
 
 //
 
-#define MAX_ASK_RETRIES 100 // FIXME
+#define MAX_ASK_RETRIES 10 // FIXME
 
 //
 
@@ -481,6 +481,7 @@ static size_t batch_size(const size_t nr_of_cells);
 static batch_t* batch_new(const batch_id_t id, const size_t nr_of_cells);
 static void batch_init(batch_t* batch, const batch_id_t id);
 static void batch_ref_count_inc(batch_t* batch);
+static bool batch_is_consumed(batch_t* batch);
 static ERL_NIF_TERM batch_to_term(ErlNifEnv* env, const batch_t* batch);
 
 //
@@ -1304,23 +1305,58 @@ static void ask_loop_tail_skip(ask_ctx_t* ctx, const batch_id_t batch_id)
         global_state_t* global_state = ctx->global_state;
         enif_mutex_lock(global_state->lock);
 
-        if (!cbroker_omap_next(global_state->batches, batch_id, NULL, (void**)&next_batch)) {
-            batch_id_t tail_id = batch_id + 1;
+        batch_t** all_next = NULL;
+        batch_t* one_of_next = NULL;
+
+        size_t all_next_count =
+            cbroker_omap_all_next(global_state->batches, batch_id, NULL, (void***)&all_next);
+
+        size_t all_next_size = all_next_count * sizeof(batch_t*);
+        batch_t** batches_to_checkout = enif_alloc(all_next_size);
+        size_t checkout_amount = 0;
+
+        for (size_t i = 0; i < all_next_count; i++) {
+            one_of_next = all_next[i];
+            assert(one_of_next != NULL);
+            assert(one_of_next->id > batch_id);
+            if (!batch_is_consumed(one_of_next)) {
+                batch_ref_count_inc(one_of_next);
+                batches_to_checkout[checkout_amount++] = one_of_next;
+            }
+        }
+
+        if (checkout_amount == 0) {
+            batch_id_t tail_id =
+                (all_next_count == 0 ? batch_id + 1 : all_next[all_next_count - 1]->id + 1);
+
             next_batch = batch_pool_get(&global_state->batch_pool, broker->nr_of_cells_per_batch);
             batch_init(next_batch, tail_id);
             map_res = cbroker_omap_insert(global_state->batches, tail_id, next_batch);
             assert(map_res == CBROKER_OMAP_OK);
+            batch_ref_count_inc(next_batch);
+
+            enif_mutex_unlock(global_state->lock);
+
+            map_res = cbroker_omap_insert(local_state->batches, next_batch->id, next_batch);
+            assert(map_res == CBROKER_OMAP_OK);
         }
+        else {
+            enif_mutex_unlock(global_state->lock);
+
+            for (size_t i = 0; i < checkout_amount; i++) {
+                one_of_next = batches_to_checkout[i];
+                map_res = cbroker_omap_insert(local_state->batches, one_of_next->id, one_of_next);
+                assert(map_res == CBROKER_OMAP_OK);
+            }
+
+            next_batch = batches_to_checkout[checkout_amount - 1];
+            enif_free(batches_to_checkout);
+        }
+
         assert(next_batch != NULL);
-        batch_ref_count_inc(next_batch);
-
-        enif_mutex_unlock(global_state->lock);
-
-        map_res = cbroker_omap_insert(local_state->batches, next_batch->id, next_batch);
-        assert(map_res == CBROKER_OMAP_OK);
+        assert(next_batch->id > batch_id);
     }
 
-    assert(next_batch->id > batch_id);
     *(ctx->tail_id_ptr) = next_batch->id;
 
     if (*(ctx->opposite_tail_id_ptr) > batch_id && lease->batch != NULL) {
@@ -1515,8 +1551,6 @@ static void ask_reply_closed(ask_ctx_t* ctx)
 
 static bool ask_retry_can(ask_ctx_t* ctx)
 {
-    LOG_UNCOND("[%T] pls retry", ctx->self_term);
-
     retry_t* retry = ctx->retry;
     int retry_nr = (retry == NULL ? 1 : retry->nr + 1);
 
@@ -2154,6 +2188,12 @@ static void batch_ref_count_inc(batch_t* batch)
     ref_count_t ref_count =
         1 + atomic_fetch_add_explicit(&batch->ref_count, +1, memory_order_relaxed);
     assert(ref_count >= 2);
+}
+
+static bool batch_is_consumed(batch_t* batch)
+{
+    return (atomic_load_explicit(&batch->consumed_count, memory_order_relaxed) >=
+            batch->nr_of_cells);
 }
 
 static ERL_NIF_TERM batch_to_term(ErlNifEnv* env, const batch_t* batch)

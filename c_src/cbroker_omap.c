@@ -461,4 +461,40 @@ bool cbroker_omap_next(const cbroker_omap_t* map, uint64_t key, uint64_t* key_ou
     return true;
 }
 
+size_t cbroker_omap_all_next(const cbroker_omap_t* map, uint64_t key, uint64_t** keys_out,
+                             void*** values_out)
+{
+    bool found;
+    size_t idx;
+
+    /* The common call is "successor of the largest key", which get_next_batch
+     * makes on every batch advance and which has no answer. One compare
+     * settles it, and an empty map, without a search. */
+    if (map->head == map->tail || key >= map->keys[map->tail - 1]) {
+        return 0;
+    }
+
+    idx = omap_search(map, key, &found);
+
+    /* omap_search lands on the first key >= `key`, which is already the
+     * successor unless it is `key` itself. */
+    if (found) {
+        idx++;
+    }
+    if (idx >= map->tail) {
+        return 0;
+    }
+
+    size_t count = map->tail - idx;
+
+    if (keys_out != NULL) {
+        *keys_out = &map->keys[idx];
+    }
+    if (values_out != NULL) {
+        *values_out = &map->values[idx];
+    }
+
+    return count;
+}
+
 void** cbroker_omap_values(const cbroker_omap_t* map) { return &map->values[map->head]; }
