@@ -571,11 +571,10 @@ static struct {
 
 //
 
-static ErlNifFunc nif_funcs[] = {{"new", 0, nif_new, 0},
-                                 {"new", 1, nif_new, 0},
-                                 {"nif_ask", 5, nif_ask, 0},
-                                 {"nif_cancel", 1, nif_cancel, 0},
-                                 {"nif_debug_info", 1, nif_debug_info, 0}};
+static ErlNifFunc nif_funcs[] = {{"new", 1, nif_new, 0},
+                                 {"ask", 5, nif_ask, 0},
+                                 {"cancel", 1, nif_cancel, 0},
+                                 {"debug_info", 1, nif_debug_info, 0}};
 
 static struct {
     ErlNifResourceType* broker;
@@ -645,7 +644,7 @@ static void load_retry_resource(ErlNifEnv* caller_env)
     assert(ResourceTypes.retry != NULL);
 }
 
-ERL_NIF_INIT(cbroker, nif_funcs, on_load, NULL, NULL, NULL);
+ERL_NIF_INIT(cbroker_nif, nif_funcs, on_load, NULL, NULL, NULL);
 
 /*********************************************************************/
 

@@ -1,7 +1,5 @@
 -module(cbroker).
 
--on_load(init/0).
-
 %% ------------------------------------------------------------------
 %% API Function Exports
 %% ------------------------------------------------------------------
@@ -46,9 +44,6 @@
 %% ------------------------------------------------------------------
 %% Macro Definitions
 %% ------------------------------------------------------------------
-
--define(APPNAME, cbroker).
--define(LIBNAME, cbroker).
 
 -define(DEFAULT_TIMEOUT, 5_000).
 
@@ -242,7 +237,7 @@ when
     SojournTime :: sojourn_time().
 
 cancel(Tag) ->
-    case nif_cancel(Tag) of
+    case cbroker_nif:cancel(Tag) of
         too_late ->
             %
             case resumable_await(Tag, infinity) of
@@ -281,7 +276,7 @@ child_spec(Name, Opts) ->
 
 debug_info(Broker) ->
     BrokerRef = resolve_broker(Broker),
-    nif_debug_info(BrokerRef).
+    cbroker_nif:debug_info(BrokerRef).
 
 %%
 
@@ -355,11 +350,8 @@ nb_ask(Broker, Side, Offer) ->
 
 %%
 
--spec new() -> Broker when
-    Broker :: broker_ref().
-
 new() ->
-    not_loaded(?LINE).
+    new([]).
 
 %%
 
@@ -367,8 +359,8 @@ new() ->
     Opts :: [broker_opt()],
     Broker :: broker_ref().
 
-new(_Opts) ->
-    not_loaded(?LINE).
+new(Opts) ->
+    cbroker_nif:new(Opts).
 
 %%
 
@@ -490,61 +482,14 @@ resumable_await(Tag, Timeout) ->
 %% Internal Function Definitions
 %% ------------------------------------------------------------------
 
-init() ->
-    SoName =
-        case code:priv_dir(?APPNAME) of
-            {error, bad_name} ->
-                case filelib:is_dir(filename:join(["..", priv])) of
-                    true ->
-                        filename:join(["..", priv, ?LIBNAME]);
-                    _ ->
-                        filename:join([priv, ?LIBNAME])
-                end;
-            Dir ->
-                filename:join(Dir, ?LIBNAME)
-        end,
-    erlang:load_nif(SoName, 0).
-
-%%
-
 do_ask(BrokerRef, Side, Offer, AskType) ->
-    OfferSizeArg = offer_size_arg(Offer),
-
-    case nif_ask(BrokerRef, Side, Offer, OfferSizeArg, AskType) of
+    case cbroker_nif:ask(BrokerRef, Side, Offer, AskType) of
         {error, Reason} ->
             error(Reason);
         %
         Result ->
             Result
     end.
-
-nif_ask(_BrokerRef, _Side, _Offer, _OffersizeArg, _AskType) ->
-    not_loaded(?LINE).
-
--if(?OTP_RELEASE < 29).
-offer_size_arg(Value) ->
-    erts_debug:flat_size(Value).
--else.
-offer_size_arg(_Value) ->
-    compute_from_nif.
--endif.
-
-%%
-
--spec nif_cancel(Tag) -> too_late | {cancelled, SojournTime} when
-    Tag :: tag(),
-    SojournTime :: sojourn_time().
-
-nif_cancel(_Tag) ->
-    not_loaded(?LINE).
-
-nif_debug_info(_BrokerRef) ->
-    not_loaded(?LINE).
-
-%%
-
-not_loaded(Line) ->
-    erlang:nif_error({not_loaded, [{module, ?MODULE}, {line, Line}]}).
 
 resolve_broker(BrokerRef) when is_reference(BrokerRef) ->
     BrokerRef;
