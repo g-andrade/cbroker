@@ -1750,8 +1750,7 @@ static void tag_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMon
     assert(request != NULL);
     assert(request->tag == tag);
 
-    LOG_UNCOND("[request DOWN %T] batch %llu, offset %llu", pid_term, request->batch_id,
-               request->offset);
+    LOG("[request DOWN %T] batch %llu, offset %llu", pid_term, request->batch_id, request->offset);
 
     broker_t* broker = NULL;
     int res = get_broker(request->env, request->broker_term, &broker);
