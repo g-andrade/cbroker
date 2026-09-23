@@ -27,8 +27,8 @@
 -define(ALL_OFFER_TYPES, [pid | ?ALL_TUPLE_OFFER_TYPES] ++ ?ALL_LIST_OFFER_TYPES).
 %-define(ALL_OFFER_TYPES, [pid, {tuple, 10}]).
 
--define(MAX_TOTAL_ITERATIONS, 1_000_000).
-%-define(TOTAL_ITERATIONS, 100).
+-define(CASE_TIMEOUT, 5000).
+%-define(CASE_TIMEOUT, 155).
 
 %% ------------------------------------------------------------------
 %% Type Definitions
@@ -39,21 +39,18 @@
     implementation,
     proc_count :: pos_integer(),
     offer_type :: term(),
-    offer :: term(),
-    total_iterations :: pos_integer()
+    offer :: term()
 }).
 
 -record(run, {
     nr_of_schedulers,
     cases,
-    stats,
-    prev_run_times :: [number()]
+    stats
 }).
 
 -record(result, {
     implementation,
     offer_type,
-    total_iterations,
     proc_count,
     stats
 }).
@@ -64,7 +61,6 @@
 
 cases(Implementations) ->
     AllOffers = [{OfferType, new_offer(OfferType)} || OfferType <- ?ALL_OFFER_TYPES],
-    IterationsPerOffer = estimate_iterations_per_offer(AllOffers),
 
     NrOfSchedulers = erlang:system_info(schedulers),
     AllProcCounts = lists:usort(
@@ -83,7 +79,7 @@ cases(Implementations) ->
             Case =/= impossible
         end,
         [
-            new_case(Implementation, OfferType, Offer, ProcCount, IterationsPerOffer)
+            new_case(Implementation, OfferType, Offer, ProcCount)
          || Implementation <- Implementations,
             {OfferType, Offer} <- AllOffers,
             ProcCount <- AllProcCounts
@@ -98,8 +94,7 @@ run(Cases) ->
     Run = #run{
         nr_of_schedulers = erlang:system_info(schedulers),
         cases = Cases,
-        stats = StatsAcc,
-        prev_run_times = []
+        stats = StatsAcc
     },
 
     run_epoch(ShuffledCases, Run).
@@ -111,11 +106,10 @@ organized_stats(#run{stats = Stats}) ->
                 fun({_CaseId, [CaseResult]}) ->
                     #result{
                         implementation = Implementation,
-                        offer_type = OfferType,
-                        total_iterations = TotalIterations
+                        offer_type = OfferType
                     } = CaseResult,
 
-                    {Implementation, OfferType, TotalIterations}
+                    {Implementation, OfferType}
                 end,
                 maps:to_list(Stats)
             )
@@ -129,8 +123,8 @@ organized_stats(#run{stats = Stats}) ->
 dump_stats(Path, GroupedAndSorted) ->
     lists:foreach(
         fun({GroupKey, Entries}) ->
-            {Implementation, OfferType, TotalIterations} = GroupKey,
-            dump_group(Path, Implementation, OfferType, TotalIterations, Entries)
+            {Implementation, OfferType} = GroupKey,
+            dump_group(Path, Implementation, OfferType, Entries)
         end,
         GroupedAndSorted
     ).
@@ -139,125 +133,19 @@ dump_stats(Path, GroupedAndSorted) ->
 %% Internal Function Definitions
 %% ------------------------------------------------------------------
 
-estimate_iterations_per_offer(AllOffers) ->
-    {ok, _} = application:ensure_all_started([taskforce]),
-    IndividualTimeout = 5000,
-
-    TaskList = lists:map(
-        fun({OfferType, Offer}) ->
-            Task = taskforce:task(fun estimate_offer_iterations/1, [Offer], #{
-                timeout => IndividualTimeout
-            }),
-            {OfferType, Task}
-        end,
-        AllOffers
-    ),
-
-    Tasks = maps:from_list(TaskList),
-
-    logger:notice("Estimating iterations per offer..."),
-    #{
-        completed := Results,
-        individual_timeouts := [],
-        global_timeouts := []
-    } = taskforce:execute(Tasks, #{timeouts => IndividualTimeout * length(AllOffers)}),
-
-    Rates = maps:values(Results),
-    {copy_rate, MaxRate} = lists:max(Rates),
-
-    maps:map(
-        fun(_OfferType, {copy_rate, CopyRate}) ->
-            RelativeRate = CopyRate / MaxRate,
-            ?assertMatch(_ when RelativeRate > 0, RelativeRate =< 1, RelativeRate),
-            RawTotalIterations = ceil(RelativeRate * ?MAX_TOTAL_ITERATIONS),
-            TotalIterations = nicer_integer(RawTotalIterations),
-            {total_iterations, TotalIterations}
-        end,
-        Results
-    ).
-
-estimate_offer_iterations(Offer) ->
-    StartTs = erlang:monotonic_time(),
-    Parent = self(),
-    AuxPid = spawn_link(fun() -> offer_estimator_aux(Parent) end),
-    _ = erlang:send_after(2000, self(), finish),
-    estimate_offer_iterations(AuxPid, Offer, StartTs, 0).
-
-estimate_offer_iterations(AuxPid, Offer, StartTs, Copies) ->
-    _ = AuxPid ! {first_copy, Offer},
-
-    receive
-        Msg ->
-            case Msg of
-                {second_copy, _} ->
-                    estimate_offer_iterations(AuxPid, Offer, StartTs, Copies + 2);
-                %
-                finish ->
-                    FinishTs = erlang:monotonic_time(),
-                    ElapsedSeconds =
-                        (FinishTs - StartTs) / erlang:convert_time_unit(1, second, native),
-                    CopyRate = (Copies + 1) / ElapsedSeconds,
-                    {copy_rate, CopyRate}
-            end
-    end.
-
-offer_estimator_aux(Parent) ->
-    receive
-        Msg ->
-            case Msg of
-                {first_copy, Offer} ->
-                    Parent ! {second_copy, Offer},
-                    offer_estimator_aux(Parent)
-            end
-    end.
-
-nicer_integer(Iterations) ->
-    Exponent = floor(math:log10(Iterations)) - 2,
-
-    case Exponent < 0 of
-        true ->
-            Iterations;
-        %
-        false ->
-            Divisor = trunc(math:pow(10, Exponent)),
-            (Iterations div Divisor) * Divisor
-    end.
-
-%%
-
-new_case(Implementation, OfferType, Offer, ProcCount, IterationsPerOffer) ->
-    TotalIterations = total_iterations(OfferType, ProcCount, IterationsPerOffer),
-
-    case TotalIterations < ProcCount of
-        true ->
-            impossible;
-        %
-        false ->
-            #bcase{
-                id = new_case_id(Implementation, OfferType, ProcCount),
-                implementation = Implementation,
-                proc_count = ProcCount,
-                offer_type = OfferType,
-                offer = Offer,
-                total_iterations = TotalIterations
-            }
-    end.
+new_case(Implementation, OfferType, Offer, ProcCount) ->
+    #bcase{
+        id = new_case_id(Implementation, OfferType, ProcCount),
+        implementation = Implementation,
+        proc_count = ProcCount,
+        offer_type = OfferType,
+        offer = Offer
+    }.
 
 new_case_id(Implementation, OfferType, ProcCount) ->
     OfferTypeIo = offer_type_io(OfferType),
     IoData = io_lib:format("~ts - ~ts (~b procs)", [Implementation, OfferTypeIo, ProcCount]),
     <<_/bytes>> = unicode:characters_to_binary(IoData).
-
-total_iterations(OfferType, ProcCount, IterationsPerOffer) ->
-    {total_iterations, TotalIterations} = maps:get(OfferType, IterationsPerOffer),
-
-    case TotalIterations >= ProcCount of
-        true ->
-            TotalIterations;
-        %
-        false ->
-            impossible
-    end.
 
 offer_type_io(pid) ->
     "pid";
@@ -278,48 +166,42 @@ new_offer({list, Size}) ->
 run_epoch([Case | Next], Acc) ->
     #run{
         cases = Cases,
-        stats = StatsAcc,
-        prev_run_times = PrevRunTimes
+        stats = StatsAcc
     } = Acc,
 
     #bcase{
         id = Id,
         implementation = Implementation,
         proc_count = ProcCount,
-        offer = Offer,
-        total_iterations = TotalIterations
+        offer = Offer
     } = Case,
 
-    Progress = progress_str(Next, Cases, PrevRunTimes),
+    Progress = progress_str(Next, Cases),
 
-    logger:notice("Running '~ts' x~b [~ts]", [Id, TotalIterations, Progress]),
-    {Time, RunStats} = timer:tc(
-        fun() -> cbroker_quickbench:bench1(Implementation, Offer, TotalIterations, ProcCount) end,
-        millisecond
-    ),
+    logger:notice("Running '~ts' [~ts]", [Id, Progress]),
+    RunStats = cbroker_quickbench:bench1(Implementation, Offer, ?CASE_TIMEOUT, ProcCount),
 
     Result = #result{
         implementation = Implementation,
         offer_type = Case#bcase.offer_type,
-        total_iterations = TotalIterations,
         proc_count = ProcCount,
         stats = RunStats
     },
 
     UpdatedStatsAcc = StatsAcc#{Id := [Result]},
-    UpdatedAcc = Acc#run{stats = UpdatedStatsAcc, prev_run_times = [Time | PrevRunTimes]},
+    UpdatedAcc = Acc#run{stats = UpdatedStatsAcc},
 
     run_epoch(Next, UpdatedAcc);
 run_epoch([], Acc) ->
     Acc.
 
-progress_str(Next, Cases, PrevRunTimes) ->
+progress_str(Next, Cases) ->
     LenNext = length(Next),
     LenCases = length(Cases),
     Prog = LenCases - LenNext,
     Percent = 100 * Prog div LenCases,
 
-    case estimate_time_left_str(PrevRunTimes, LenNext) of
+    case time_left_str(LenNext) of
         none ->
             io_lib:format("~b / ~b (~b %)", [Prog, LenCases, Percent]);
         %
@@ -327,11 +209,8 @@ progress_str(Next, Cases, PrevRunTimes) ->
             io_lib:format("~b / ~b (~b %, ~ts remaining)", [Prog, LenCases, Percent, EstimateStr])
     end.
 
-estimate_time_left_str(PrevRunTimes, _LenNext) when length(PrevRunTimes) < 5 ->
-    none;
-estimate_time_left_str(PrevRunTimes, LenNext) ->
-    AvgRunTime = lists:sum(PrevRunTimes) / length(PrevRunTimes),
-    ExpectationInSeconds = ceil(AvgRunTime * LenNext / 1000),
+time_left_str(LenNext) ->
+    ExpectationInSeconds = ceil(LenNext * (?CASE_TIMEOUT + 150) / 1000),
 
     Hours = ExpectationInSeconds div 3600,
     HourSeconds = ExpectationInSeconds rem 3600,
@@ -368,11 +247,10 @@ prepare_group_entry({_CaseId, [CaseResult]}) ->
 
 %%
 
-dump_group(BasePath, Implementation, OfferType, TotalIterations, Entries) ->
+dump_group(BasePath, Implementation, OfferType, Entries) ->
     Path = filename:join([
         BasePath,
-        atom_to_binary(Implementation, utf8),
-        io_lib:format("~ts x~b.csv", [offer_type_io(OfferType), TotalIterations])
+        io_lib:format("~p_~ts.csv", [Implementation, offer_type_io(OfferType)])
     ]),
 
     ok = filelib:ensure_dir(Path),
@@ -382,7 +260,8 @@ dump_group(BasePath, Implementation, OfferType, TotalIterations, Entries) ->
     Headers =
         [
             proc_count,
-            run_time_s,
+            {rps, average},
+            {rps, median},
             {delay_us, blocked, average},
             {delay_us, blocked, median},
             {delay_us, blocked, p95},
@@ -414,6 +293,8 @@ dump_group(BasePath, Implementation, OfferType, TotalIterations, Entries) ->
 
 csv_header(Atom) when is_atom(Atom) ->
     atom_to_binary(Atom, utf8);
+csv_header({rps, StatName}) ->
+    io_lib:format("rps_~p", [StatName]);
 csv_header({delay_us, DelayType, Metric}) ->
     io_lib:format("~p_delay_~p_μs", [DelayType, Metric]).
 
@@ -422,9 +303,22 @@ csv_cell(ProcCount, Stats, HeaderName) ->
         proc_count ->
             integer_to_list(ProcCount);
         %
-        run_time_s ->
-            {_, Value} = lists:keyfind(total_duration_secs, 1, Stats),
-            float_to_binary(Value, [{decimals, 4}, compact]);
+        {rps, StatName} ->
+            {_, RpsStats} = lists:keyfind(requests_per_second, 1, Stats),
+
+            case RpsStats of
+                not_available ->
+                    "";
+                %
+                RpsStats when StatName =:= average ->
+                    {_, Value} = lists:keyfind(average, 1, RpsStats),
+                    integer_to_binary(Value);
+                %
+                RpsStats ->
+                    {_, Percentiles} = lists:keyfind(percentiles, 1, RpsStats),
+                    {_, Value} = lists:keyfind(StatName, 1, Percentiles),
+                    integer_to_binary(Value)
+            end;
         %
         {delay_us, DelayType, StatName} ->
             {_, DelaysPerGroup} = lists:keyfind(delays_per_group, 1, Stats),

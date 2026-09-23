@@ -90,11 +90,16 @@ start_link() ->
     proc_lib:start_link(?MODULE, init, [self()]).
 
 async_ask(Side, Pid, Value) ->
-    ServPid = whereis(?SERVER),
-    Tag = monitor(process, ServPid),
-    Ts = erlang:monotonic_time(),
-    _ = ServPid ! {ask, Side, Pid, Value, Tag, Ts},
-    {await, ServPid, Tag}.
+    case whereis(?SERVER) of
+        undefined ->
+            stopped;
+        %
+        ServPid ->
+            Tag = monitor(process, ServPid),
+            Ts = erlang:monotonic_time(),
+            _ = ServPid ! {ask, Side, Pid, Value, Tag, Ts},
+            {await, ServPid, Tag}
+    end.
 
 ask(Side, Pid, Value) ->
     {await, _, Tag} = async_ask(Side, Pid, Value),

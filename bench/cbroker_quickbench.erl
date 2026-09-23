@@ -46,13 +46,13 @@
 %% API Function Definitions
 %% ------------------------------------------------------------------
 
-bench1(Impl, OfferName, TotalIterations, TotalPidsAmount) when is_atom(OfferName) ->
+bench1(Impl, OfferName, Timeout, TotalPidsAmount) when is_atom(OfferName) ->
     Offer = generate_exchange_value(OfferName),
-    bench1(Impl, Offer, TotalIterations, TotalPidsAmount);
-bench1(Impl, Offer, TotalIterations, TotalPidsAmount) ->
+    bench1(Impl, Offer, Timeout, TotalPidsAmount);
+bench1(Impl, Offer, Timeout, TotalPidsAmount) ->
     Target = setup(Impl),
     try
-        run_bench1(Impl, Target, Offer, TotalIterations, TotalPidsAmount)
+        run_bench1(Impl, Target, Offer, Timeout, TotalPidsAmount)
     after
         teardown(Impl, Target)
     end.
@@ -61,7 +61,7 @@ bench1(Impl, Offer, TotalIterations, TotalPidsAmount) ->
 %% Internal Function Definitions
 %% ------------------------------------------------------------------
 
-run_bench1(Impl, Target, Offer, TotalIterations, TotalPidsAmount) ->
+run_bench1(Impl, Target, Offer, Timeout, TotalPidsAmount) ->
     LeftFun = left_fun(Impl, Target),
     RightFun = right_fun(Impl, Target),
 
@@ -69,11 +69,8 @@ run_bench1(Impl, Target, Offer, TotalIterations, TotalPidsAmount) ->
     LeftPidsAmount = TotalPidsAmount div 2,
     RightPidsAmount = TotalPidsAmount - LeftPidsAmount,
 
-    LeftIterationsList = iterations_list(TotalIterations, LeftPidsAmount),
-    RightIterationsList = iterations_list(TotalIterations, RightPidsAmount),
-
-    LeftPids = launch_processes(LeftFun, Offer, LeftIterationsList),
-    RightPids = launch_processes(RightFun, Offer, RightIterationsList),
+    LeftPids = launch_processes(LeftFun, Offer, LeftPidsAmount),
+    RightPids = launch_processes(RightFun, Offer, RightPidsAmount),
 
     Pids = pids_join(LeftPids, RightPids),
     PidSet = maps:from_keys(Pids, v),
@@ -82,15 +79,26 @@ run_bench1(Impl, Target, Offer, TotalIterations, TotalPidsAmount) ->
     erlang:garbage_collect(),
     %logger:notice("Starting..."),
     StartTs = erlang:monotonic_time(),
+    ScheduledFinishTsMillis = erlang:convert_time_unit(StartTs, native, millisecond) + Timeout,
+    TimerRef = erlang:send_after(ScheduledFinishTsMillis, self(), timeout, [{abs, true}]),
     processes_send(Pids, go),
+
+    receive
+        timeout ->
+            false = erlang:cancel_timer(TimerRef),
+            processes_send(Pids, stop_asking),
+            teardown(Impl, Target)
+    end,
+
     receive_done(PidSet),
-    FinishTs = erlang:monotonic_time(),
 
     logger:debug("Collecting stats!"),
     %timer:sleep(100),
 
     processes_send(Pids, stats),
     Samples = receive_results(PidSet),
+
+    {OldestSampleStartTs, NewestSampleFinishTs} = total_samples_duration_timestamps(Samples),
 
     TotalSamples = length(Samples),
     GroupedSamples = maps:groups_from_list(fun sample_group/1, Samples),
@@ -101,50 +109,45 @@ run_bench1(Impl, Target, Offer, TotalIterations, TotalPidsAmount) ->
 
     TotalDurationSecs =
         round(
-            (FinishTs - StartTs) /
+            (NewestSampleFinishTs - OldestSampleStartTs) /
                 erlang:convert_time_unit(1, millisecond, native)
         ) / 1000,
 
     [
         {total_duration_secs, TotalDurationSecs},
+        {total_requests, length(Samples)},
+        {requests_per_second, rps_stats(Samples)},
         {delays_per_group,
             lists:map(fun(Group) -> group_stats(Group, TotalSamples) end, SortedGroups)}
     ].
 
-iterations_list(TotalIterations, PidsAmount) ->
-    Base = TotalIterations div PidsAmount,
-    Rem = TotalIterations rem PidsAmount,
-    true = Base >= 1,
-    [
-        Base +
-            (if
-                I =< Rem -> 1;
-                true -> 0
-            end)
-     || I <- lists:seq(1, PidsAmount)
-    ].
+total_samples_duration_timestamps([{_SampleType, StartTs, FinishTs} | Next]) ->
+    total_samples_duration_timestamps_recur(Next, StartTs, FinishTs).
 
-sample_group({blocked, _}) ->
+total_samples_duration_timestamps_recur(
+    [{_SampleType, StartTs, FinishTs} | Next], OldestStartTs, NewestFinishTs
+) ->
+    total_samples_duration_timestamps_recur(
+        Next, min(OldestStartTs, StartTs), max(NewestFinishTs, FinishTs)
+    );
+total_samples_duration_timestamps_recur([], OldestStartTs, NewestFinishTs) ->
+    {OldestStartTs, NewestFinishTs}.
+
+sample_group({blocked, _, _}) ->
     blocked;
 sample_group({instant, _, _}) ->
-    instant;
-sample_group({instant, _}) ->
-    instant;
-sample_group({retried, RetryCount, _}) ->
-    {retried, RetryCount}.
+    instant.
 
 group_with_sorting_key({GroupKey, _} = Pair) ->
     {group_sorting_key(GroupKey), Pair}.
 
 group_sorting_key(instant) ->
     [1];
-group_sorting_key({retried, RetryCount}) ->
-    [2, RetryCount];
 group_sorting_key(blocked) ->
-    [3].
+    [2].
 
 group_stats({_SortingKey, {GroupKey, Samples}}, TotalSamples) ->
-    Delays = lists:map(fun last_element/1, Samples),
+    Delays = [sample_delay(Sample) || Sample <- Samples],
     Count = length(Delays),
     PercentageOfTotal = round(1000 * Count / TotalSamples) / 10,
 
@@ -162,36 +165,12 @@ group_stats({_SortingKey, {GroupKey, Samples}}, TotalSamples) ->
 
     {GroupKey, Stats}.
 
-last_element(Tuple) ->
-    Size = tuple_size(Tuple),
-    element(Size, Tuple).
+sample_delay({Type, StartTs, EndTs}) when Type =:= instant; Type =:= blocked ->
+    EndTs - StartTs.
 
 percentile_us(Percentile, Bag) ->
     {value, Value} = xb5_bag:percentile(Percentile, Bag),
     native_to_us(Value).
-
-%    DelaysBag = xb5_bag:from_list(Delays),
-%    RpsList = rps_list(StartTss),
-%    RpsBag = xb5_bag:from_list(RpsList),
-
-%    [
-%     {rps, [
-%        {average, floor(lists:sum(RpsList) / length(RpsList))},
-%        {percentiles, [
-%           {median, floor(element(2, xb5_bag:percentile(0.50, RpsBag)))},
-%           {p95, floor(element(2, xb5_bag:percentile(0.95, RpsBag)))},
-%           {p99, floor(element(2, xb5_bag:percentile(0.99, RpsBag)))}
-%        ]}
-%     ]},
-%     {delays, [
-%        {average, native_to_us(lists:sum(Delays) / length(Delays))},
-%        {percentiles, [
-%           {median, native_to_us(xb5_bag:percentile(0.50, DelaysBag))},
-%           {p95, native_to_us(xb5_bag:percentile(0.95, DelaysBag))},
-%           {p99, native_to_us(xb5_bag:percentile(0.99, DelaysBag))}
-%        ]}
-%     ]}
-%    ].
 
 generate_exchange_value(smallest) ->
     self();
@@ -212,32 +191,82 @@ native_to_us(Interval) when is_number(Interval) ->
 
 %%
 
-%rps_list(StartTss) ->
-%    Bag = xb5_bag:from_list(StartTss),
-%    Sorted = lists:usort(xb5_bag:to_list(Bag)),
-%    rps_list_recur(Sorted, Bag).
-%
-%rps_list_recur([WindowEnd | Next], Bag) ->
-%    WindowStart = WindowEnd - erlang:convert_time_unit(1, second, native),
-%
-%    case xb5_bag:larger(WindowStart, Bag) of
-%        {found, StartTs} ->
-%            case WindowEnd - StartTs of
-%                0 ->
-%                    rps_list_recur(Next, Bag);
-%                %
-%                Duration ->
-%                    {rank, StartRank} = xb5_bag:rank(StartTs, Bag),
-%                    {rank, EndRank} = xb5_bag:rank(WindowEnd, Bag),
-%                    InstantRps = (EndRank - StartRank + 1) / (Duration / erlang:convert_time_unit(1, second, native)),
-%                    [InstantRps | rps_list_recur(Next, Bag)]
-%            end;
-%        %
-%        none ->
-%            rps_list_recur(Next, Bag)
-%    end;
-%rps_list_recur([], _) ->
-%    [].
+rps_stats(Stats) ->
+    SortedStats = lists:keysort(3, Stats),
+    Window = queue:new(),
+    WindowSize = 0,
+    MinPeriod = erlang:convert_time_unit(100, millisecond, native),
+    OneSecond = erlang:convert_time_unit(1, second, native),
+
+    case rps_stats_recur(SortedStats, Window, WindowSize, MinPeriod, OneSecond) of
+        [] ->
+            not_available;
+        %
+        RpsValues ->
+            RpsBag = xb5_bag:from_list(RpsValues),
+            Avg = lists:sum(RpsValues) / xb5_bag:size(RpsBag),
+
+            [
+                {average, round_rps(Avg)},
+                {percentiles, [
+                    {median, round_rps(xb5_bag:percentile(0.50, RpsBag))},
+                    {p95, round_rps(xb5_bag:percentile(0.95, RpsBag))},
+                    {p99, round_rps(xb5_bag:percentile(0.99, RpsBag))}
+                ]}
+            ]
+    end.
+
+round_rps({value, Value}) ->
+    round_rps(Value);
+round_rps(Value) ->
+    floor(Value).
+
+rps_stats_recur(
+    [{_SampleType, _StartTs, FinishTs} | Next], Window, WindowSize, MinPeriod, OneSecond
+) ->
+    % we gotta pick one, but excessive delays may distort the results
+    SampleTs = FinishTs,
+    [Window2 | WindowSize2] = rps_stats_drop(SampleTs, Window, WindowSize, OneSecond),
+    Window3 = queue:in(SampleTs, Window2),
+    WindowSize3 = WindowSize2 + 1,
+
+    case maybe_rps_value(Window3, WindowSize3, MinPeriod, OneSecond) of
+        no ->
+            rps_stats_recur(Next, Window3, WindowSize3, MinPeriod, OneSecond);
+        %
+        Rps ->
+            [Rps | rps_stats_recur(Next, Window3, WindowSize3, MinPeriod, OneSecond)]
+    end;
+rps_stats_recur([], _, _, _, _) ->
+    [].
+
+rps_stats_drop(SampleTs, Window, WindowSize, OneSecond) ->
+    case queue:is_empty(Window) orelse [head | queue:head(Window)] of
+        true ->
+            [Window | WindowSize];
+        %
+        [head | OldestTs] ->
+            case SampleTs - OldestTs of
+                Diff when Diff >= OneSecond ->
+                    Window2 = queue:drop(Window),
+                    [Window2 | WindowSize - 1];
+                %
+                Diff when Diff >= 0 ->
+                    [Window | WindowSize]
+            end
+    end.
+
+maybe_rps_value(Window, WindowSize, MinPeriod, OneSecond) ->
+    Oldest = queue:head(Window),
+    Newest = queue:last(Window),
+
+    case Newest - Oldest of
+        Diff when Diff >= MinPeriod ->
+            WindowSize * (OneSecond / Diff);
+        %
+        Diff when Diff >= 0 ->
+            no
+    end.
 
 %%
 
@@ -247,12 +276,22 @@ setup(simple) ->
     {ok, Pid} = cbroker_simple:start_link(),
     Pid;
 setup(cbroker) ->
-    cbroker:new().
+    {ok, Pid} = cbroker_persistent:start_link({local, ?MODULE}, []),
+    BrokerRef = cbroker:resolve_name(?MODULE),
+    [Pid | BrokerRef].
 
 teardown(simple, Pid) ->
-    ok = sys:terminate(Pid, normal);
-teardown(cbroker, _Broker) ->
-    ok.
+    ok = sys_terminate_or_noproc(Pid);
+teardown(cbroker, [Pid | _BrokerRef]) ->
+    ok = sys_terminate_or_noproc(Pid).
+
+sys_terminate_or_noproc(Pid) ->
+    try
+        sys:terminate(Pid, normal)
+    catch
+        exit:{Reason, {sys, terminate, [Pid, normal]}} when Reason =:= noproc; Reason =:= normal ->
+            ok
+    end.
 
 left_fun(simple, _Pid) ->
     fun simple_left_iteration/1;
@@ -274,49 +313,62 @@ simple_right_iteration(Offer) ->
 
 simple_iteration(Side, Offer) ->
     StartTs = erlang:monotonic_time(),
-    {await, Pid, Tag} = cbroker_simple:async_ask(Side, self(), Offer),
 
-    receive
-        {Ref, Reply} when Ref =:= Tag ->
-            FinalTs = erlang:monotonic_time(),
-            {match, _MatchRef, _, _} = Reply,
-            {blocked, FinalTs - StartTs};
+    case cbroker_simple:async_ask(Side, self(), Offer) of
+        {await, Pid, Tag} ->
+            receive
+                {Ref, Reply} when Ref =:= Tag ->
+                    FinalTs = erlang:monotonic_time(),
+                    {match, _MatchRef, _, _} = Reply,
+                    {blocked, StartTs, FinalTs};
+                %
+                {'DOWN', Ref, _, _, Reason} when Ref =:= Tag ->
+                    receive
+                        stop_asking ->
+                            throw(finished_asking)
+                    after 0 ->
+                        exit({queue_down, Pid, Reason})
+                    end
+            end;
         %
-        {'DOWN', Ref, _, _, Reason} when Ref =:= Tag ->
-            exit({queue_down, Pid, Reason})
+        stopped ->
+            throw(finished_asking)
     end.
 
 %%
 
-cbroker_iteration(Broker, Side, Offer) ->
+cbroker_iteration([_Pid | BrokerRef], Side, Offer) ->
     StartTs = erlang:monotonic_time(),
-    cbroker_iteration_recur(StartTs, Broker, Side, Offer, 0).
+    cbroker_iteration_recur(StartTs, BrokerRef, Side, Offer).
 
-cbroker_iteration_recur(StartTs, Broker, Side, Offer, RetryCount) ->
-    case cbroker:dynamic_ask(Broker, Side, Offer) of
+cbroker_iteration_recur(StartTs, BrokerRef, Side, Offer) ->
+    try cbroker:dynamic_ask(BrokerRef, Side, Offer) of
         {await, Tag} ->
             cbroker_iteration_await(StartTs, Tag);
         %
         {match, _, _, _} ->
             FinalTs = erlang:monotonic_time(),
-
-            case RetryCount of
-                0 ->
-                    {instant, FinalTs - StartTs};
-                _ ->
-                    {retried, RetryCount, FinalTs - StartTs}
-            end;
+            {instant, StartTs, FinalTs};
         %
-        retry ->
-            cbroker_iteration_recur(StartTs, Broker, Side, Offer, RetryCount + 1)
+        {drop, broker_closed, _} ->
+            throw(finished_asking)
+    catch
+        error:broker_closed ->
+            throw(finished_asking)
     end.
 
 cbroker_iteration_await(StartTs, Tag) ->
     receive
-        {T, Result} when T =:= Tag ->
-            FinalTs = erlang:monotonic_time(),
-            {match, _, _, _} = Result,
-            {blocked, FinalTs - StartTs}
+        Msg ->
+            case Msg of
+                {T, Result} when T =:= Tag ->
+                    FinalTs = erlang:monotonic_time(),
+                    {match, _, _, _} = Result,
+                    {blocked, StartTs, FinalTs};
+                %
+                stop_asking ->
+                    throw(finished_asking)
+            end
     end.
 
 %%
@@ -335,7 +387,7 @@ receive_results(PidSet) when map_size(PidSet) > 0 ->
         {finished, Pid, Stats} when is_map_key(Pid, PidSet) ->
             RemainingPidSet = maps:remove(Pid, PidSet),
             #proc_stats{samples = Samples} = Stats,
-            Samples ++ receive_results(RemainingPidSet)
+            lists:reverse(Samples, receive_results(RemainingPidSet))
     end;
 receive_results(#{}) ->
     [].
@@ -353,20 +405,20 @@ processes_send([Pid | Next], Msg) ->
 processes_send([], _) ->
     ok.
 
-launch_processes(RunFun, Offer, [Iterations | Next]) ->
+launch_processes(RunFun, Offer, Amount) when Amount > 0 ->
     Parent = self(),
     [
-        spawn_link(fun() -> start_process(Parent, RunFun, Offer, Iterations) end)
-        | launch_processes(RunFun, Offer, Next)
+        spawn_link(fun() -> start_process(Parent, RunFun, Offer) end)
+        | launch_processes(RunFun, Offer, Amount - 1)
     ];
-launch_processes(_, _, []) ->
+launch_processes(_, _, 0) ->
     [].
 
-start_process(Parent, RunFun, Offer, Iterations) ->
+start_process(Parent, RunFun, Offer) ->
     receive
         go ->
             erlang:yield(),
-            Samples = run_process(RunFun, Offer, Iterations),
+            Samples = run_process(RunFun, Offer),
             _ = Parent ! {done, self()},
 
             receive
@@ -379,8 +431,11 @@ start_process(Parent, RunFun, Offer, Iterations) ->
             end
     end.
 
-run_process(RunFun, Offer, Iterations) when Iterations > 0 ->
-    Timestamps = RunFun(Offer),
-    [Timestamps | run_process(RunFun, Offer, Iterations - 1)];
-run_process(_, _, 0) ->
-    [].
+run_process(RunFun, Offer) ->
+    try RunFun(Offer) of
+        Timestamps ->
+            [Timestamps | run_process(RunFun, Offer)]
+    catch
+        finished_asking ->
+            []
+    end.
