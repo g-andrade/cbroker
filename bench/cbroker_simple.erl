@@ -11,15 +11,14 @@
 %% ------------------------------------------------------------------
 
 -export([
-    child_spec/0,
-    start_link/0,
-    async_ask/3,
-    ask/3
+    start_link/1,
+    async_ask/4,
+    ask/4
 ]).
 
 -ignore_xref([
-    start_link/0,
-    ask/3
+    start_link/1,
+    ask/4
 ]).
 
 %% ------------------------------------------------------------------
@@ -27,7 +26,7 @@
 %% ------------------------------------------------------------------
 
 -export([
-    init/1,
+    init/3,
     system_code_change/4,
     system_continue/3,
     system_terminate/4,
@@ -35,7 +34,7 @@
 ]).
 
 -ignore_xref([
-    init/1,
+    init/3,
     system_code_change/4,
     system_continue/3,
     system_terminate/4,
@@ -45,8 +44,6 @@
 %% ------------------------------------------------------------------
 %% Macro Definitions
 %% ------------------------------------------------------------------
-
--define(SERVER, ?MODULE).
 
 -define(ENTRY(Pid, Value, Tag, Mon, Ts), {Pid, Value, Tag, Mon, Ts}).
 
@@ -78,34 +75,23 @@
 %% API Function Definitions
 %% ------------------------------------------------------------------
 
--spec child_spec() -> supervisor:child_spec().
-child_spec() ->
-    #{
-        id => ?SERVER,
-        start => {?MODULE, start_link, []}
-    }.
+-spec start_link(on_heap | off_heap) -> {ok, pid()} | {error, {already_started, pid()}}.
+start_link(MessageQueueData) ->
+    Name = server_name(MessageQueueData),
+    proc_lib:start_link(?MODULE, init, [self(), Name, MessageQueueData]).
 
--spec start_link() -> {ok, pid()} | {error, {already_started, pid()}}.
-start_link() ->
-    proc_lib:start_link(?MODULE, init, [self()]).
+async_ask(ServPid, Side, Pid, Value) ->
+    Tag = monitor(process, ServPid),
+    Ts = erlang:monotonic_time(),
+    _ = ServPid ! {ask, Side, Pid, Value, Tag, Ts},
+    {await, Tag}.
 
-async_ask(Side, Pid, Value) ->
-    case whereis(?SERVER) of
-        undefined ->
-            stopped;
-        %
-        ServPid ->
-            Tag = monitor(process, ServPid),
-            Ts = erlang:monotonic_time(),
-            _ = ServPid ! {ask, Side, Pid, Value, Tag, Ts},
-            {await, ServPid, Tag}
-    end.
-
-ask(Side, Pid, Value) ->
-    {await, _, Tag} = async_ask(Side, Pid, Value),
+ask(ServPid, Side, Pid, Value) ->
+    {await, Tag} = async_ask(ServPid, Side, Pid, Value),
 
     receive
         {T, Reply} when T =:= Tag ->
+            demonitor(Tag),
             Reply;
         %
         {'DOWN', Ref, _, _, Reason} when Ref =:= Tag ->
@@ -116,12 +102,12 @@ ask(Side, Pid, Value) ->
 %% sys Function Definitions
 %% ------------------------------------------------------------------
 
--spec init(pid()) -> no_return().
-init(Parent) ->
-    try register(?SERVER, self()) of
+-spec init(pid(), atom(), on_heap | off_heap) -> no_return().
+init(Parent, ServerName, MessageQueueData) ->
+    try register(ServerName, self()) of
         true ->
             Debug = sys:debug_options([]),
-            erlang:process_flag(message_queue_data, off_heap),
+            erlang:process_flag(message_queue_data, MessageQueueData),
 
             Invariants = #invariants{parent = Parent},
 
@@ -136,7 +122,7 @@ init(Parent) ->
             loop(Debug, State)
     catch
         error:badarg ->
-            ExistingPid = whereis(?SERVER),
+            ExistingPid = whereis(ServerName),
             proc_lib:init_ack(Parent, {error, {already_started, ExistingPid}}),
             exit(normal)
     end.
@@ -166,6 +152,11 @@ system_code_change(#state{} = State, _Module, _OldVsn, _Extra) ->
 %% ------------------------------------------------------------------
 %% Internal Function Definitions
 %% ------------------------------------------------------------------
+
+server_name(on_heap) ->
+    cbroker_simple_on_heap;
+server_name(off_heap) ->
+    cbroker_simple_off_heap.
 
 state_parent(#state{invariants = #invariants{parent = Parent}}) ->
     Parent.

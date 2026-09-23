@@ -37,6 +37,13 @@
 ]).
 
 %% ------------------------------------------------------------------
+%% Macro Definitions
+%% ------------------------------------------------------------------
+
+%-define(SAMPLING_MASK, 16#F).
+%-define(SAMPLING_MULTIPLIER, (1 + ?SAMPLING_MASK)).
+
+%% ------------------------------------------------------------------
 %% Type Definitions
 %% ------------------------------------------------------------------
 
@@ -135,6 +142,9 @@ total_samples_duration_timestamps_recur([], OldestStartTs, NewestFinishTs) ->
 
 sample_group({blocked, _, _}) ->
     blocked;
+sample_group({{overloaded, _}, _, _}) ->
+    % This simplifies analysis but it's something to keep an eye on
+    blocked;
 sample_group({instant, _, _}) ->
     instant.
 
@@ -143,8 +153,10 @@ group_with_sorting_key({GroupKey, _} = Pair) ->
 
 group_sorting_key(instant) ->
     [1];
+group_sorting_key({overloaded, OverloadCount}) ->
+    [2, OverloadCount];
 group_sorting_key(blocked) ->
-    [2].
+    [3].
 
 group_stats({_SortingKey, {GroupKey, Samples}}, TotalSamples) ->
     Delays = [sample_delay(Sample) || Sample <- Samples],
@@ -165,7 +177,7 @@ group_stats({_SortingKey, {GroupKey, Samples}}, TotalSamples) ->
 
     {GroupKey, Stats}.
 
-sample_delay({Type, StartTs, EndTs}) when Type =:= instant; Type =:= blocked ->
+sample_delay({_Type, StartTs, EndTs}) ->
     EndTs - StartTs.
 
 percentile_us(Percentile, Bag) ->
@@ -209,6 +221,8 @@ rps_stats(Stats) ->
             [
                 {average, round_rps(Avg)},
                 {percentiles, [
+                    {p01, round_rps(xb5_bag:percentile(0.01, RpsBag))},
+                    {p05, round_rps(xb5_bag:percentile(0.05, RpsBag))},
                     {median, round_rps(xb5_bag:percentile(0.50, RpsBag))},
                     {p95, round_rps(xb5_bag:percentile(0.95, RpsBag))},
                     {p99, round_rps(xb5_bag:percentile(0.99, RpsBag))}
@@ -273,7 +287,10 @@ maybe_rps_value(Window, WindowSize, MinPeriod, OneSecond) ->
 % The bench owns what it measures: a fresh broker, or the `cbroker_simple`
 % baseline server
 setup(simple) ->
-    {ok, Pid} = cbroker_simple:start_link(),
+    {ok, Pid} = cbroker_simple:start_link(on_heap),
+    Pid;
+setup(simple_off_heap) ->
+    {ok, Pid} = cbroker_simple:start_link(off_heap),
     Pid;
 setup(cbroker) ->
     {ok, Pid} = cbroker_persistent:start_link({local, ?MODULE}, []),
@@ -281,6 +298,8 @@ setup(cbroker) ->
     [Pid | BrokerRef].
 
 teardown(simple, Pid) ->
+    ok = sys_terminate_or_noproc(Pid);
+teardown(simple_off_heap, Pid) ->
     ok = sys_terminate_or_noproc(Pid);
 teardown(cbroker, [Pid | _BrokerRef]) ->
     ok = sys_terminate_or_noproc(Pid).
@@ -293,34 +312,29 @@ sys_terminate_or_noproc(Pid) ->
             ok
     end.
 
-left_fun(simple, _Pid) ->
-    fun simple_left_iteration/1;
+left_fun(Implementation, Pid) when Implementation =:= simple; Implementation =:= simple_off_heap ->
+    fun(Offer, AskCounter, Acc) -> simple_iteration(Pid, left, Offer, AskCounter, Acc) end;
 left_fun(cbroker, Broker) ->
-    fun(Offer) -> cbroker_iteration(Broker, left, Offer) end.
+    fun(Offer, AskCounter, Acc) -> cbroker_iteration(Broker, left, Offer, AskCounter, Acc) end.
 
-right_fun(simple, _Pid) ->
-    fun simple_right_iteration/1;
+right_fun(Implementation, Pid) when Implementation =:= simple; Implementation =:= simple_off_heap ->
+    fun(Offer, AskCounter, Acc) -> simple_iteration(Pid, right, Offer, AskCounter, Acc) end;
 right_fun(cbroker, Broker) ->
-    fun(Offer) -> cbroker_iteration(Broker, right, Offer) end.
+    fun(Offer, AskCounter, Acc) -> cbroker_iteration(Broker, right, Offer, AskCounter, Acc) end.
 
 %%
 
-simple_left_iteration(Offer) ->
-    simple_iteration(left, Offer).
-
-simple_right_iteration(Offer) ->
-    simple_iteration(right, Offer).
-
-simple_iteration(Side, Offer) ->
+simple_iteration(Pid, Side, Offer, _AskCounter, Acc) ->
     StartTs = erlang:monotonic_time(),
 
-    case cbroker_simple:async_ask(Side, self(), Offer) of
-        {await, Pid, Tag} ->
+    case cbroker_simple:async_ask(Pid, Side, self(), Offer) of
+        {await, Tag} ->
             receive
                 {Ref, Reply} when Ref =:= Tag ->
+                    demonitor(Ref),
                     FinalTs = erlang:monotonic_time(),
                     {match, _MatchRef, _, _} = Reply,
-                    {blocked, StartTs, FinalTs};
+                    [{blocked, StartTs, FinalTs} | Acc];
                 %
                 {'DOWN', Ref, _, _, Reason} when Ref =:= Tag ->
                     receive
@@ -337,18 +351,29 @@ simple_iteration(Side, Offer) ->
 
 %%
 
-cbroker_iteration([_Pid | BrokerRef], Side, Offer) ->
+cbroker_iteration([_Pid | BrokerRef], Side, Offer, AskCounter, Acc) ->
     StartTs = erlang:monotonic_time(),
-    cbroker_iteration_recur(StartTs, BrokerRef, Side, Offer).
+    cbroker_iteration_recur(BrokerRef, Side, Offer, AskCounter, StartTs, Acc, 0).
 
-cbroker_iteration_recur(StartTs, BrokerRef, Side, Offer) ->
+cbroker_iteration_recur(BrokerRef, Side, Offer, AskCounter, StartTs, Acc, OverloadCount) ->
     try cbroker:dynamic_ask(BrokerRef, Side, Offer) of
         {await, Tag} ->
-            cbroker_iteration_await(StartTs, Tag);
+            cbroker_iteration_await(StartTs, Tag, AskCounter, Acc);
         %
         {match, _, _, _} ->
             FinalTs = erlang:monotonic_time(),
-            {instant, StartTs, FinalTs};
+
+            case OverloadCount > 0 of
+                true ->
+                    [{{overloaded, OverloadCount}, StartTs, FinalTs} | Acc];
+                _ ->
+                    [{instant, StartTs, FinalTs} | Acc]
+            end;
+        %
+        {drop, broker_overloaded, _} ->
+            cbroker_iteration_recur(
+                BrokerRef, Side, Offer, AskCounter, StartTs, Acc, OverloadCount + 1
+            );
         %
         {drop, broker_closed, _} ->
             throw(finished_asking)
@@ -357,19 +382,23 @@ cbroker_iteration_recur(StartTs, BrokerRef, Side, Offer) ->
             throw(finished_asking)
     end.
 
-cbroker_iteration_await(StartTs, Tag) ->
+cbroker_iteration_await(StartTs, Tag, _AskCounter, Acc) ->
     receive
         Msg ->
             case Msg of
                 {T, Result} when T =:= Tag ->
                     FinalTs = erlang:monotonic_time(),
                     {match, _, _, _} = Result,
-                    {blocked, StartTs, FinalTs};
+                    [{blocked, StartTs, FinalTs} | Acc];
                 %
                 stop_asking ->
                     throw(finished_asking)
             end
     end.
+
+%should_sample(_AskCounter) ->
+%    true.
+%    %(AskCounter band ?SAMPLING_MASK) =:= 0.
 
 %%
 
@@ -418,7 +447,7 @@ start_process(Parent, RunFun, Offer) ->
     receive
         go ->
             erlang:yield(),
-            Samples = run_process(RunFun, Offer),
+            Samples = run_process(RunFun, Offer, 0, []),
             _ = Parent ! {done, self()},
 
             receive
@@ -431,11 +460,11 @@ start_process(Parent, RunFun, Offer) ->
             end
     end.
 
-run_process(RunFun, Offer) ->
-    try RunFun(Offer) of
-        Timestamps ->
-            [Timestamps | run_process(RunFun, Offer)]
+run_process(RunFun, Offer, AskCounter, Acc) ->
+    try RunFun(Offer, AskCounter, Acc) of
+        UpdatedAcc ->
+            run_process(RunFun, Offer, AskCounter + 1, UpdatedAcc)
     catch
         finished_asking ->
-            []
+            Acc
     end.

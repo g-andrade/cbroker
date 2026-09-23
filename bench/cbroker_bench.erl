@@ -45,7 +45,8 @@
 -record(run, {
     nr_of_schedulers,
     cases,
-    stats
+    stats,
+    prev_run_times
 }).
 
 -record(result, {
@@ -94,7 +95,8 @@ run(Cases) ->
     Run = #run{
         nr_of_schedulers = erlang:system_info(schedulers),
         cases = Cases,
-        stats = StatsAcc
+        stats = StatsAcc,
+        prev_run_times = []
     },
 
     run_epoch(ShuffledCases, Run).
@@ -166,7 +168,8 @@ new_offer({list, Size}) ->
 run_epoch([Case | Next], Acc) ->
     #run{
         cases = Cases,
-        stats = StatsAcc
+        stats = StatsAcc,
+        prev_run_times = PrevRunTimes
     } = Acc,
 
     #bcase{
@@ -176,10 +179,16 @@ run_epoch([Case | Next], Acc) ->
         offer = Offer
     } = Case,
 
-    Progress = progress_str(Next, Cases),
+    Progress = progress_str(Next, Cases, PrevRunTimes),
 
     logger:notice("Running '~ts' [~ts]", [Id, Progress]),
-    RunStats = cbroker_quickbench:bench1(Implementation, Offer, ?CASE_TIMEOUT, ProcCount),
+    {Time, RunStats} =
+        timer:tc(
+            fun() ->
+                cbroker_quickbench:bench1(Implementation, Offer, ?CASE_TIMEOUT, ProcCount)
+            end,
+            millisecond
+        ),
 
     Result = #result{
         implementation = Implementation,
@@ -189,19 +198,19 @@ run_epoch([Case | Next], Acc) ->
     },
 
     UpdatedStatsAcc = StatsAcc#{Id := [Result]},
-    UpdatedAcc = Acc#run{stats = UpdatedStatsAcc},
+    UpdatedAcc = Acc#run{stats = UpdatedStatsAcc, prev_run_times = [Time | PrevRunTimes]},
 
     run_epoch(Next, UpdatedAcc);
 run_epoch([], Acc) ->
     Acc.
 
-progress_str(Next, Cases) ->
+progress_str(Next, Cases, PrevRunTimes) ->
     LenNext = length(Next),
     LenCases = length(Cases),
     Prog = LenCases - LenNext,
     Percent = 100 * Prog div LenCases,
 
-    case time_left_str(LenNext) of
+    case time_left_str(LenNext, PrevRunTimes) of
         none ->
             io_lib:format("~b / ~b (~b %)", [Prog, LenCases, Percent]);
         %
@@ -209,8 +218,11 @@ progress_str(Next, Cases) ->
             io_lib:format("~b / ~b (~b %, ~ts remaining)", [Prog, LenCases, Percent, EstimateStr])
     end.
 
-time_left_str(LenNext) ->
-    ExpectationInSeconds = ceil(LenNext * (?CASE_TIMEOUT + 150) / 1000),
+time_left_str(_LenNext, []) ->
+    none;
+time_left_str(LenNext, PrevRunTimes) ->
+    AvgRunTime = lists:sum(PrevRunTimes) / (1000 * length(PrevRunTimes)),
+    ExpectationInSeconds = ceil(LenNext * AvgRunTime),
 
     Hours = ExpectationInSeconds div 3600,
     HourSeconds = ExpectationInSeconds rem 3600,
