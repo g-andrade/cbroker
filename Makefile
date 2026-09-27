@@ -35,7 +35,7 @@ check-slow:
 .NOTPARALLEL: check-slow
 .PHONY: check-slow
 
-test: eunit ct proper
+test: eunit ct proper cover
 .NOTPARALLEL: test
 .PHONY: test
 
@@ -60,7 +60,7 @@ format-c:
 ## Tests
 
 ct:
-	@rebar3 do ct, cover
+	@rebar3 do ct
 .PHONY: ct
 
 eunit:
@@ -73,6 +73,10 @@ PROPER_NUMTESTS ?= 100
 proper:
 	@rebar3 proper -n $(PROPER_NUMTESTS)
 .PHONY: proper
+
+cover: ct eunit proper
+	@rebar3 cover
+.PHONY: cover
 
 ## Checks
 
