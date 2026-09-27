@@ -49,8 +49,10 @@
     X(_batch_full,            "batch_full")  \
     X(_batch_pool,            "batch_pool")  \
     X(_batches,               "batches") \
+    X(_blocks,                "blocks") \
     X(_broker_closed,         "broker_closed") \
     X(_broker_overloaded,     "broker_overloaded") \
+    X(_brokers,               "brokers") \
     X(_cancelled,             "cancelled") \
     X(_cells,                 "cells") \
     X(_compute_from_nif,      "compute_from_nif") \
@@ -62,6 +64,7 @@
     X(_drop,                  "drop") \
     X(_dynamic,               "dynamic") \
     X(_empty,                 "empty") \
+    X(_envs,                  "envs") \
     X(_error,                 "error") \
     X(_false,                 "false") \
     X(_global_state,          "global_state") \
@@ -78,6 +81,7 @@
     X(_nr_of_schedulers,      "nr_of_schedulers") \
     X(_ref_count,             "ref_count") \
     X(_request_pool,          "request_pool") \
+    X(_retries,               "retries") \
     X(_retry,                 "retry") \
     X(_right,                 "right") \
     X(_right_count,           "right_count") \
@@ -86,6 +90,7 @@
     X(_sum,                   "sum") \
     X(_ticket,                "ticket") \
     X(_ticket_pool,           "ticket_pool") \
+    X(_tickets,               "tickets") \
     X(_too_late,              "too_late") \
     X(_true,                  "true") \
     X(_unavailable,           "unavailable") \
@@ -354,6 +359,8 @@ static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM nif_debug_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM nif_alloc_counters(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM make_counter(ErlNifEnv* env, ERL_NIF_TERM key, _Atomic(int64_t)* counter);
 
 //
 
@@ -561,7 +568,8 @@ static struct {
 static ErlNifFunc nif_funcs[] = {{"new", 1, nif_new, 0},
                                  {"ask", 6, nif_ask, 0},
                                  {"cancel", 1, nif_cancel, 0},
-                                 {"debug_info", 1, nif_debug_info, 0}};
+                                 {"debug_info", 1, nif_debug_info, 0},
+                                 {"alloc_counters", 0, nif_alloc_counters, 0}};
 
 static struct {
     ErlNifResourceType* broker;
@@ -575,6 +583,50 @@ static _Thread_local thread_id_t my_thread_id = -1;
 // Sentinel values used in batch cells
 static request_t sentinel_request_cancelled;
 static request_t sentinel_request_matched;
+
+/* Exposed through `alloc_counters/0`, for the tests to assert nothing leaked.
+ * Refcounted resources are counted as allocations against destructor calls. */
+static _Atomic(int64_t) nr_of_live_blocks = 0;
+static _Atomic(int64_t) nr_of_live_envs = 0;
+static _Atomic(int64_t) nr_of_live_brokers = 0;
+static _Atomic(int64_t) nr_of_live_tickets = 0;
+static _Atomic(int64_t) nr_of_live_retries = 0;
+
+static void* cbroker_alloc(size_t size)
+{
+    atomic_fetch_add_explicit(&nr_of_live_blocks, 1, memory_order_relaxed);
+    return enif_alloc(size);
+}
+
+static void cbroker_free(void* ptr)
+{
+    atomic_fetch_sub_explicit(&nr_of_live_blocks, 1, memory_order_relaxed);
+    enif_free(ptr);
+}
+
+static ErlNifEnv* cbroker_alloc_env(void)
+{
+    atomic_fetch_add_explicit(&nr_of_live_envs, 1, memory_order_relaxed);
+    return enif_alloc_env();
+}
+
+static void cbroker_free_env(ErlNifEnv* env)
+{
+    atomic_fetch_sub_explicit(&nr_of_live_envs, 1, memory_order_relaxed);
+    enif_free_env(env);
+}
+
+static void* cbroker_alloc_resource(_Atomic(int64_t)* counter, ErlNifResourceType* type,
+                                    size_t size)
+{
+    atomic_fetch_add_explicit(counter, 1, memory_order_relaxed);
+    return enif_alloc_resource(type, size);
+}
+
+static void cbroker_count_dtor(_Atomic(int64_t)* counter)
+{
+    atomic_fetch_sub_explicit(counter, 1, memory_order_relaxed);
+}
 
 /*********************************************************************/
 
@@ -665,7 +717,8 @@ static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     assert(nr_of_schedulers > 0);
 
     const size_t broker_size = new_broker_size(nr_of_schedulers);
-    broker_t* broker = enif_alloc_resource(ResourceTypes.broker, broker_size);
+    broker_t* broker =
+        cbroker_alloc_resource(&nr_of_live_brokers, ResourceTypes.broker, broker_size);
     assert(broker != NULL);
     memset(broker, 0, broker_size);
 
@@ -938,6 +991,24 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
 
 //
 
+// What is alive right now, across every broker
+static ERL_NIF_TERM nif_alloc_counters(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    return enif_make_list5(env,
+                           //
+                           make_counter(env, Atoms._blocks, &nr_of_live_blocks),
+                           make_counter(env, Atoms._envs, &nr_of_live_envs),
+                           make_counter(env, Atoms._brokers, &nr_of_live_brokers),
+                           make_counter(env, Atoms._tickets, &nr_of_live_tickets),
+                           make_counter(env, Atoms._retries, &nr_of_live_retries));
+}
+
+static ERL_NIF_TERM make_counter(ErlNifEnv* env, ERL_NIF_TERM key, _Atomic(int64_t)* counter)
+{
+    int64_t value = atomic_load_explicit(counter, memory_order_relaxed);
+    return enif_make_tuple2(env, key, enif_make_int64(env, value));
+}
+
 static ERL_NIF_TERM nif_debug_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     broker_t* broker = NULL;
@@ -956,7 +1027,7 @@ static ERL_NIF_TERM nif_debug_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM 
 
     //
 
-    ERL_NIF_TERM* batch_terms = enif_alloc(nr_of_batches * sizeof(ERL_NIF_TERM));
+    ERL_NIF_TERM* batch_terms = cbroker_alloc(nr_of_batches * sizeof(ERL_NIF_TERM));
 
     for (size_t i = 0; i < nr_of_batches; i++) {
         lease_t* lease = &leases[i];
@@ -970,7 +1041,7 @@ static ERL_NIF_TERM nif_debug_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM 
 
     ERL_NIF_TERM batch_terms_list =
         enif_make_list_from_array(env, batch_terms, (unsigned)nr_of_batches);
-    enif_free(batch_terms);
+    cbroker_free(batch_terms);
 
     ERL_NIF_TERM global_state_term = global_state_to_term(env, &broker->global_state);
 
@@ -1095,7 +1166,7 @@ static batch_t* local_state_get_batch(local_state_t* local_state, const batch_id
 static ERL_NIF_TERM local_states_to_term(ErlNifEnv* env, local_state_t local_states[],
                                          const size_t nr_of_schedulers)
 {
-    ERL_NIF_TERM* local_state_terms = enif_alloc(nr_of_schedulers * sizeof(ERL_NIF_TERM));
+    ERL_NIF_TERM* local_state_terms = cbroker_alloc(nr_of_schedulers * sizeof(ERL_NIF_TERM));
 
     for (size_t thread_id = 0; thread_id < nr_of_schedulers; thread_id++) {
         local_state_t* local_state = &local_states[thread_id];
@@ -1114,7 +1185,7 @@ static ERL_NIF_TERM local_states_to_term(ErlNifEnv* env, local_state_t local_sta
 
     ERL_NIF_TERM list =
         enif_make_list_from_array(env, local_state_terms, (unsigned)nr_of_schedulers);
-    enif_free(local_state_terms);
+    cbroker_free(local_state_terms);
     return list;
 }
 
@@ -1316,7 +1387,7 @@ static void ask_loop_tail_skip(ask_ctx_t* ctx, const batch_id_t batch_id)
             cbroker_omap_all_next(global_state->batches, batch_id, NULL, (void***)&all_next);
 
         size_t all_next_size = all_next_count * sizeof(batch_t*);
-        batch_t** batches_to_checkout = enif_alloc(all_next_size);
+        batch_t** batches_to_checkout = cbroker_alloc(all_next_size);
         size_t checkout_amount = 0;
 
         for (size_t i = 0; i < all_next_count; i++) {
@@ -1340,7 +1411,6 @@ static void ask_loop_tail_skip(ask_ctx_t* ctx, const batch_id_t batch_id)
             batch_ref_count_inc(next_batch);
 
             enif_mutex_unlock(global_state->lock);
-
             map_res = cbroker_omap_insert(local_state->batches, next_batch->id, next_batch);
             assert(map_res == CBROKER_OMAP_OK);
         }
@@ -1354,8 +1424,9 @@ static void ask_loop_tail_skip(ask_ctx_t* ctx, const batch_id_t batch_id)
             }
 
             next_batch = batches_to_checkout[checkout_amount - 1];
-            enif_free(batches_to_checkout);
         }
+
+        cbroker_free(batches_to_checkout);
 
         assert(next_batch != NULL);
         assert(next_batch->id > batch_id);
@@ -1630,7 +1701,7 @@ static void ask_retry(ask_ctx_t* ctx, int argc, const ERL_NIF_TERM argv[])
     }
     else {
         assert(enif_is_atom(ctx->env, argv[retry_idx]));
-        retry = enif_alloc_resource(ResourceTypes.retry, sizeof(retry_t));
+        retry = cbroker_alloc_resource(&nr_of_live_retries, ResourceTypes.retry, sizeof(retry_t));
         memset(retry, 0, sizeof(retry_t));
 
         retry->nr = 1;
@@ -1642,12 +1713,12 @@ static void ask_retry(ask_ctx_t* ctx, int argc, const ERL_NIF_TERM argv[])
         ERL_NIF_TERM retry_term = enif_make_resource(ctx->env, retry);
         enif_release_resource(retry);
 
-        ERL_NIF_TERM* retry_argv = enif_alloc(((size_t)argc) * sizeof(ERL_NIF_TERM));
+        ERL_NIF_TERM* retry_argv = cbroker_alloc(((size_t)argc) * sizeof(ERL_NIF_TERM));
         memcpy(retry_argv, argv, retry_idx * sizeof(ERL_NIF_TERM));
         retry_argv[retry_idx] = retry_term;
 
         ERL_NIF_TERM res = ask_retry_schedule(ctx->env, argc, retry_argv);
-        enif_free(retry_argv);
+        cbroker_free(retry_argv);
         ctx->term_res = res;
     }
 }
@@ -1726,8 +1797,8 @@ static void request_reclaim(request_t* request, bool ticket_used, local_state_t*
         }
     }
     else {
-        enif_free_env(request->env);
-        enif_free(request);
+        cbroker_free_env(request->env);
+        cbroker_free(request);
         enif_release_resource(ticket);
     }
 }
@@ -1746,6 +1817,7 @@ static bool request_demonitor_and_reclaim(ErlNifEnv* caller_env, request_t* requ
 
 static void ticket_dtor(ErlNifEnv* caller_env, void* obj)
 {
+    cbroker_count_dtor(&nr_of_live_tickets);
     ticket_t* ticket = (ticket_t*)obj;
     request_t* request = ticket->request;
 
@@ -1753,8 +1825,8 @@ static void ticket_dtor(ErlNifEnv* caller_env, void* obj)
         ErlNifEnv* env = request->env;
         assert(env != NULL);
 
-        enif_free_env(env);
-        enif_free(request);
+        cbroker_free_env(env);
+        cbroker_free(request);
         ticket->request = NULL;
     }
 
@@ -1814,6 +1886,7 @@ static void ticket_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNif
 
 static void retry_dtor(ErlNifEnv* caller_env, void* obj)
 {
+    cbroker_count_dtor(&nr_of_live_retries);
     retry_t* retry = (retry_t*)obj;
     request_t* request = retry->request;
 
@@ -1897,8 +1970,8 @@ static void broker_cancel_all_batch_cells(ErlNifEnv* env, broker_t* broker,
                     notify_of_cancellation(env, request, DROP_REASON_CLOSED);
                     ticket->request = NULL;
 
-                    enif_free_env(request->env);
-                    enif_free(request);
+                    cbroker_free_env(request->env);
+                    cbroker_free(request);
                 }
                 enif_release_resource(ticket);
             }
@@ -1919,7 +1992,7 @@ static void broker_checkout_all_batches(broker_t* broker, local_state_t* opt_loc
 
     const size_t nr_of_batches = cbroker_omap_size(global_state->batches);
     const size_t array_size = nr_of_batches * sizeof(lease_t);
-    lease_t* array = enif_alloc(array_size);
+    lease_t* array = cbroker_alloc(array_size);
     memset(array, 0, array_size);
 
     batch_t** batches = (batch_t**)cbroker_omap_values(global_state->batches);
@@ -1962,7 +2035,7 @@ static void broker_checkin_many_batches(broker_t* broker, lease_t** array_ptr,
         }
     }
 
-    enif_free(array);
+    cbroker_free(array);
     *array_ptr = NULL;
 }
 
@@ -1970,6 +2043,7 @@ static void broker_checkin_many_batches(broker_t* broker, lease_t** array_ptr,
 
 static void broker_dtor(ErlNifEnv* caller_env, void* obj)
 {
+    cbroker_count_dtor(&nr_of_live_brokers);
     broker_t* broker = (broker_t*)obj;
 
     global_state_t* global_state = &broker->global_state;
@@ -2001,8 +2075,11 @@ static void broker_dtor_cb_local_batch(batch_id_t key, void* obj, void* ctx)
     // We don't actually free the batch here, we just make sure that it's present in global state
     global_state_t* global_state = (global_state_t*)ctx;
     batch_t* batch = (batch_t*)obj;
-    bool present_in_global_state = cbroker_omap_lookup(global_state->batches, batch->id, NULL);
+    batch_t* global_batch = NULL;
+    bool present_in_global_state =
+        cbroker_omap_lookup(global_state->batches, batch->id, (void**)&global_batch);
     assert(present_in_global_state);
+    assert(global_batch == batch);
 }
 
 static void broker_dtor_cb_global_batch(batch_id_t key, void* obj, void* ctx)
@@ -2017,7 +2094,7 @@ static void broker_dtor_cb_global_batch(batch_id_t key, void* obj, void* ctx)
                request == &sentinel_request_matched);
     }
 
-    enif_free(batch);
+    cbroker_free(batch);
 }
 
 //
@@ -2215,7 +2292,7 @@ static size_t batch_size(const size_t nr_of_cells)
 static batch_t* batch_new(const batch_id_t id, const size_t nr_of_cells)
 {
     const size_t size = batch_size(nr_of_cells);
-    batch_t* batch = enif_alloc(size);
+    batch_t* batch = cbroker_alloc(size);
     batch->nr_of_cells = nr_of_cells;
     batch_init(batch, id);
     return batch;
@@ -2249,7 +2326,7 @@ static bool batch_is_consumed(batch_t* batch)
 static ERL_NIF_TERM batch_to_term(ErlNifEnv* env, const batch_t* batch)
 {
     const size_t nr_of_cells = batch->nr_of_cells;
-    ERL_NIF_TERM* cell_terms = enif_alloc(nr_of_cells * sizeof(ERL_NIF_TERM));
+    ERL_NIF_TERM* cell_terms = cbroker_alloc(nr_of_cells * sizeof(ERL_NIF_TERM));
 
     for (offset_t i = 0; i < nr_of_cells; i++) {
         const cell_t* cell = &batch->cells[i];
@@ -2276,7 +2353,7 @@ static ERL_NIF_TERM batch_to_term(ErlNifEnv* env, const batch_t* batch)
 
     ERL_NIF_TERM cell_terms_list =
         enif_make_list_from_array(env, cell_terms, (unsigned)nr_of_cells);
-    enif_free(cell_terms);
+    cbroker_free(cell_terms);
 
     return enif_make_list6(
         env,
@@ -2333,7 +2410,7 @@ static void* batch_pool_cb_alloc(void* alloc_ctx)
     batch_pool_alloc_ctx_t* ctx = (batch_pool_alloc_ctx_t*)alloc_ctx;
     const size_t size = batch_size(ctx->nr_of_cells);
 
-    batch_t* batch = enif_alloc(size);
+    batch_t* batch = cbroker_alloc(size);
     memset(batch, 0, size);
 
     batch->nr_of_cells = ctx->nr_of_cells;
@@ -2348,7 +2425,7 @@ static void batch_pool_cb_clear(void* obj)
     batch->nr_of_cells = nr_of_cells;
 }
 
-static void batch_pool_cb_free(void* obj) { enif_free(obj); }
+static void batch_pool_cb_free(void* obj) { cbroker_free(obj); }
 
 //
 
@@ -2364,9 +2441,9 @@ static void request_pool_init(mempool_t* pool)
 static void* request_pool_cb_alloc(void* ctx)
 {
     assert(ctx == NULL);
-    request_t* request = enif_alloc(sizeof(request_t));
+    request_t* request = cbroker_alloc(sizeof(request_t));
     memset(request, 0, sizeof(request_t));
-    request->env = enif_alloc_env();
+    request->env = cbroker_alloc_env();
     return request;
 }
 
@@ -2387,8 +2464,8 @@ static void request_pool_cb_free(void* obj)
     ErlNifEnv* env = request->env;
     assert(env != NULL);
 
-    enif_free_env(request->env);
-    enif_free(obj);
+    cbroker_free_env(request->env);
+    cbroker_free(obj);
 }
 
 //
@@ -2405,7 +2482,8 @@ static void ticket_pool_init(mempool_t* pool)
 static void* ticket_pool_cb_alloc(void* ctx)
 {
     assert(ctx == NULL);
-    ticket_t* ticket = enif_alloc_resource(ResourceTypes.ticket, sizeof(ticket_t));
+    ticket_t* ticket =
+        cbroker_alloc_resource(&nr_of_live_tickets, ResourceTypes.ticket, sizeof(ticket_t));
     memset(ticket, 0, sizeof(ticket_t));
     return ticket;
 }
@@ -2428,7 +2506,7 @@ static void mempool_init(mempool_t* pool, size_t initial_count, size_t size, voi
     assert(size > 0);
     pool->count = initial_count;
     pool->size = size;
-    pool->array = enif_alloc(pool->size * sizeof(void*));
+    pool->array = cbroker_alloc(pool->size * sizeof(void*));
 
     for (size_t i = 0; i < pool->count; i++) {
         pool->array[i] = pool->alloc_cb(alloc_ctx);
@@ -2471,7 +2549,7 @@ static void mempool_destroy(mempool_t* pool)
     }
 
     if (pool->array != NULL) {
-        enif_free(pool->array);
+        cbroker_free(pool->array);
     }
 
     pool->array = NULL;
