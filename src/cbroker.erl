@@ -11,9 +11,7 @@
     %
     async_ask/2,
     async_ask/3,
-    %
-    await/1,
-    await/2,
+    async_ask/4,
     %
     cancel/1,
     %
@@ -24,6 +22,7 @@
     %
     dynamic_ask/2,
     dynamic_ask/3,
+    dynamic_ask/4,
     %
     nb_ask/2,
     nb_ask/3,
@@ -35,10 +34,7 @@
     %
     resumable_ask/2,
     resumable_ask/3,
-    resumable_ask/4,
-    %
-    resumable_await/1,
-    resumable_await/2
+    resumable_ask/4
 ]).
 
 %% ------------------------------------------------------------------
@@ -70,11 +66,11 @@
 -type side() :: left | right.
 -export_type([side/0]).
 
--type msg() :: {tag(), reply()}.
+-type msg() :: {ticket(), reply()}.
 -export_type([msg/0]).
 
--type tag() :: reference().
--export_type([tag/0]).
+-type ticket() :: reference().
+-export_type([ticket/0]).
 
 -type reply() :: (match() | drop()).
 -export_type([reply/0]).
@@ -153,103 +149,63 @@ when
     SojournTime :: sojourn_time().
 
 ask(Broker, Side, Offer, Timeout) ->
-    case dynamic_ask(Broker, Side, Offer) of
-        {await, Tag} ->
-            await(Tag, Timeout);
+    BrokerRef = resolve_broker(Broker),
+    ReplyRef = make_ref(),
+
+    case do_ask(BrokerRef, Side, Offer, ReplyRef, dynamic) of
+        {await, Ticket} ->
+            ask_await(ReplyRef, Ticket, Timeout);
         %
         Result ->
             Result
     end.
-
 %%
 
--spec async_ask(Broker, Side) -> {await, Tag} when
+-spec async_ask(Broker, Side) -> {await, Ticket} when
     Broker :: broker(),
     Side :: side(),
-    Tag :: tag().
+    Ticket :: ticket().
 
 async_ask(Broker, Side) ->
     async_ask(Broker, Side, self()).
 
 %%
 
--spec async_ask(Broker, Side, Offer) -> {await, Tag} when
+-spec async_ask(Broker, Side, Offer) -> {await, Ticket} when
     Broker :: broker(),
     Side :: side(),
     Offer :: term(),
-    Tag :: tag().
+    Ticket :: ticket().
 
 async_ask(Broker, Side, Offer) ->
+    async_ask(Broker, Side, Offer, ticket).
+
+%%
+
+-spec async_ask(Broker, Side, Offer, ReplyRef) -> {await, Ticket} when
+    Broker :: broker(),
+    Side :: side(),
+    Offer :: term(),
+    ReplyRef :: ticket | reference(),
+    Ticket :: ticket().
+
+async_ask(Broker, Side, Offer, ReplyRef) ->
     BrokerRef = resolve_broker(Broker),
-    {await, _} = do_ask(BrokerRef, Side, Offer, async).
+    {await, _} = do_ask(BrokerRef, Side, Offer, ReplyRef, async).
 
 %%
 
--spec await(Tag) ->
-    {match, MatchRef, CounterOffer, SojournTime}
-    | {drop, DropReason, SojournTime}
-when
-    Tag :: tag(),
-    MatchRef :: match_ref(),
-    CounterOffer :: term(),
-    DropReason :: timeout | drop_reason(),
+-spec cancel(Ticket) -> {cancelled, SojournTime} | too_late when
+    Ticket :: ticket(),
     SojournTime :: sojourn_time().
 
-await(Tag) ->
-    await(Tag, ?DEFAULT_TIMEOUT).
-
-%%
-
--spec await(Tag, Timeout) ->
-    {match, MatchRef, CounterOffer, SojournTime}
-    | {drop, DropReason, SojournTime}
-when
-    Tag :: tag(),
-    Timeout :: timeout(),
-    MatchRef :: match_ref(),
-    CounterOffer :: term(),
-    DropReason :: timeout | drop_reason(),
-    SojournTime :: sojourn_time().
-
-await(Tag, Timeout) ->
-    receive
-        {Ref, Reply} when Ref =:= Tag ->
-            Reply
-    after Timeout ->
-        case cancel(Tag) of
-            {cancelled, SojournTime} ->
-                {drop, timeout, SojournTime};
-            %
-            {match, _, _, _} = Match ->
-                Match
-        end
-    end.
-
-%%
-
--spec cancel(Tag) ->
-    {match, MatchRef, CounterOffer, SojournTime}
-    | {cancelled, SojournTime}
-when
-    Tag :: tag(),
-    MatchRef :: match_ref(),
-    CounterOffer :: term(),
-    SojournTime :: sojourn_time().
-
-cancel(Tag) ->
-    case cbroker_nif:cancel(Tag) of
-        too_late ->
-            %
-            case resumable_await(Tag, infinity) of
-                {drop, _, SojournTime} ->
-                    {cancelled, SojournTime};
-                %
-                {match, _, _, _} = Match ->
-                    Match
-            end;
-        %
+cancel(Ticket) ->
+    case cbroker_nif:cancel(Ticket) of
         {cancelled, _} = Cancelled ->
-            Cancelled
+            Cancelled;
+        %
+        too_late ->
+            too_late
     end.
 
 %%
@@ -281,13 +237,13 @@ debug_info(Broker) ->
 %%
 
 -spec dynamic_ask(Broker, Side) ->
-    {await, Tag}
+    {await, Ticket}
     | {match, MatchRef, CounterOffer, SojournTime}
     | {drop, DropReason, SojournTime}
 when
     Broker :: broker(),
     Side :: side(),
-    Tag :: tag(),
+    Ticket :: ticket(),
     MatchRef :: match_ref(),
     CounterOffer :: term(),
     DropReason :: drop_reason(),
@@ -299,22 +255,42 @@ dynamic_ask(Broker, Side) ->
 %%
 
 -spec dynamic_ask(Broker, Side, Offer) ->
-    {await, Tag}
+    {await, Ticket}
     | {match, MatchRef, CounterOffer, SojournTime}
     | {drop, DropReason, SojournTime}
 when
     Broker :: broker(),
     Side :: side(),
     Offer :: term(),
-    Tag :: tag(),
+    Ticket :: ticket(),
     MatchRef :: match_ref(),
     CounterOffer :: term(),
     DropReason :: drop_reason(),
     SojournTime :: sojourn_time().
 
 dynamic_ask(Broker, Side, Offer) ->
+    dynamic_ask(Broker, Side, Offer, ticket).
+
+%%
+
+-spec dynamic_ask(Broker, Side, Offer, ReplyRef) ->
+    {await, Ticket}
+    | {match, MatchRef, CounterOffer, SojournTime}
+    | {drop, DropReason, SojournTime}
+when
+    Broker :: broker(),
+    Side :: side(),
+    Offer :: term(),
+    ReplyRef :: ticket | reference(),
+    Ticket :: ticket(),
+    MatchRef :: match_ref(),
+    CounterOffer :: term(),
+    DropReason :: drop_reason(),
+    SojournTime :: sojourn_time().
+
+dynamic_ask(Broker, Side, Offer, ReplyRef) ->
     BrokerRef = resolve_broker(Broker),
-    do_ask(BrokerRef, Side, Offer, dynamic).
+    do_ask(BrokerRef, Side, Offer, ReplyRef, dynamic).
 
 %%
 
@@ -346,7 +322,7 @@ when
 
 nb_ask(Broker, Side, Offer) ->
     BrokerRef = resolve_broker(Broker),
-    do_ask(BrokerRef, Side, Offer, non_blocking).
+    do_ask(BrokerRef, Side, Offer, ticket, non_blocking).
 
 %%
 
@@ -376,7 +352,7 @@ resolve_name(BrokerName) ->
 -spec resumable_ask(Broker, Side) ->
     {match, MatchRef, CounterOffer, SojournTime}
     | {drop, DropReason, SojournTime}
-    | {timeout, Tag}
+    | {timeout, Ticket}
 when
     Broker :: broker(),
     Side :: side(),
@@ -384,7 +360,7 @@ when
     CounterOffer :: term(),
     SojournTime :: sojourn_time(),
     DropReason :: drop_reason(),
-    Tag :: tag().
+    Ticket :: ticket().
 
 resumable_ask(Broker, Side) ->
     resumable_ask(Broker, Side, self()).
@@ -394,7 +370,7 @@ resumable_ask(Broker, Side) ->
 -spec resumable_ask(Broker, Side, Offer) ->
     {match, MatchRef, CounterOffer, SojournTime}
     | {drop, DropReason, SojournTime}
-    | {timeout, Tag}
+    | {timeout, Ticket}
 when
     Broker :: broker(),
     Side :: side(),
@@ -403,7 +379,7 @@ when
     CounterOffer :: term(),
     SojournTime :: sojourn_time(),
     DropReason :: drop_reason(),
-    Tag :: tag().
+    Ticket :: ticket().
 
 resumable_ask(Broker, Side, Offer) ->
     resumable_ask(Broker, Side, Offer, ?DEFAULT_TIMEOUT).
@@ -413,7 +389,7 @@ resumable_ask(Broker, Side, Offer) ->
 -spec resumable_ask(Broker, Side, Offer, Timeout) ->
     {match, MatchRef, CounterOffer, SojournTime}
     | {drop, DropReason, SojournTime}
-    | {timeout, Tag}
+    | {timeout, Ticket, ReplyRef}
 when
     Broker :: broker(),
     Side :: side(),
@@ -423,18 +399,16 @@ when
     CounterOffer :: term(),
     SojournTime :: sojourn_time(),
     DropReason :: drop_reason(),
-    Tag :: tag().
+    Ticket :: ticket(),
+    ReplyRef :: reference().
 
 resumable_ask(Broker, Side, Offer, Timeout) ->
-    case dynamic_ask(Broker, Side, Offer) of
-        {await, Tag} ->
-            case resumable_await(Tag, Timeout) of
-                timeout ->
-                    {timeout, Tag};
-                %
-                Result ->
-                    Result
-            end;
+    BrokerRef = resolve_broker(Broker),
+    ReplyRef = make_ref(),
+
+    case do_ask(BrokerRef, Side, Offer, ReplyRef, dynamic) of
+        {await, Ticket} ->
+            resumable_ask_await(ReplyRef, Ticket, Timeout);
         %
         Result ->
             Result
@@ -442,48 +416,70 @@ resumable_ask(Broker, Side, Offer, Timeout) ->
 
 %%
 
--spec resumable_await(Tag) ->
-    {match, MatchRef, CounterOffer, SojournTime}
-    | {drop, DropReason, SojournTime}
-    | timeout
-when
-    Tag :: tag(),
-    MatchRef :: match_ref(),
-    CounterOffer :: term(),
-    DropReason :: drop_reason(),
-    SojournTime :: sojourn_time().
-
-resumable_await(Tag) ->
-    resumable_await(Tag, ?DEFAULT_TIMEOUT).
-
-%%
-
--spec resumable_await(Tag, Timeout) ->
-    {match, MatchRef, CounterOffer, SojournTime}
-    | {drop, DropReason, SojournTime}
-    | timeout
-when
-    Tag :: tag(),
-    Timeout :: timeout(),
-    MatchRef :: match_ref(),
-    CounterOffer :: term(),
-    DropReason :: drop_reason(),
-    SojournTime :: sojourn_time().
-
-resumable_await(Tag, Timeout) ->
-    receive
-        {T, Reply} when T =:= Tag ->
-            Reply
-    after Timeout ->
-        timeout
-    end.
+% -spec resumable_await(Ticket) ->
+%     {match, MatchRef, CounterOffer, SojournTime}
+%     | {drop, DropReason, SojournTime}
+%     | timeout
+% when
+%     Ticket :: ticket(),
+%     MatchRef :: match_ref(),
+%     CounterOffer :: term(),
+%     DropReason :: drop_reason(),
+%     SojournTime :: sojourn_time().
+%
+% resumable_await(Ticket) ->
+%     resumable_await(Ticket, ?DEFAULT_TIMEOUT).
+%
+% %%
+%
+% -spec resumable_await(Ticket, Timeout) ->
+%     {match, MatchRef, CounterOffer, SojournTime}
+%     | {drop, DropReason, SojournTime}
+%     | timeout
+% when
+%     Ticket :: ticket(),
+%     Timeout :: timeout(),
+%     MatchRef :: match_ref(),
+%     CounterOffer :: term(),
+%     DropReason :: drop_reason(),
+%     SojournTime :: sojourn_time().
+%
+% resumable_await(Ticket, Timeout) ->
+%     receive
+%         {T, Reply} when T =:= Ticket ->
+%             Reply
+%     after Timeout ->
+%         timeout
+%     end.
 
 %% ------------------------------------------------------------------
 %% Internal Function Definitions
 %% ------------------------------------------------------------------
 
-do_ask(BrokerRef, Side, Offer, AskType) ->
-    case cbroker_nif:ask(BrokerRef, Side, Offer, AskType) of
+ask_await(ReplyRef, Ticket, Timeout) ->
+    receive
+        {ReplyRef, Reply} ->
+            Reply
+    after Timeout ->
+        ask_timeout(ReplyRef, Ticket)
+    end.
+
+ask_timeout(ReplyRef, Ticket) ->
+    case cbroker_nif:cancel(Ticket) of
+        {cancelled, SojournTime} ->
+            {drop, timeout, SojournTime};
+        %
+        too_late ->
+            receive
+                {ReplyRef, Reply} ->
+                    Reply
+            end
+    end.
+
+%%
+
+do_ask(BrokerRef, Side, Offer, ReplyRef, AskType) ->
+    case cbroker_nif:ask(BrokerRef, Side, Offer, ReplyRef, AskType) of
         {error, Reason} ->
             error(Reason);
         %
@@ -491,7 +487,19 @@ do_ask(BrokerRef, Side, Offer, AskType) ->
             Result
     end.
 
+%%
+
 resolve_broker(BrokerRef) when is_reference(BrokerRef) ->
     BrokerRef;
 resolve_broker(BrokerName) ->
     cbroker_persistent:get(BrokerName).
+
+%%
+
+resumable_ask_await(ReplyRef, Ticket, Timeout) ->
+    receive
+        {ReplyRef, Reply} ->
+            Reply
+    after Timeout ->
+        {timeout, Ticket, ReplyRef}
+    end.

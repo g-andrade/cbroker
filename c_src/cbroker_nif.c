@@ -84,7 +84,8 @@
     X(_stats,                 "stats") \
     X(_stopped,               "stopped") \
     X(_sum,                   "sum") \
-    X(_tag_pool,              "tag_pool") \
+    X(_ticket,                "ticket") \
+    X(_ticket_pool,           "ticket_pool") \
     X(_too_late,              "too_late") \
     X(_true,                  "true") \
     X(_unavailable,           "unavailable") \
@@ -136,11 +137,12 @@ typedef struct {
     ErlNifPid pid;
     ERL_NIF_TERM offer;
     size_t offer_size;
+    ERL_NIF_TERM reply_ref;
     //
     ERL_NIF_TERM broker_term;
     batch_id_t batch_id;
     offset_t offset;
-    void* tag;
+    void* ticket;
 } request_t;
 
 //
@@ -148,7 +150,7 @@ typedef struct {
 typedef struct {
     ErlNifMonitor mon;
     request_t* request;
-} tag_t;
+} ticket_t;
 
 //
 
@@ -201,7 +203,7 @@ typedef struct {
     batch_id_t right_tail_id;
     //
     mempool_t request_pool;
-    mempool_t tag_pool;
+    mempool_t ticket_pool;
 } local_state_t;
 
 //
@@ -247,7 +249,7 @@ typedef struct {
     ErlNifTime enqueue_ts;
     ERL_NIF_TERM ask_type;
     request_t* request;
-    ERL_NIF_TERM tag_term;
+    ERL_NIF_TERM ticket_term;
 } retry_t;
 
 //
@@ -318,6 +320,7 @@ typedef struct {
     ERL_NIF_TERM side;
     ERL_NIF_TERM offer;
     ptrdiff_t offer_size; // negative when it hasn't been computed yet
+    ERL_NIF_TERM reply_ref;
     retry_t* retry;
     //
     broker_t* broker;
@@ -339,7 +342,7 @@ typedef struct {
     //
     lease_t lease;
     request_t* request;
-    ERL_NIF_TERM tag_term;
+    ERL_NIF_TERM ticket_term;
     request_t* counter_request;
     bool consume_slot;
     ERL_NIF_TERM term_res;
@@ -353,7 +356,7 @@ typedef struct {
     bool consume_slot;
     // optional, reuse to notify counter-party if we allocated it but ended up in 2nd place
     request_t* our_request;
-    ERL_NIF_TERM our_tag;
+    ERL_NIF_TERM our_ticket;
     request_t* opposite_request;
     drop_reason_t drop_reason;
 } ask_out_t;
@@ -363,7 +366,7 @@ typedef struct {
 static int on_load(ErlNifEnv* caller_env, void** priv_data, ERL_NIF_TERM load_info);
 static void init_atoms(ErlNifEnv* caller_env);
 static void load_broker_resource(ErlNifEnv* caller_env);
-static void load_tag_resource(ErlNifEnv* caller_env);
+static void load_ticket_resource(ErlNifEnv* caller_env);
 static void load_retry_resource(ErlNifEnv* caller_env);
 
 //
@@ -426,14 +429,14 @@ static void ask_drop(ask_ctx_t* ctx, drop_reason_t reason);
 //
 
 static bool request_demonitor(ErlNifEnv* caller_env, request_t* request);
-static void request_reclaim(request_t* request, bool tag_used, local_state_t* opt_local_state);
-static bool request_demonitor_and_reclaim(ErlNifEnv* caller_env, request_t* request, bool tag_used,
-                                          local_state_t* local_state);
+static void request_reclaim(request_t* request, bool ticket_used, local_state_t* opt_local_state);
+static bool request_demonitor_and_reclaim(ErlNifEnv* caller_env, request_t* request,
+                                          bool ticket_used, local_state_t* local_state);
 
 //
 
-static void tag_dtor(ErlNifEnv* caller_env, void* obj);
-static void tag_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon);
+static void ticket_dtor(ErlNifEnv* caller_env, void* obj);
+static void ticket_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon);
 
 //
 
@@ -470,6 +473,8 @@ static bool lease_consume_slot(lease_t* lease);
 
 //
 
+static ERL_NIF_TERM reply_tag(ErlNifEnv* env, request_t* request);
+
 static void notify_of_cancellation(ErlNifEnv* env, request_t* request, const drop_reason_t reason);
 
 static bool either_notify_or_assert_not_alive(ErlNifEnv* caller_env, ErlNifPid* pid,
@@ -499,10 +504,10 @@ static void* request_pool_cb_alloc(void*);
 static void request_pool_cb_clear(void* obj);
 static void request_pool_cb_free(void* obj);
 
-static void tag_pool_init(mempool_t* pool);
-static void* tag_pool_cb_alloc(void*);
-static void tag_pool_cb_clear(void* obj);
-static void tag_pool_cb_free(void* obj);
+static void ticket_pool_init(mempool_t* pool);
+static void* ticket_pool_cb_alloc(void*);
+static void ticket_pool_cb_clear(void* obj);
+static void ticket_pool_cb_free(void* obj);
 
 //
 
@@ -534,14 +539,14 @@ static int get_retry(ErlNifEnv* env, ERL_NIF_TERM term, retry_t** out_retry);
 static int get_size_t(ErlNifEnv* env, ERL_NIF_TERM term, size_t* out);
 #endif
 
-static int get_tag(ErlNifEnv* env, ERL_NIF_TERM term, tag_t** out_tag);
+static int get_ticket(ErlNifEnv* env, ERL_NIF_TERM term, ticket_t** out_ticket);
 
 //
 
 static ERL_NIF_TERM make_badarg(ErlNifEnv* env, ERL_NIF_TERM term);
 static ERL_NIF_TERM make_badopts(ErlNifEnv* env, ERL_NIF_TERM term);
 static ERL_NIF_TERM make_badopt(ErlNifEnv* env, ERL_NIF_TERM term);
-static ERL_NIF_TERM make_await(ErlNifEnv* env, ERL_NIF_TERM tag);
+static ERL_NIF_TERM make_await(ErlNifEnv* env, ERL_NIF_TERM ticket);
 static ERL_NIF_TERM make_cancelled(ErlNifEnv* env, const int64_t sojourn_time);
 
 static ERL_NIF_TERM make_drop(ErlNifEnv* env, const drop_reason_t reason,
@@ -552,6 +557,8 @@ static ERL_NIF_TERM make_error(ErlNifEnv* env, ERL_NIF_TERM reason);
 
 static ERL_NIF_TERM make_match(ErlNifEnv* env, ERL_NIF_TERM match_ref, ERL_NIF_TERM offer,
                                int64_t sojourn_time);
+
+static ERL_NIF_TERM make_reply(ErlNifEnv* env, ERL_NIF_TERM tag, ERL_NIF_TERM reply);
 
 static ERL_NIF_TERM raise_tuple2(ErlNifEnv* env, ERL_NIF_TERM reason_type,
                                  ERL_NIF_TERM reason_content);
@@ -573,13 +580,13 @@ static struct {
 //
 
 static ErlNifFunc nif_funcs[] = {{"new", 1, nif_new, 0},
-                                 {"ask", 5, nif_ask, 0},
+                                 {"ask", 6, nif_ask, 0},
                                  {"cancel", 1, nif_cancel, 0},
                                  {"debug_info", 1, nif_debug_info, 0}};
 
 static struct {
     ErlNifResourceType* broker;
-    ErlNifResourceType* tag;
+    ErlNifResourceType* ticket;
     ErlNifResourceType* retry;
 } ResourceTypes;
 
@@ -598,7 +605,7 @@ static int on_load(ErlNifEnv* caller_env, void** priv_data, ERL_NIF_TERM load_in
 
     memset(&ResourceTypes, 0, sizeof(ResourceTypes));
     load_broker_resource(caller_env);
-    load_tag_resource(caller_env);
+    load_ticket_resource(caller_env);
     load_retry_resource(caller_env);
 
     memset(&sentinel_request_cancelled, 0, sizeof(request_t));
@@ -625,14 +632,14 @@ static void load_broker_resource(ErlNifEnv* caller_env)
     assert(ResourceTypes.broker != NULL);
 }
 
-static void load_tag_resource(ErlNifEnv* caller_env)
+static void load_ticket_resource(ErlNifEnv* caller_env)
 {
-    ErlNifResourceTypeInit callbacks = {tag_dtor, NULL, tag_down, 3, NULL};
+    ErlNifResourceTypeInit callbacks = {ticket_dtor, NULL, ticket_down, 3, NULL};
     ErlNifResourceFlags flags = ERL_NIF_RT_CREATE;
 
-    ResourceTypes.tag =
-        enif_init_resource_type(caller_env, "cbroker.tag", &callbacks, flags, &flags);
-    assert(ResourceTypes.tag != NULL);
+    ResourceTypes.ticket =
+        enif_init_resource_type(caller_env, "cbroker.ticket", &callbacks, flags, &flags);
+    assert(ResourceTypes.ticket != NULL);
 }
 
 static void load_retry_resource(ErlNifEnv* caller_env)
@@ -705,7 +712,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     ask_ctx_t ctx;
     memset(&ctx, 0, sizeof(ask_ctx_t));
-    ctx.tag_term = Atoms._none;
+    ctx.ticket_term = Atoms._none;
 
     ctx.env = env;
     ctx.argv = argv;
@@ -717,7 +724,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         return enif_make_badarg(env);
     }
 
-    assert(argc == 5);
+    assert(argc == 6);
 
     ctx.broker_term = argv[0];
     ctx.side = argv[1];
@@ -727,7 +734,8 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         return make_badarg(env, argv[3]);
     }
 
-    ERL_NIF_TERM ask_type_arg = argv[4];
+    ERL_NIF_TERM reply_ref = argv[4];
+    ERL_NIF_TERM ask_type_arg = argv[5];
     ERL_NIF_TERM ask_type = Atoms._none;
 
     //
@@ -741,6 +749,15 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     }
     else if (ctx.side != Atoms._right) {
         return make_badarg(env, ctx.side);
+    }
+
+    //
+
+    if (!(reply_ref == Atoms._ticket || enif_is_ref(env, reply_ref))) {
+        return make_badarg(env, reply_ref);
+    }
+    else {
+        ctx.reply_ref = reply_ref;
     }
 
     //
@@ -786,7 +803,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     }
 
     ensure_one_entry_in_pool(&ctx.local_state->request_pool, NULL);
-    ensure_one_entry_in_pool(&ctx.local_state->tag_pool, NULL);
+    ensure_one_entry_in_pool(&ctx.local_state->ticket_pool, NULL);
 
     ctx.credits = 400;
     ctx.term_res = Atoms._none;
@@ -825,7 +842,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             request_demonitor_and_reclaim(env, ctx.request, false, ctx.local_state);
         assert(demonitor_res);
         ctx.request = NULL;
-        ctx.tag_term = Atoms._none;
+        ctx.ticket_term = Atoms._none;
     }
 
     consume_timeslice(env, ctx.copied_bytes);
@@ -839,32 +856,32 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     ErlNifPid self;
-    tag_t* tag = NULL;
+    ticket_t* ticket = NULL;
 
     if (!enif_self(env, &self)) {
         return enif_make_badarg(env);
     }
 
-    ERL_NIF_TERM tag_term = argv[0];
+    ERL_NIF_TERM ticket_term = argv[0];
 
-    LOG("[cancel] Resolving tag");
-    if (!get_tag(env, tag_term, &tag)) {
-        if (enif_is_ref(env, tag_term)) {
-            // assume this to be a faux tag
+    LOG("[cancel] Resolving ticket");
+    if (!get_ticket(env, ticket_term, &ticket)) {
+        if (enif_is_ref(env, ticket_term)) {
+            // assume this to be a faux ticket
             return Atoms._too_late;
         }
-        return make_badarg(env, tag_term);
+        return make_badarg(env, ticket_term);
     }
 
     LOG("[cancel] demonitoring process");
-    if (enif_demonitor_process(env, tag, &tag->mon) != 0) {
+    if (enif_demonitor_process(env, ticket, &ticket->mon) != 0) {
         // too late
         return Atoms._too_late;
     }
 
-    request_t* request = tag->request;
+    request_t* request = ticket->request;
     assert(request != NULL);
-    assert(request->tag == tag);
+    assert(request->ticket == ticket);
     LOG("[cancel] Got request %p", request);
     LOG("[cancel] Request batch id: %llu", request->batch_id);
     LOG("[cancel] Request offset: %llu", request->offset);
@@ -1055,7 +1072,7 @@ static void local_states_init(local_state_t local_states[], const size_t nr_of_s
         local_states->right_tail_id = first_batch->id;
 
         request_pool_init(&local_state->request_pool);
-        tag_pool_init(&local_state->tag_pool);
+        ticket_pool_init(&local_state->ticket_pool);
     }
 }
 
@@ -1095,13 +1112,14 @@ static ERL_NIF_TERM local_states_to_term(ErlNifEnv* env, local_state_t local_sta
     for (size_t thread_id = 0; thread_id < nr_of_schedulers; thread_id++) {
         local_state_t* local_state = &local_states[thread_id];
 
-        ERL_NIF_TERM local_state_term = enif_make_list2(
-            env,
-            //
-            enif_make_tuple2(env, Atoms._request_pool,
-                             mempool_to_term(env, &local_state->request_pool)),
-            //
-            enif_make_tuple2(env, Atoms._tag_pool, mempool_to_term(env, &local_state->tag_pool)));
+        ERL_NIF_TERM local_state_term =
+            enif_make_list2(env,
+                            //
+                            enif_make_tuple2(env, Atoms._request_pool,
+                                             mempool_to_term(env, &local_state->request_pool)),
+                            //
+                            enif_make_tuple2(env, Atoms._ticket_pool,
+                                             mempool_to_term(env, &local_state->ticket_pool)));
 
         local_state_terms[thread_id] = local_state_term;
     }
@@ -1373,31 +1391,31 @@ static request_t* ask_loop_request_prepare(ask_ctx_t* ctx, const batch_id_t batc
                                            const offset_t offset)
 {
     request_t* request = ctx->request;
-    ERL_NIF_TERM tag_term = Atoms._none;
+    ERL_NIF_TERM ticket_term = Atoms._none;
 
     if (request == NULL) {
         retry_t* retry = ctx->retry;
 
         if (retry != NULL) {
             request = retry->request;
-            tag_term = retry->tag_term;
+            ticket_term = retry->ticket_term;
             retry->request = NULL;
-            retry->tag_term = Atoms._none;
+            retry->ticket_term = Atoms._none;
         }
 
         if (request == NULL) {
             ask_loop_request_new(ctx);
         }
         else {
-            ctx->tag_term = tag_term;
+            ctx->ticket_term = ticket_term;
         }
 
         request = ctx->request;
-        tag_term = ctx->tag_term;
+        ticket_term = ctx->ticket_term;
     }
 
     assert(request != NULL);
-    assert(tag_term != Atoms._none);
+    assert(ticket_term != Atoms._none);
 
     request->batch_id = batch_id;
     request->offset = offset;
@@ -1407,7 +1425,7 @@ static request_t* ask_loop_request_prepare(ask_ctx_t* ctx, const batch_id_t batc
 static void ask_loop_request_new(ask_ctx_t* ctx)
 {
     assert(ctx->request == NULL);
-    assert(ctx->tag_term == Atoms._none);
+    assert(ctx->ticket_term == Atoms._none);
 
     local_state_t* local_state = ctx->local_state;
     request_t* request = mempool_get(&local_state->request_pool, NULL);
@@ -1425,6 +1443,7 @@ static void ask_loop_request_new(ask_ctx_t* ctx)
     }
 
     request->broker_term = enif_make_copy(request->env, ctx->broker_term);
+    ctx->copied_bytes += term_size(request->env, request->broker_term);
 
     if (ctx->offer_size == 0) {
         // immediate term
@@ -1433,23 +1452,31 @@ static void ask_loop_request_new(ask_ctx_t* ctx)
     }
     else {
         request->offer = enif_make_copy(request->env, ctx->offer);
-        ctx->copied_bytes += (request->offer_size + term_size(request->env, ctx->broker_term));
+        ctx->copied_bytes += request->offer_size;
+    }
+
+    if (ctx->reply_ref == Atoms._ticket) {
+        request->reply_ref = Atoms._ticket;
+    }
+    else {
+        request->reply_ref = enif_make_copy(request->env, ctx->reply_ref);
+        ctx->copied_bytes += term_size(request->env, request->reply_ref);
     }
 
     //
 
-    tag_t* tag = mempool_get(&local_state->tag_pool, NULL);
+    ticket_t* ticket = mempool_get(&local_state->ticket_pool, NULL);
 
-    bool mon_res = enif_monitor_process(ctx->env, tag, &ctx->self, &tag->mon);
+    bool mon_res = enif_monitor_process(ctx->env, ticket, &ctx->self, &ticket->mon);
     assert(mon_res == 0);
 
-    tag->request = request;
-    request->tag = tag;
+    ticket->request = request;
+    request->ticket = ticket;
 
     //
 
     ctx->request = request;
-    ctx->tag_term = enif_make_resource(ctx->env, tag);
+    ctx->ticket_term = enif_make_resource(ctx->env, ticket);
 }
 
 //
@@ -1458,18 +1485,18 @@ static void ask_reply_await(ask_ctx_t* ctx)
 {
     assert(!ctx->is_non_blocking);
     assert(ctx->request == NULL);
-    assert(ctx->tag_term != Atoms._none);
+    assert(ctx->ticket_term != Atoms._none);
     assert(ctx->counter_request == NULL);
     assert(!ctx->consume_slot);
 
-    ctx->term_res = make_await(ctx->env, ctx->tag_term);
+    ctx->term_res = make_await(ctx->env, ctx->ticket_term);
 }
 
 static void ask_reply_match(ask_ctx_t* ctx)
 {
     request_t* request = ctx->request;
-    ERL_NIF_TERM tag_term = ctx->tag_term;
-    assert((request == NULL) == (tag_term == Atoms._none));
+    ERL_NIF_TERM ticket_term = ctx->ticket_term;
+    assert((request == NULL) == (ticket_term == Atoms._none));
 
     request_t* counter_request = ctx->counter_request;
     assert(counter_request != NULL);
@@ -1498,16 +1525,16 @@ static void ask_reply_match_notify_other(ask_ctx_t* ctx, ERL_NIF_TERM match_ref)
     if (request != NULL) {
         // We reuse our own request's env, which already contains our offer
         ErlNifEnv* msg_env = request->env;
-        ERL_NIF_TERM tag = enif_make_resource(msg_env, counter_request->tag);
+        ERL_NIF_TERM tag = reply_tag(msg_env, counter_request);
         ERL_NIF_TERM ref = enif_make_copy(msg_env, match_ref);
         ERL_NIF_TERM match = make_match(msg_env, ref, request->offer, sojourn_time);
-        ERL_NIF_TERM msg = enif_make_tuple2(msg_env, tag, match);
+        ERL_NIF_TERM msg = make_reply(msg_env, tag, match);
         either_notify_or_assert_not_alive(ctx->env, &counter_request->pid, msg_env, msg);
     }
     else {
-        ERL_NIF_TERM tag = enif_make_resource(ctx->env, counter_request->tag);
+        ERL_NIF_TERM tag = reply_tag(ctx->env, counter_request);
         ERL_NIF_TERM match = make_match(ctx->env, match_ref, ctx->offer, sojourn_time);
-        ERL_NIF_TERM msg = enif_make_tuple2(ctx->env, tag, match);
+        ERL_NIF_TERM msg = make_reply(ctx->env, tag, match);
         either_notify_or_assert_not_alive(ctx->env, &counter_request->pid, NULL, msg);
     }
 }
@@ -1520,17 +1547,29 @@ static ERL_NIF_TERM ask_reply_match_self(ask_ctx_t* ctx, ERL_NIF_TERM match_ref)
     const int64_t sojourn_time = monotonic_ts() - ctx->enqueue_ts;
 
     if (ctx->is_async) {
-        ERL_NIF_TERM faux_tag_term = enif_make_ref(ctx->env);
-
         // We reuse the counter request's env, which already contains their offer
         ErlNifEnv* msg_env = counter_request->env;
-        ERL_NIF_TERM msg_tag = enif_make_copy(msg_env, faux_tag_term);
+        ERL_NIF_TERM msg;
+        ERL_NIF_TERM faux_tag;
         ERL_NIF_TERM msg_ref = enif_make_copy(msg_env, match_ref);
+        ERL_NIF_TERM msg_tag;
+
+        if (ctx->reply_ref == Atoms._ticket) {
+            ERL_NIF_TERM faux_ticket_term = enif_make_ref(ctx->env);
+            msg_tag = enif_make_copy(msg_env, faux_ticket_term);
+            faux_tag = faux_ticket_term;
+        }
+        else {
+            // No need to allocate another ref, reuse custom reply
+            msg_tag = enif_make_copy(msg_env, ctx->reply_ref);
+            faux_tag = ctx->reply_ref;
+        }
+
         ERL_NIF_TERM msg_match = make_match(msg_env, msg_ref, counter_request->offer, sojourn_time);
-        ERL_NIF_TERM msg = enif_make_tuple2(msg_env, msg_tag, msg_match);
+        msg = make_reply(msg_env, msg_tag, msg_match);
         either_notify_or_assert_not_alive(ctx->env, &ctx->self, msg_env, msg);
 
-        return make_await(ctx->env, faux_tag_term);
+        return make_await(ctx->env, faux_tag);
     }
     else {
         ERL_NIF_TERM counter_offer;
@@ -1551,7 +1590,7 @@ static ERL_NIF_TERM ask_reply_match_self(ask_ctx_t* ctx, ERL_NIF_TERM match_ref)
 static void ask_reply_nomatch(ask_ctx_t* ctx)
 {
     assert(ctx->request == NULL);
-    assert(ctx->tag_term == Atoms._none);
+    assert(ctx->ticket_term == Atoms._none);
     assert(ctx->counter_request == NULL);
 
     int64_t sojourn_time = monotonic_ts() - ctx->enqueue_ts;
@@ -1582,24 +1621,24 @@ static void ask_retry(ask_ctx_t* ctx, int argc, const ERL_NIF_TERM argv[])
     retry_t* retry = ctx->retry;
 
     request_t* request = ctx->request;
-    ERL_NIF_TERM tag_term = ctx->tag_term;
+    ERL_NIF_TERM ticket_term = ctx->ticket_term;
 
     ctx->request = NULL;
-    ctx->tag_term = Atoms._none;
+    ctx->ticket_term = Atoms._none;
 
     if (retry != NULL) {
         assert(!enif_is_atom(ctx->env, argv[retry_idx]));
         retry->nr++;
 
         if (retry->request == NULL) {
-            assert(retry->tag_term == Atoms._none);
+            assert(retry->ticket_term == Atoms._none);
             retry->request = request;
-            retry->tag_term = tag_term;
+            retry->ticket_term = ticket_term;
         }
         else {
-            assert(retry->tag_term != Atoms._none);
+            assert(retry->ticket_term != Atoms._none);
             assert(request == NULL);
-            assert(tag_term == Atoms._none);
+            assert(ticket_term == Atoms._none);
         }
 
         ctx->term_res = ask_retry_schedule(ctx->env, argc, argv);
@@ -1613,7 +1652,7 @@ static void ask_retry(ask_ctx_t* ctx, int argc, const ERL_NIF_TERM argv[])
         retry->enqueue_ts = ctx->enqueue_ts;
         retry->ask_type = argv[retry_idx];
         retry->request = request;
-        retry->tag_term = tag_term;
+        retry->ticket_term = ticket_term;
 
         ERL_NIF_TERM retry_term = enif_make_resource(ctx->env, retry);
         enif_release_resource(retry);
@@ -1647,16 +1686,16 @@ static void ask_retry_clear(ask_ctx_t* ctx, const bool expect_no_request)
     }
 
     if (request != NULL) {
-        assert(retry->tag_term != Atoms._none);
+        assert(retry->ticket_term != Atoms._none);
 
         bool demonitor_res =
             request_demonitor_and_reclaim(ctx->env, request, false, ctx->local_state);
         assert(demonitor_res);
         retry->request = NULL;
-        retry->tag_term = Atoms._none;
+        retry->ticket_term = Atoms._none;
     }
     else {
-        assert(retry->tag_term == Atoms._none);
+        assert(retry->ticket_term == Atoms._none);
     }
 }
 
@@ -1670,50 +1709,50 @@ static void ask_drop(ask_ctx_t* ctx, drop_reason_t reason)
 
 static bool request_demonitor(ErlNifEnv* caller_env, request_t* request)
 {
-    tag_t* tag = request->tag;
-    assert(tag != NULL);
+    ticket_t* ticket = request->ticket;
+    assert(ticket != NULL);
 
-    if (enif_demonitor_process(caller_env, tag, &tag->mon) == 0) {
+    if (enif_demonitor_process(caller_env, ticket, &ticket->mon) == 0) {
         return true;
     }
     else {
-        enif_release_resource(tag);
+        enif_release_resource(ticket);
         return false;
     }
 }
 
-static void request_reclaim(request_t* request, bool tag_used, local_state_t* opt_local_state)
+static void request_reclaim(request_t* request, bool ticket_used, local_state_t* opt_local_state)
 {
     assert(request != NULL);
 
-    tag_t* tag = request->tag;
-    assert(tag != NULL);
-    assert(tag->request == request);
-    tag->request = NULL;
-    request->tag = NULL;
+    ticket_t* ticket = request->ticket;
+    assert(ticket != NULL);
+    assert(ticket->request == request);
+    ticket->request = NULL;
+    request->ticket = NULL;
 
     if (opt_local_state != NULL) {
         mempool_return(&opt_local_state->request_pool, request);
 
-        if (tag_used) {
-            enif_release_resource(tag);
+        if (ticket_used) {
+            enif_release_resource(ticket);
         }
         else {
-            mempool_return(&opt_local_state->tag_pool, tag);
+            mempool_return(&opt_local_state->ticket_pool, ticket);
         }
     }
     else {
         enif_free_env(request->env);
         enif_free(request);
-        enif_release_resource(tag);
+        enif_release_resource(ticket);
     }
 }
 
-static bool request_demonitor_and_reclaim(ErlNifEnv* caller_env, request_t* request, bool tag_used,
-                                          local_state_t* local_state)
+static bool request_demonitor_and_reclaim(ErlNifEnv* caller_env, request_t* request,
+                                          bool ticket_used, local_state_t* local_state)
 {
     if (request_demonitor(caller_env, request)) {
-        request_reclaim(request, tag_used, local_state);
+        request_reclaim(request, ticket_used, local_state);
         return true;
     }
     return false;
@@ -1721,10 +1760,10 @@ static bool request_demonitor_and_reclaim(ErlNifEnv* caller_env, request_t* requ
 
 /*********************************************************************/
 
-static void tag_dtor(ErlNifEnv* caller_env, void* obj)
+static void ticket_dtor(ErlNifEnv* caller_env, void* obj)
 {
-    tag_t* tag = (tag_t*)obj;
-    request_t* request = tag->request;
+    ticket_t* ticket = (ticket_t*)obj;
+    request_t* request = ticket->request;
 
     if (request != NULL) {
         ErlNifEnv* env = request->env;
@@ -1732,23 +1771,23 @@ static void tag_dtor(ErlNifEnv* caller_env, void* obj)
 
         enif_free_env(env);
         enif_free(request);
-        tag->request = NULL;
+        ticket->request = NULL;
     }
 
-    memset(tag, 0, sizeof(tag_t));
+    memset(ticket, 0, sizeof(ticket_t));
 }
 
 //
 
-static void tag_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon)
+static void ticket_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon)
 {
-    ERL_NIF_TERM pid_term = enif_make_pid(caller_env, pid);
+    // ERL_NIF_TERM pid_term = enif_make_pid(caller_env, pid);
 
-    tag_t* tag = (tag_t*)obj;
+    ticket_t* ticket = (ticket_t*)obj;
 
-    request_t* request = tag->request;
+    request_t* request = ticket->request;
     assert(request != NULL);
-    assert(request->tag == tag);
+    assert(request->ticket == ticket);
 
     LOG("[request DOWN %T] batch %llu, offset %llu", pid_term, request->batch_id, request->offset);
 
@@ -1795,12 +1834,12 @@ static void retry_dtor(ErlNifEnv* caller_env, void* obj)
     request_t* request = retry->request;
 
     if (request != NULL) {
-        tag_t* tag = request->tag;
-        assert(tag != NULL);
+        ticket_t* ticket = request->ticket;
+        assert(ticket != NULL);
 
         // whether demonitoring succeeds doesn't matter in this case
-        enif_demonitor_process(caller_env, tag, &tag->mon);
-        enif_release_resource(tag);
+        enif_demonitor_process(caller_env, ticket, &ticket->mon);
+        enif_release_resource(ticket);
         retry->request = NULL;
     }
 
@@ -1867,17 +1906,17 @@ static void broker_cancel_all_batch_cells(ErlNifEnv* env, broker_t* broker,
 
         if (atomic_compare_exchange_strong(cell, &request, &sentinel_request_cancelled)) {
             if (request != NULL) {
-                tag_t* tag = (tag_t*)request->tag;
-                assert(tag != NULL);
+                ticket_t* ticket = (ticket_t*)request->ticket;
+                assert(ticket != NULL);
 
-                if (enif_demonitor_process(env, tag, &tag->mon) == 0) {
+                if (enif_demonitor_process(env, ticket, &ticket->mon) == 0) {
                     notify_of_cancellation(env, request, DROP_REASON_CLOSED);
-                    tag->request = NULL;
+                    ticket->request = NULL;
 
                     enif_free_env(request->env);
                     enif_free(request);
                 }
-                enif_release_resource(tag);
+                enif_release_resource(ticket);
             }
         }
         else {
@@ -1964,7 +2003,7 @@ static void broker_dtor(ErlNifEnv* caller_env, void* obj)
         local_state->batches = NULL;
 
         mempool_destroy(&local_state->request_pool);
-        mempool_destroy(&local_state->tag_pool);
+        mempool_destroy(&local_state->ticket_pool);
     }
 
     //
@@ -2139,14 +2178,26 @@ static bool lease_consume_slot(lease_t* lease)
 
 /*********************************************************************/
 
+static ERL_NIF_TERM reply_tag(ErlNifEnv* env, request_t* request)
+{
+    ERL_NIF_TERM reply_ref = request->reply_ref;
+
+    if (reply_ref != Atoms._ticket) {
+        return enif_make_copy(env, reply_ref);
+    }
+    else {
+        return enif_make_resource(env, request->ticket);
+    }
+}
+
 static void notify_of_cancellation(ErlNifEnv* env, request_t* request, const drop_reason_t reason)
 {
-    assert(request->tag != NULL);
+    assert(request->ticket != NULL);
 
-    ERL_NIF_TERM tag = enif_make_resource(env, request->tag);
+    ERL_NIF_TERM tag = reply_tag(env, request);
     int64_t sojourn_time = monotonic_ts() - request->enqueue_ts;
     ERL_NIF_TERM cancelled = make_drop(env, reason, sojourn_time);
-    ERL_NIF_TERM msg = enif_make_tuple2(env, tag, cancelled);
+    ERL_NIF_TERM msg = make_reply(env, tag, cancelled);
     either_notify_or_assert_not_alive(env, &request->pid, NULL, msg);
 }
 
@@ -2358,30 +2409,30 @@ static void request_pool_cb_free(void* obj)
 
 //
 
-static void tag_pool_init(mempool_t* pool)
+static void ticket_pool_init(mempool_t* pool)
 {
     memset(pool, 0, sizeof(mempool_t));
-    pool->alloc_cb = tag_pool_cb_alloc;
-    pool->clear_cb = tag_pool_cb_clear;
-    pool->free_cb = tag_pool_cb_free;
+    pool->alloc_cb = ticket_pool_cb_alloc;
+    pool->clear_cb = ticket_pool_cb_clear;
+    pool->free_cb = ticket_pool_cb_free;
     mempool_init(pool, TAG_POOLS_INITIAL_COUNT, TAG_POOLS_SIZE, NULL);
 }
 
-static void* tag_pool_cb_alloc(void* ctx)
+static void* ticket_pool_cb_alloc(void* ctx)
 {
     assert(ctx == NULL);
-    tag_t* tag = enif_alloc_resource(ResourceTypes.tag, sizeof(tag_t));
-    memset(tag, 0, sizeof(tag_t));
-    return tag;
+    ticket_t* ticket = enif_alloc_resource(ResourceTypes.ticket, sizeof(ticket_t));
+    memset(ticket, 0, sizeof(ticket_t));
+    return ticket;
 }
 
-static void tag_pool_cb_clear(void* obj)
+static void ticket_pool_cb_clear(void* obj)
 {
-    tag_t* tag = (tag_t*)obj;
-    memset(tag, 0, sizeof(tag_t));
+    ticket_t* ticket = (ticket_t*)obj;
+    memset(ticket, 0, sizeof(ticket_t));
 }
 
-static void tag_pool_cb_free(void* obj) { enif_release_resource(obj); }
+static void ticket_pool_cb_free(void* obj) { enif_release_resource(obj); }
 
 //
 
@@ -2603,16 +2654,16 @@ static int get_size_t(ErlNifEnv* env, ERL_NIF_TERM term, size_t* out)
 
 //
 
-static int get_tag(ErlNifEnv* env, ERL_NIF_TERM term, tag_t** out_tag)
+static int get_ticket(ErlNifEnv* env, ERL_NIF_TERM term, ticket_t** out_ticket)
 {
-    return enif_get_resource(env, term, ResourceTypes.tag, (void**)out_tag);
+    return enif_get_resource(env, term, ResourceTypes.ticket, (void**)out_ticket);
 }
 
 /*********************************************************************/
 
-static ERL_NIF_TERM make_await(ErlNifEnv* env, ERL_NIF_TERM tag)
+static ERL_NIF_TERM make_await(ErlNifEnv* env, ERL_NIF_TERM ticket)
 {
-    return enif_make_tuple2(env, Atoms._await, tag);
+    return enif_make_tuple2(env, Atoms._await, ticket);
 }
 
 static ERL_NIF_TERM make_badarg(ErlNifEnv* env, ERL_NIF_TERM term)
@@ -2674,6 +2725,11 @@ static ERL_NIF_TERM make_match(ErlNifEnv* env, ERL_NIF_TERM match_ref, ERL_NIF_T
 
     return enif_make_tuple4(env, Atoms._match, match_ref, offer,
                             enif_make_int64(env, sojourn_time));
+}
+
+static ERL_NIF_TERM make_reply(ErlNifEnv* env, ERL_NIF_TERM tag, ERL_NIF_TERM reply)
+{
+    return enif_make_tuple2(env, tag, reply);
 }
 
 static ERL_NIF_TERM raise_tuple2(ErlNifEnv* env, ERL_NIF_TERM reason_type,

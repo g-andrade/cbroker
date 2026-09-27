@@ -43,6 +43,9 @@
 %-define(SAMPLING_MASK, 16#F).
 %-define(SAMPLING_MULTIPLIER, (1 + ?SAMPLING_MASK)).
 
+-define(CBROKER, cbroker_bench).
+-define(CBROKER_BLOCKING, cbroker_bench_blocking).
+
 %% ------------------------------------------------------------------
 %% Type Definitions
 %% ------------------------------------------------------------------
@@ -293,8 +296,12 @@ setup(simple_off_heap) ->
     {ok, Pid} = cbroker_simple:start_link(off_heap),
     Pid;
 setup(cbroker) ->
-    {ok, Pid} = cbroker_persistent:start_link({local, ?MODULE}, []),
-    BrokerRef = cbroker:resolve_name(?MODULE),
+    {ok, Pid} = cbroker_persistent:start_link({local, ?CBROKER}, []),
+    BrokerRef = cbroker:resolve_name(?CBROKER),
+    [Pid | BrokerRef];
+setup(cbroker_blocking) ->
+    {ok, Pid} = cbroker_persistent:start_link({local, ?CBROKER_BLOCKING}, []),
+    BrokerRef = cbroker:resolve_name(?CBROKER_BLOCKING),
     [Pid | BrokerRef].
 
 teardown(simple, Pid) ->
@@ -302,6 +309,8 @@ teardown(simple, Pid) ->
 teardown(simple_off_heap, Pid) ->
     ok = sys_terminate_or_noproc(Pid);
 teardown(cbroker, [Pid | _BrokerRef]) ->
+    ok = sys_terminate_or_noproc(Pid);
+teardown(cbroker_blocking, [Pid | _BrokerRef]) ->
     ok = sys_terminate_or_noproc(Pid).
 
 sys_terminate_or_noproc(Pid) ->
@@ -315,12 +324,20 @@ sys_terminate_or_noproc(Pid) ->
 left_fun(Implementation, Pid) when Implementation =:= simple; Implementation =:= simple_off_heap ->
     fun(Offer, AskCounter, Acc) -> simple_iteration(Pid, left, Offer, AskCounter, Acc) end;
 left_fun(cbroker, Broker) ->
-    fun(Offer, AskCounter, Acc) -> cbroker_iteration(Broker, left, Offer, AskCounter, Acc) end.
+    fun(Offer, AskCounter, Acc) -> cbroker_iteration(Broker, left, Offer, AskCounter, Acc) end;
+left_fun(cbroker_blocking, Broker) ->
+    fun(Offer, AskCounter, Acc) ->
+        blocking_cbroker_iteration(Broker, left, Offer, AskCounter, Acc)
+    end.
 
 right_fun(Implementation, Pid) when Implementation =:= simple; Implementation =:= simple_off_heap ->
     fun(Offer, AskCounter, Acc) -> simple_iteration(Pid, right, Offer, AskCounter, Acc) end;
 right_fun(cbroker, Broker) ->
-    fun(Offer, AskCounter, Acc) -> cbroker_iteration(Broker, right, Offer, AskCounter, Acc) end.
+    fun(Offer, AskCounter, Acc) -> cbroker_iteration(Broker, right, Offer, AskCounter, Acc) end;
+right_fun(cbroker_blocking, Broker) ->
+    fun(Offer, AskCounter, Acc) ->
+        blocking_cbroker_iteration(Broker, right, Offer, AskCounter, Acc)
+    end.
 
 %%
 
@@ -399,6 +416,36 @@ cbroker_iteration_await(StartTs, Tag, _AskCounter, Acc) ->
 %should_sample(_AskCounter) ->
 %    true.
 %    %(AskCounter band ?SAMPLING_MASK) =:= 0.
+
+%%
+
+blocking_cbroker_iteration([_Pid | BrokerRef], Side, Offer, AskCounter, Acc) ->
+    StartTs = erlang:monotonic_time(),
+    blocking_cbroker_iteration_recur(BrokerRef, Side, Offer, AskCounter, StartTs, Acc, 0).
+
+blocking_cbroker_iteration_recur(BrokerRef, Side, Offer, AskCounter, StartTs, Acc, OverloadCount) ->
+    try cbroker:ask(BrokerRef, Side, Offer) of
+        {match, _, _, _} ->
+            FinalTs = erlang:monotonic_time(),
+
+            case OverloadCount > 0 of
+                true ->
+                    [{{overloaded, OverloadCount}, StartTs, FinalTs} | Acc];
+                _ ->
+                    [{blocking, StartTs, FinalTs} | Acc]
+            end;
+        %
+        {drop, broker_overloaded, _} ->
+            cbroker_iteration_recur(
+                BrokerRef, Side, Offer, AskCounter, StartTs, Acc, OverloadCount + 1
+            );
+        %
+        {drop, broker_closed, _} ->
+            throw(finished_asking)
+    catch
+        error:broker_closed ->
+            throw(finished_asking)
+    end.
 
 %%
 
