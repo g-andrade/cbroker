@@ -2529,7 +2529,7 @@ static ERL_NIF_TERM rolling_avg_to_term(ErlNifEnv* env, rolling_avg_t* rolling_a
     int64_t sum = atomic_load_explicit(&rolling_avg->sum, memory_order_relaxed);
 
     ERL_NIF_TERM avg_key = (count > ROLLING_AVG_SIZE + 20) ? Atoms._avg : Atoms._approx_avg;
-    double avg = (double)sum / (double)count;
+    double avg = (count == 0 ? 0.0 : (double)sum / (double)count);
 
     return enif_make_list3(env,
                            //
