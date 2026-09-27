@@ -58,8 +58,14 @@ found both a live `assert` abort and a lost-reply hang in the cancellation path.
 
 Leak detection stays off. Even with `+Mea min`, LSan would mostly report the
 emulator's own allocations, and suppressions can't separate them from ours because
-both reach `malloc` through `erts_alloc`. Counting `enif_alloc`/`enif_free` inside
-the NIF and asserting the balance from the test fixtures is the better tool there.
+both reach `malloc` through `erts_alloc`. Instead, the same target builds with
+`COUNT_ALLOCS=1` (`-DCBROKER_COUNT_ALLOCS`), which turns the `cbroker_alloc*`
+wrappers into counting ones and makes `cbroker_nif:alloc_counters/0` report live
+blocks, envs, brokers, tickets and retries; the
+`brokers_leave_nothing_allocated` case asserts they return to baseline. Without
+that define the wrappers are macros for the plain ERTS calls, `alloc_counters/0`
+answers `unavailable`, and the case skips itself. Note `cbroker_omap.c` allocates
+through `CBROKER_OMAP_ALLOC` directly, so its blocks are not counted.
 The NIF is cleaned afterwards, as these flags don't mix with the normal `-O3` build.
 
 All checks run sequentially (`.NOTPARALLEL`). CI runs `make check-fast`, `make test`,

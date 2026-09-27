@@ -360,7 +360,9 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM nif_debug_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM nif_alloc_counters(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+#ifdef CBROKER_COUNT_ALLOCS
 static ERL_NIF_TERM make_counter(ErlNifEnv* env, ERL_NIF_TERM key, _Atomic(int64_t)* counter);
+#endif
 
 //
 
@@ -584,8 +586,14 @@ static _Thread_local thread_id_t my_thread_id = -1;
 static request_t sentinel_request_cancelled;
 static request_t sentinel_request_matched;
 
-/* Exposed through `alloc_counters/0`, for the tests to assert nothing leaked.
- * Refcounted resources are counted as allocations against destructor calls. */
+/* Allocation counting, built only with -DCBROKER_COUNT_ALLOCS (see `make
+ * test-sanitized`), where `alloc_counters/0` reports what is alive so the tests
+ * can assert nothing leaked; refcounted resources count allocations against
+ * destructor calls. Without it there is nothing left of this: the wrappers below
+ * are macros for the plain ERTS calls, and `alloc_counters/0` says
+ * `unavailable`. */
+#ifdef CBROKER_COUNT_ALLOCS
+
 static _Atomic(int64_t) nr_of_live_blocks = 0;
 static _Atomic(int64_t) nr_of_live_envs = 0;
 static _Atomic(int64_t) nr_of_live_brokers = 0;
@@ -627,6 +635,18 @@ static void cbroker_count_dtor(_Atomic(int64_t)* counter)
 {
     atomic_fetch_sub_explicit(counter, 1, memory_order_relaxed);
 }
+
+#else
+
+#define cbroker_alloc(size) enif_alloc((size))
+#define cbroker_free(ptr) enif_free((ptr))
+#define cbroker_alloc_env() enif_alloc_env()
+#define cbroker_free_env(env) enif_free_env((env))
+/* The counter argument is dropped, so the counters need not exist */
+#define cbroker_alloc_resource(counter, type, size) enif_alloc_resource((type), (size))
+#define cbroker_count_dtor(counter) ((void)0)
+
+#endif
 
 /*********************************************************************/
 
@@ -994,6 +1014,7 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
 // What is alive right now, across every broker
 static ERL_NIF_TERM nif_alloc_counters(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
+#ifdef CBROKER_COUNT_ALLOCS
     return enif_make_list5(env,
                            //
                            make_counter(env, Atoms._blocks, &nr_of_live_blocks),
@@ -1001,13 +1022,18 @@ static ERL_NIF_TERM nif_alloc_counters(ErlNifEnv* env, int argc, const ERL_NIF_T
                            make_counter(env, Atoms._brokers, &nr_of_live_brokers),
                            make_counter(env, Atoms._tickets, &nr_of_live_tickets),
                            make_counter(env, Atoms._retries, &nr_of_live_retries));
+#else
+    return Atoms._unavailable;
+#endif
 }
 
+#ifdef CBROKER_COUNT_ALLOCS
 static ERL_NIF_TERM make_counter(ErlNifEnv* env, ERL_NIF_TERM key, _Atomic(int64_t)* counter)
 {
     int64_t value = atomic_load_explicit(counter, memory_order_relaxed);
     return enif_make_tuple2(env, key, enif_make_int64(env, value));
 }
+#endif
 
 static ERL_NIF_TERM nif_debug_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {

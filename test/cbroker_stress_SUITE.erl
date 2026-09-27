@@ -153,8 +153,15 @@ killed_waiters_are_reclaimed(Config) ->
 % nothing behind once collected. This is what the cell and pool assertions
 % cannot see: memory that is consistent, just unreachable
 brokers_leave_nothing_allocated(_Config) ->
-    Baseline = alloc_counters(),
+    case alloc_counters() of
+        unavailable ->
+            {skip, "built without allocation counters; see `make test-sanitized`"};
+        %
+        Baseline ->
+            assert_nothing_stays_allocated(Baseline)
+    end.
 
+assert_nothing_stays_allocated(Baseline) ->
     lists:foreach(
         fun(_) ->
             {Pid, MonRef} = spawn_monitor(fun() -> churn_through_batches() end),

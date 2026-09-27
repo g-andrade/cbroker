@@ -89,7 +89,8 @@ stress:
 	@rebar3 ct --suite=test/cbroker_stress_SUITE
 .PHONY: stress
 
-# Runs the CT suites against an instrumented NIF. The sanitizer runtime has to
+# Runs the CT suites against an instrumented NIF: ASan+UBSan plus the allocation
+# counters, which only exist in this build. The sanitizer runtime has to
 # be preloaded into the emulator, since it must initialize before the library
 # that needs it is dlopen'd. `+Mea min` routes erts_alloc through libc malloc:
 # without it ASan cannot see `enif_alloc`ed memory, so overflowing such a block
@@ -106,9 +107,9 @@ UBSAN_OPTIONS ?= print_stacktrace=1
 
 test-sanitized:
 	@$(MAKE) -C c_src clean
-	@$(MAKE) -C c_src SANITIZE=$(SANITIZERS)
+	@$(MAKE) -C c_src SANITIZE=$(SANITIZERS) COUNT_ALLOCS=1
 	@status=0; \
-	SANITIZE=$(SANITIZERS) \
+	SANITIZE=$(SANITIZERS) COUNT_ALLOCS=1 \
 	ERL_FLAGS="+Mea min" \
 	LD_PRELOAD=$(SANITIZER_PRELOAD) \
 	ASAN_OPTIONS=$(ASAN_OPTIONS) \

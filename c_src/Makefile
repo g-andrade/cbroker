@@ -38,6 +38,12 @@ LDFLAGS += -shared
 # loads with the sanitizer runtime preloaded into the emulator, which is what
 # the top-level `make test-sanitized` target sets up. Optimization drops to -O1
 # so that stack traces stay meaningful.
+# COUNT_ALLOCS=1 builds the allocation counters behind `alloc_counters/0`.
+ifneq ($(COUNT_ALLOCS),)
+	CFLAGS += -DCBROKER_COUNT_ALLOCS
+	CXXFLAGS += -DCBROKER_COUNT_ALLOCS
+endif
+
 ifneq ($(SANITIZE),)
 	CFLAGS := $(filter-out -O3,$(CFLAGS)) -O1 -g -fsanitize=$(SANITIZE) -fno-omit-frame-pointer
 	CXXFLAGS := $(filter-out -O3,$(CXXFLAGS)) -O1 -g -fsanitize=$(SANITIZE) -fno-omit-frame-pointer
