@@ -278,18 +278,6 @@ typedef struct {
 //
 
 typedef enum {
-    ASK_STATE_INITIAL = 0,
-    ASK_STATE_FOUND_BATCH = 1,
-    ASK_STATE_HAVE_BATCH = 2,
-    ASK_STATE_HAVE_OFFSET = 3,
-    ASK_STATE_BATCH_FULL = 4,
-    ASK_STATE_BATCH_CONSUMED = 5,
-    ASK_STATE_DONE = 10
-} ask_state_t;
-
-//
-
-typedef enum {
     ASK_RESULT_NONE = 0,
     ASK_RESULT_SKIP_BATCH,
     ASK_RESULT_AWAIT,
@@ -298,14 +286,6 @@ typedef enum {
     ASK_RESULT_CLOSED,
     ASK_RESULT_OUT_OF_CREDITS
 } ask_result_t;
-
-//
-
-typedef enum {
-    MATCH_STATE_AWAIT = 1,
-    MATCH_STATE_MATCHED = 2,
-    MATCH_STATE_CLOSED = 4
-} match_state_t;
 
 //
 
@@ -333,8 +313,6 @@ typedef struct {
     local_state_t* local_state;
     size_t copied_bytes;
     //
-    //
-    // ask_state_t ask_state;
     int credits;
     batch_t* batch;
     _Atomic(offset_t)* offset_counter;
