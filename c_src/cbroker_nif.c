@@ -345,6 +345,7 @@ typedef struct {
     ERL_NIF_TERM ticket_term;
     request_t* counter_request;
     bool consume_slot;
+    bool demonitoring_failed;
     ERL_NIF_TERM term_res;
 } ask_ctx_t;
 
@@ -818,7 +819,13 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     }
 
     if (ctx.counter_request != NULL) {
-        request_reclaim(ctx.counter_request, true, ctx.local_state);
+        if (ctx.demonitoring_failed) {
+            // Can't reclaim the request, it's tied to the ticket
+            enif_release_resource(ctx.counter_request->ticket);
+        }
+        else {
+            request_reclaim(ctx.counter_request, true, ctx.local_state);
+        }
         ctx.counter_request = NULL;
     }
 
@@ -895,57 +902,60 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
 
     lease_t lease;
     memset(&lease, 0, sizeof(lease_t));
-
-    if (local_state->is_closed) {
-        return Atoms._too_late;
-    }
+    bool was_cell_swapped = false;
+    bool too_late = false;
 
     LOG("[cancel] Checking out batch");
-    if (!broker_checkout_batch(broker, local_state, request->batch_id, &lease)) {
-        return Atoms._too_late;
-    }
+    if (broker_checkout_batch(broker, local_state, request->batch_id, &lease)) {
+        batch_t* batch = lease.batch;
 
-    batch_t* batch = lease.batch;
-    ERL_NIF_TERM res;
+        LOG("[cancel] asserting offset within bounds");
+        assert(request->offset < batch->nr_of_cells);
 
-    LOG("[cancel] asserting offset within bounds");
-    assert(request->offset < batch->nr_of_cells);
+        LOG("[cancel] Retrieving cell");
+        cell_t* cell = &batch->cells[request->offset];
+        request_t* cell_request = request;
 
-    LOG("[cancel] Retrieving cell");
-    cell_t* cell = &batch->cells[request->offset];
+        if (atomic_compare_exchange_strong(cell, &cell_request, &sentinel_request_cancelled)) {
+            LOG("[cancel] Consuming lease slot");
+            lease_consume_slot(&lease);
+            was_cell_swapped = true;
+        }
+        else if (cell_request == &sentinel_request_matched) {
+            too_late = true;
+        }
+        else {
+            assert(cell_request == &sentinel_request_cancelled);
+        }
 
-    //
-
-    if (atomic_compare_exchange_strong(cell, &request, &sentinel_request_cancelled)) {
-        LOG("[cancel] Consuming lease slot");
-        lease_consume_slot(&lease);
-
-        LOG("[cancel] Reclaiming request %p", request);
-        ErlNifPid cancelled_pid = request->pid;
-        ErlNifTime enqueue_ts = request->enqueue_ts;
-        request_reclaim(request, true, local_state);
-        request = NULL;
-
-        LOG("enqueue_ts=%lld, monotonic_ts=%lld", enqueue_ts, monotonic_ts());
-
-        int64_t sojourn_time = monotonic_ts() - enqueue_ts;
-        res = make_cancelled(env, sojourn_time);
-
-        if (enif_compare_pids(&cancelled_pid, &self)) {
-            notify_of_cancellation(env, request, DROP_REASON_CANCELLED);
+        if (lease.batch != NULL && !lease.found_locally) {
+            lease_ref_count_dec(&lease);
         }
     }
     else {
-        assert(request == &sentinel_request_cancelled || request == &sentinel_request_matched);
-        res = Atoms._too_late;
+        too_late = true;
     }
 
     //
 
-    if (lease.batch != NULL && !lease.found_locally) {
-        lease_ref_count_dec(&lease);
+    ErlNifPid cancelled_pid = request->pid;
+    ErlNifTime enqueue_ts = request->enqueue_ts;
+
+    if (too_late) {
+        return Atoms._too_late;
     }
-    return res;
+    else if (was_cell_swapped) {
+        if (enif_compare_pids(&cancelled_pid, &self)) {
+            notify_of_cancellation(env, request, DROP_REASON_CANCELLED);
+        }
+
+        LOG("[cancel] Reclaiming request %p", request);
+        request_reclaim(request, true, local_state);
+        request = NULL;
+    }
+
+    int64_t sojourn_time = monotonic_ts() - enqueue_ts;
+    return make_cancelled(env, sojourn_time);
 }
 
 //
@@ -1292,14 +1302,12 @@ static ask_result_t ask_loop_tail_offset_ask(ask_ctx_t* ctx, lease_t* lease, con
     if (atomic_compare_exchange_strong(cell, &counter_request, &sentinel_request_matched)) {
         assert(counter_request != NULL);
 
-        if (request_demonitor(ctx->env, counter_request)) {
-            // Matched!
-            assert(counter_request->offer_size >= 0);
-            ctx->counter_request = counter_request;
-            ctx->consume_slot = true;
-            return ASK_RESULT_MATCHED;
-        }
-        return ASK_RESULT_NONE;
+        // Matched!
+        ctx->demonitoring_failed = !request_demonitor(ctx->env, counter_request);
+        assert(counter_request->offer_size >= 0);
+        ctx->counter_request = counter_request;
+        ctx->consume_slot = true;
+        return ASK_RESULT_MATCHED;
     }
 
     assert(counter_request == &sentinel_request_cancelled);
@@ -1715,7 +1723,6 @@ static bool request_demonitor(ErlNifEnv* caller_env, request_t* request)
         return true;
     }
     else {
-        enif_release_resource(ticket);
         return false;
     }
 }
