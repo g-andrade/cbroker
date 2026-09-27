@@ -1594,7 +1594,7 @@ static void ask_reply_nomatch(ask_ctx_t* ctx)
     assert(ctx->counter_request == NULL);
 
     int64_t sojourn_time = monotonic_ts() - ctx->enqueue_ts;
-    ctx->term_res = make_drop(ctx->env, DROP_REASON_TOO_MANY_RETRIES, sojourn_time);
+    ctx->term_res = make_drop(ctx->env, DROP_REASON_NON_BLOCKING, sojourn_time);
 }
 
 static void ask_reply_closed(ask_ctx_t* ctx)
