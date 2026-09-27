@@ -14,7 +14,8 @@ callback module (started via the `mod` entry in `cbroker.app.src`); it starts
 
 ```bash
 make compile         # compile
-make test            # eunit + CT (+ coverage)
+make test            # eunit + CT (+ coverage) + PropEr
+make proper          # PropEr only; `make proper PROPER_NUMTESTS=1000` for a longer run
 make check           # check-fast + check-slow
 make check-fast      # format check (erlfmt) + xref + dead-code (hank) + lint (elvis)
 make check-slow      # dialyzer

@@ -35,7 +35,7 @@ check-slow:
 .NOTPARALLEL: check-slow
 .PHONY: check-slow
 
-test: eunit ct
+test: eunit ct proper
 .NOTPARALLEL: test
 .PHONY: test
 
@@ -66,6 +66,13 @@ ct:
 eunit:
 	@rebar3 eunit
 .PHONY: eunit
+
+# PROPER_NUMTESTS: raise it for a longer run, e.g. `make proper PROPER_NUMTESTS=1000`
+PROPER_NUMTESTS ?= 100
+
+proper:
+	@rebar3 proper -n $(PROPER_NUMTESTS)
+.PHONY: proper
 
 ## Checks
 
