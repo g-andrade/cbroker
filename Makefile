@@ -78,6 +78,17 @@ cover: ct eunit proper
 	@rebar3 cover
 .PHONY: cover
 
+# The stress cases also run as part of `ct`, but with small defaults; this runs
+# them for much longer. Override either variable to size it differently.
+STRESS_PROCS_PER_SIDE ?= 32
+STRESS_ITERATIONS ?= 20000
+
+stress: export CBROKER_STRESS_PROCS_PER_SIDE = $(STRESS_PROCS_PER_SIDE)
+stress: export CBROKER_STRESS_ITERATIONS = $(STRESS_ITERATIONS)
+stress:
+	@rebar3 ct --suite=test/cbroker_stress_SUITE
+.PHONY: stress
+
 ## Checks
 
 check-formatted: check-formatted-erl check-formatted-c

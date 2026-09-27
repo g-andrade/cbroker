@@ -16,6 +16,7 @@ callback module (started via the `mod` entry in `cbroker.app.src`); it starts
 make compile         # compile
 make test            # eunit + CT (+ coverage) + PropEr
 make proper          # PropEr only; `make proper PROPER_NUMTESTS=1000` for a longer run
+make stress          # the stress cases alone, sized up (see below)
 make check           # check-fast + check-slow
 make check-fast      # format check (erlfmt) + xref + dead-code (hank) + lint (elvis)
 make check-slow      # dialyzer
@@ -29,6 +30,16 @@ Benchmarks live in `bench/` (`cbroker_bench`, plus the `cbroker_simple` baseline
 compares against), compiled only by the `bench` profile together with their
 bench-only deps (`xb5`). Run e.g. `cbroker_bench:bench1(cbroker, smallest, 1_000_000, 64)`
 from `make bench-shell`; each run sets up and tears down what it measures.
+
+Tests come in three layers: `cbroker_tests_SUITE` (worked examples per API family),
+`prop_cbroker` plus `prop_cbroker_statem` (stateless properties and a single-process
+model), and `cbroker_stress_SUITE` (concurrency invariants — matches pair up, the
+cancel-versus-match race never loses a reply, dead processes' requests are
+reclaimed). The stress cases are sized by `CBROKER_STRESS_PROCS_PER_SIDE` and
+`CBROKER_STRESS_ITERATIONS`, small enough by default to run inside `make test`;
+`make stress` (`STRESS_PROCS_PER_SIDE`, `STRESS_ITERATIONS`) runs them far longer.
+That suite is also the workload to run against a sanitizer build of the NIF: it
+found both a live `assert` abort and a lost-reply hang in the cancellation path.
 
 All checks run sequentially (`.NOTPARALLEL`). CI runs `make check-fast`, `make test`,
 and `make check-slow` over OTP 24–29 on Linux, plus a Windows job that only builds
