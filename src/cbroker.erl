@@ -352,7 +352,7 @@ resolve_name(BrokerName) ->
 -spec resumable_ask(Broker, Side) ->
     {match, MatchRef, CounterOffer, SojournTime}
     | {drop, DropReason, SojournTime}
-    | {timeout, Ticket}
+    | {timeout, ReplyRef, Ticket}
 when
     Broker :: broker(),
     Side :: side(),
@@ -360,6 +360,7 @@ when
     CounterOffer :: term(),
     SojournTime :: sojourn_time(),
     DropReason :: drop_reason(),
+    ReplyRef :: reference(),
     Ticket :: ticket().
 
 resumable_ask(Broker, Side) ->
@@ -370,7 +371,7 @@ resumable_ask(Broker, Side) ->
 -spec resumable_ask(Broker, Side, Offer) ->
     {match, MatchRef, CounterOffer, SojournTime}
     | {drop, DropReason, SojournTime}
-    | {timeout, Ticket}
+    | {timeout, ReplyRef, Ticket}
 when
     Broker :: broker(),
     Side :: side(),
@@ -379,6 +380,7 @@ when
     CounterOffer :: term(),
     SojournTime :: sojourn_time(),
     DropReason :: drop_reason(),
+    ReplyRef :: reference(),
     Ticket :: ticket().
 
 resumable_ask(Broker, Side, Offer) ->
@@ -389,7 +391,7 @@ resumable_ask(Broker, Side, Offer) ->
 -spec resumable_ask(Broker, Side, Offer, Timeout) ->
     {match, MatchRef, CounterOffer, SojournTime}
     | {drop, DropReason, SojournTime}
-    | {timeout, Ticket, ReplyRef}
+    | {timeout, ReplyRef, Ticket}
 when
     Broker :: broker(),
     Side :: side(),
@@ -399,8 +401,8 @@ when
     CounterOffer :: term(),
     SojournTime :: sojourn_time(),
     DropReason :: drop_reason(),
-    Ticket :: ticket(),
-    ReplyRef :: reference().
+    ReplyRef :: reference(),
+    Ticket :: ticket().
 
 resumable_ask(Broker, Side, Offer, Timeout) ->
     BrokerRef = resolve_broker(Broker),
@@ -501,5 +503,5 @@ resumable_ask_await(ReplyRef, Ticket, Timeout) ->
         {ReplyRef, Reply} ->
             Reply
     after Timeout ->
-        {timeout, Ticket, ReplyRef}
+        {timeout, ReplyRef, Ticket}
     end.
