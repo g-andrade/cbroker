@@ -20,10 +20,10 @@
 
 %% A `proper_statem` model of one broker, driven from a single process.
 %%
-%% The model keeps at most one outstanding request per side, which makes every
-%% outcome predictable: an ask matches exactly when the opposite side has a
+%% The model keeps at most one outstanding request per lane, which makes every
+%% outcome predictable: an ask matches exactly when the opposite lane has a
 %% request parked, and it is unambiguous which request it matched. Several
-%% requests per side would make the model depend on the order in which cells
+%% requests per lane would make the model depend on the order in which cells
 %% are handed out, which is a scheduler detail rather than a promise; the
 %% stress suite covers that case with weaker, global invariants.
 
@@ -113,12 +113,12 @@ initial_state() ->
 command(State) ->
     frequency(
         [
-            {3, {call, ?MODULE, nb_ask, [side(), offer(State)]}},
-            {1, {call, ?MODULE, ask_without_waiting, [side(), offer(State)]}}
+            {3, {call, ?MODULE, nb_ask, [lane(), offer(State)]}},
+            {1, {call, ?MODULE, ask_without_waiting, [lane(), offer(State)]}}
         ] ++
             [
-                {6, {call, ?MODULE, dynamic_ask, [parkable_side(State), offer(State)]}}
-             || parkable_sides(State) =/= []
+                {6, {call, ?MODULE, dynamic_ask, [parkable_lane(State), offer(State)]}}
+             || parkable_lanes(State) =/= []
             ] ++
             [
                 {3, {call, ?MODULE, cancel, [cancellable(State)]}}
@@ -130,8 +130,8 @@ command(State) ->
             ]
     ).
 
-precondition(State, {call, _, dynamic_ask, [Side, _]}) ->
-    parked(State, Side) =:= none;
+precondition(State, {call, _, dynamic_ask, [Lane, _]}) ->
+    parked(State, Lane) =:= none;
 precondition(State, {call, _, cancel, [AskResult]}) ->
     lists:member(AskResult, cancellable_results(State));
 precondition(State, {call, _, collect, [AskResult]}) ->
@@ -139,16 +139,16 @@ precondition(State, {call, _, collect, [AskResult]}) ->
 precondition(_State, _Call) ->
     true.
 
-postcondition(State, {call, _, nb_ask, [Side, _Offer]}, Result) ->
-    case parked(State, opposite(Side)) of
+postcondition(State, {call, _, nb_ask, [Lane, _Offer]}, Result) ->
+    case parked(State, opposite(Lane)) of
         none ->
             matches_drop(Result, match_unavailable);
         %
         {_, CounterOffer} ->
             matches_match(Result, CounterOffer)
     end;
-postcondition(State, {call, _, ask_without_waiting, [Side, _Offer]}, Result) ->
-    case parked(State, opposite(Side)) of
+postcondition(State, {call, _, ask_without_waiting, [Lane, _Offer]}, Result) ->
+    case parked(State, opposite(Lane)) of
         none ->
             % Nothing to match, so `ask/4` cancels its own request
             matches_drop(Result, timeout);
@@ -156,8 +156,8 @@ postcondition(State, {call, _, ask_without_waiting, [Side, _Offer]}, Result) ->
         {_, CounterOffer} ->
             matches_match(Result, CounterOffer)
     end;
-postcondition(State, {call, _, dynamic_ask, [Side, _Offer]}, Result) ->
-    case parked(State, opposite(Side)) of
+postcondition(State, {call, _, dynamic_ask, [Lane, _Offer]}, Result) ->
+    case parked(State, opposite(Lane)) of
         none ->
             case Result of
                 {await, Ticket} -> is_reference(Ticket);
@@ -184,23 +184,23 @@ postcondition(State, {call, _, collect, [AskResult]}, Result) ->
     {AskResult, CounterOffer} = lists:keyfind(AskResult, 1, State#state.matched),
     matches_match(Result, CounterOffer).
 
-next_state(State, Result, {call, _, dynamic_ask, [Side, Offer]}) ->
-    case parked(State, opposite(Side)) of
+next_state(State, Result, {call, _, dynamic_ask, [Lane, Offer]}) ->
+    case parked(State, opposite(Lane)) of
         none ->
-            park(State, Side, {Result, Offer});
+            park(State, Lane, {Result, Offer});
         %
         {CounterAskResult, _} ->
-            matched(unpark(State, opposite(Side)), CounterAskResult, Offer)
+            matched(unpark(State, opposite(Lane)), CounterAskResult, Offer)
     end;
-next_state(State, _Result, {call, _, Ask, [Side, Offer]}) when
+next_state(State, _Result, {call, _, Ask, [Lane, Offer]}) when
     Ask =:= nb_ask; Ask =:= ask_without_waiting
 ->
-    case parked(State, opposite(Side)) of
+    case parked(State, opposite(Lane)) of
         none ->
             State;
         %
         {CounterAskResult, _} ->
-            matched(unpark(State, opposite(Side)), CounterAskResult, Offer)
+            matched(unpark(State, opposite(Lane)), CounterAskResult, Offer)
     end;
 next_state(State, _Result, {call, _, cancel, [AskResult]}) ->
     % Either it was parked and is now gone, or it had already matched and its
@@ -216,14 +216,14 @@ next_state(State, _Result, {call, _, collect, [AskResult]}) ->
 %% Command Function Definitions
 %% ------------------------------------------------------------------
 
-nb_ask(Side, Offer) ->
-    cbroker:nb_ask(broker(), Side, Offer).
+nb_ask(Lane, Offer) ->
+    cbroker:nb_ask(broker(), Lane, Offer).
 
-dynamic_ask(Side, Offer) ->
-    cbroker:dynamic_ask(broker(), Side, Offer).
+dynamic_ask(Lane, Offer) ->
+    cbroker:dynamic_ask(broker(), Lane, Offer).
 
-ask_without_waiting(Side, Offer) ->
-    cbroker:ask(broker(), Side, Offer, 0).
+ask_without_waiting(Lane, Offer) ->
+    cbroker:ask(broker(), Lane, Offer, 0).
 
 cancel({await, Ticket}) ->
     cbroker:cancel(Ticket).
@@ -240,11 +240,11 @@ collect({await, Ticket}) ->
 %% Generators
 %% ------------------------------------------------------------------
 
-side() ->
+lane() ->
     oneof([left, right]).
 
-parkable_side(State) ->
-    oneof(parkable_sides(State)).
+parkable_lane(State) ->
+    oneof(parkable_lanes(State)).
 
 offer(#state{nr_of_offers = NrOfOffers}) ->
     {offer, NrOfOffers + 1}.
@@ -259,8 +259,8 @@ collectable(#state{matched = Matched}) ->
 %% Internal Function Definitions
 %% ------------------------------------------------------------------
 
-parkable_sides(State) ->
-    [Side || Side <- [left, right], parked(State, Side) =:= none].
+parkable_lanes(State) ->
+    [Lane || Lane <- [left, right], parked(State, Lane) =:= none].
 
 % Parked requests, plus those already matched: cancelling the latter is how
 % the `too_late` path gets exercised
@@ -337,7 +337,7 @@ cleanup(#state{} = State) ->
         Cell =/= matched,
         Cell =/= cancelled
     ],
-    Expected = length([Side || Side <- [left, right], parked(State, Side) =/= none]),
+    Expected = length([Lane || Lane <- [left, right], parked(State, Lane) =/= none]),
 
     erlang:erase(broker),
 

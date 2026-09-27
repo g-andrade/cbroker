@@ -34,9 +34,9 @@
 %% API Function Definitions
 %% ------------------------------------------------------------------
 
-ask(BrokerRef, Side, Offer, ReplyRef, AskType) ->
+ask(BrokerRef, Lane, Offer, ReplyRef, AskType) ->
     OfferSizeArg = offer_size_arg(Offer),
-    ask(BrokerRef, Side, Offer, OfferSizeArg, ReplyRef, AskType).
+    ask(BrokerRef, Lane, Offer, OfferSizeArg, ReplyRef, AskType).
 
 cancel(_Ticket) ->
     not_loaded(?LINE).
@@ -66,7 +66,7 @@ init() ->
         end,
     erlang:load_nif(SoName, 0).
 
-ask(_BrokerRef, _Side, _Offer, _OfferSizeArg, _ReplyRef, _AskType) ->
+ask(_BrokerRef, _Lane, _Offer, _OfferSizeArg, _ReplyRef, _AskType) ->
     not_loaded(?LINE).
 
 % Live allocations across every broker, for the tests to assert nothing leaked

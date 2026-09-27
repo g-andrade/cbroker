@@ -79,10 +79,10 @@ prop_sojourn_times_are_plausible() ->
 
 prop_nb_ask_on_an_idle_broker_drops() ->
     ?FORALL(
-        {Side, Offer},
-        {side(), offer()},
+        {Lane, Offer},
+        {lane(), offer()},
         begin
-            {drop, Reason, Sojourn} = cbroker:nb_ask(broker(), Side, Offer),
+            {drop, Reason, Sojourn} = cbroker:nb_ask(broker(), Lane, Offer),
 
             Reason =:= match_unavailable andalso is_plausible_sojourn(Sojourn)
         end
@@ -122,7 +122,7 @@ offer() ->
         {1, ?LET(Bytes, range(0, 2_000), binary(Bytes))}
     ]).
 
-side() ->
+lane() ->
     oneof([left, right]).
 
 %% ------------------------------------------------------------------

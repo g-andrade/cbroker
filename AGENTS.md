@@ -36,9 +36,9 @@ Tests come in three layers: `cbroker_tests_SUITE` (worked examples per API famil
 `prop_cbroker` plus `prop_cbroker_statem` (stateless properties and a single-process
 model), and `cbroker_stress_SUITE` (concurrency invariants — matches pair up, the
 cancel-versus-match race never loses a reply, dead processes' requests are
-reclaimed). The stress cases are sized by `CBROKER_STRESS_PROCS_PER_SIDE` and
+reclaimed). The stress cases are sized by `CBROKER_STRESS_PROCS_PER_LANE` and
 `CBROKER_STRESS_ITERATIONS`, small enough by default to run inside `make test`;
-`make stress` (`STRESS_PROCS_PER_SIDE`, `STRESS_ITERATIONS`) runs them far longer.
+`make stress` (`STRESS_PROCS_PER_LANE`, `STRESS_ITERATIONS`) runs them far longer.
 That suite is also the workload to run against a sanitizer build of the NIF: it
 found both a live `assert` abort and a lost-reply hang in the cancellation path.
 

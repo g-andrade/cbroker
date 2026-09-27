@@ -164,5 +164,5 @@ jobs:
       - name: Run Sanitized Tests
         run: make test-sanitized
         env:
-          CBROKER_STRESS_PROCS_PER_SIDE: 16
+          CBROKER_STRESS_PROCS_PER_LANE: 16
           CBROKER_STRESS_ITERATIONS: 2000

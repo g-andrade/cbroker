@@ -53,7 +53,7 @@
 
 -record(state, {
     invariants :: invariants(),
-    side :: none | left | right,
+    lane :: none | left | right,
     q :: queue:queue(entry()),
     downed_mons :: downed_mons()
 }).
@@ -80,14 +80,14 @@ start_link(MessageQueueData) ->
     Name = server_name(MessageQueueData),
     proc_lib:start_link(?MODULE, init, [self(), Name, MessageQueueData]).
 
-async_ask(ServPid, Side, Pid, Value) ->
+async_ask(ServPid, Lane, Pid, Value) ->
     Tag = monitor(process, ServPid),
     Ts = erlang:monotonic_time(),
-    _ = ServPid ! {ask, Side, Pid, Value, Tag, Ts},
+    _ = ServPid ! {ask, Lane, Pid, Value, Tag, Ts},
     {await, Tag}.
 
-ask(ServPid, Side, Pid, Value) ->
-    {await, Tag} = async_ask(ServPid, Side, Pid, Value),
+ask(ServPid, Lane, Pid, Value) ->
+    {await, Tag} = async_ask(ServPid, Lane, Pid, Value),
 
     receive
         {T, Reply} when T =:= Tag ->
@@ -113,7 +113,7 @@ init(Parent, ServerName, MessageQueueData) ->
 
             State = #state{
                 invariants = Invariants,
-                side = none,
+                lane = none,
                 q = queue:new(),
                 downed_mons = #{}
             },
@@ -176,8 +176,8 @@ handle_msg(Msg, Debug, State) ->
     loop(UpdatedDebug, UpdatedState).
 
 -spec handle_non_system_msg(term(), state()) -> state() | no_return().
-handle_non_system_msg({ask, Side, Pid, Value, Tag, Ts}, State) ->
-    handle_ask(Side, Pid, Value, Tag, Ts, State);
+handle_non_system_msg({ask, Lane, Pid, Value, Tag, Ts}, State) ->
+    handle_ask(Lane, Pid, Value, Tag, Ts, State);
 handle_non_system_msg({'DOWN', Ref, process, _Pid, _Reason}, State) ->
     handle_monitor_down(Ref, State);
 handle_non_system_msg(Msg, _State) ->
@@ -190,32 +190,32 @@ terminate(Reason) ->
 %%
 
 handle_ask(
-    Side, Pid, Value, Tag, Ts, #state{side = QSide, q = Q, downed_mons = DownedMons} = State
+    Lane, Pid, Value, Tag, Ts, #state{lane = QLane, q = Q, downed_mons = DownedMons} = State
 ) ->
-    case Side =:= QSide of
+    case Lane =:= QLane of
         true ->
             Mon = monitor(process, Pid),
             Entry = ?ENTRY(Pid, Value, Tag, Mon, Ts),
             UpdatedQ = queue:in(Entry, Q),
             State#state{q = UpdatedQ};
         %
-        _ when QSide =:= none ->
+        _ when QLane =:= none ->
             Mon = monitor(process, Pid),
             Entry = ?ENTRY(Pid, Value, Tag, Mon, Ts),
             UpdatedQ = queue:in(Entry, Q),
-            State#state{side = Side, q = UpdatedQ};
+            State#state{lane = Lane, q = UpdatedQ};
         %
         _ ->
             case map_size(DownedMons) of
                 0 ->
-                    try_matching1(Side, Pid, Value, Tag, Ts, Q, State);
+                    try_matching1(Lane, Pid, Value, Tag, Ts, Q, State);
                 %
                 _ ->
-                    try_matching2(Side, Pid, Value, Tag, Ts, Q, DownedMons, State)
+                    try_matching2(Lane, Pid, Value, Tag, Ts, Q, DownedMons, State)
             end
     end.
 
-try_matching1(Side2, Pid2, Value2, Tag2, Ts2, Q, State) ->
+try_matching1(Lane2, Pid2, Value2, Tag2, Ts2, Q, State) ->
     case queue:out(Q) of
         {{value, ?ENTRY(Pid1, Value1, Tag1, Mon1, Ts1)}, RemainingQ} ->
             match(Pid1, Value1, Tag1, Mon1, Ts1, Pid2, Value2, Tag2, Ts2),
@@ -225,17 +225,17 @@ try_matching1(Side2, Pid2, Value2, Tag2, Ts2, Q, State) ->
                     State#state{q = RemainingQ};
                 %
                 true ->
-                    State#state{side = none, q = RemainingQ}
+                    State#state{lane = none, q = RemainingQ}
             end;
         %
         {empty, EmptyQ} ->
             Mon = monitor(process, Pid2),
             Entry = ?ENTRY(Pid2, Value2, Tag2, Mon, Ts2),
             UpdatedQ = queue:in(Entry, EmptyQ),
-            State#state{side = Side2, q = UpdatedQ, downed_mons = #{}}
+            State#state{lane = Lane2, q = UpdatedQ, downed_mons = #{}}
     end.
 
-try_matching2(Side2, Pid2, Value2, Tag2, Ts2, Q, DownedMons, State) ->
+try_matching2(Lane2, Pid2, Value2, Tag2, Ts2, Q, DownedMons, State) ->
     case queue:out(Q) of
         {{value, ?ENTRY(Pid1, Value1, Tag1, Mon1, Ts1)}, RemainingQ} ->
             case maps:take(Mon1, DownedMons) of
@@ -247,18 +247,18 @@ try_matching2(Side2, Pid2, Value2, Tag2, Ts2, Q, DownedMons, State) ->
                             State#state{q = RemainingQ, downed_mons = DownedMons};
                         %
                         true ->
-                            State#state{side = none, q = RemainingQ, downed_mons = #{}}
+                            State#state{lane = none, q = RemainingQ, downed_mons = #{}}
                     end;
                 %
                 {_, RemainingMons} ->
                     case map_size(RemainingMons) of
                         0 ->
                             try_matching2(
-                                Side2, Pid2, Value2, Tag2, Ts2, RemainingQ, RemainingMons, State
+                                Lane2, Pid2, Value2, Tag2, Ts2, RemainingQ, RemainingMons, State
                             );
                         %
                         _ ->
-                            try_matching1(Side2, Pid2, Value2, Tag2, Ts2, RemainingQ, State)
+                            try_matching1(Lane2, Pid2, Value2, Tag2, Ts2, RemainingQ, State)
                     end
             end;
         %
@@ -266,7 +266,7 @@ try_matching2(Side2, Pid2, Value2, Tag2, Ts2, Q, DownedMons, State) ->
             Mon = monitor(process, Pid2),
             Entry = ?ENTRY(Pid2, Value2, Tag2, Mon, Ts2),
             UpdatedQ = queue:in(Entry, EmptyQ),
-            State#state{side = Side2, q = UpdatedQ, downed_mons = #{}}
+            State#state{lane = Lane2, q = UpdatedQ, downed_mons = #{}}
     end.
 
 match(Pid1, Value1, Tag1, Mon1, Ts1, Pid2, Value2, Tag2, Ts2) ->
@@ -296,7 +296,7 @@ handle_monitor_down(Ref, #state{downed_mons = Mons} = State) ->
 
             case queue:is_empty(FilteredQ) of
                 true ->
-                    State#state{side = none, q = FilteredQ, downed_mons = #{}};
+                    State#state{lane = none, q = FilteredQ, downed_mons = #{}};
                 %
                 false ->
                     State#state{q = FilteredQ, downed_mons = #{}}

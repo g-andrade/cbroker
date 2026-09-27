@@ -341,10 +341,10 @@ right_fun(cbroker_blocking, Broker) ->
 
 %%
 
-simple_iteration(Pid, Side, Offer, _AskCounter, Acc) ->
+simple_iteration(Pid, Lane, Offer, _AskCounter, Acc) ->
     StartTs = erlang:monotonic_time(),
 
-    case cbroker_simple:async_ask(Pid, Side, self(), Offer) of
+    case cbroker_simple:async_ask(Pid, Lane, self(), Offer) of
         {await, Tag} ->
             receive
                 {Ref, Reply} when Ref =:= Tag ->
@@ -368,12 +368,12 @@ simple_iteration(Pid, Side, Offer, _AskCounter, Acc) ->
 
 %%
 
-cbroker_iteration([_Pid | BrokerRef], Side, Offer, AskCounter, Acc) ->
+cbroker_iteration([_Pid | BrokerRef], Lane, Offer, AskCounter, Acc) ->
     StartTs = erlang:monotonic_time(),
-    cbroker_iteration_recur(BrokerRef, Side, Offer, AskCounter, StartTs, Acc, 0).
+    cbroker_iteration_recur(BrokerRef, Lane, Offer, AskCounter, StartTs, Acc, 0).
 
-cbroker_iteration_recur(BrokerRef, Side, Offer, AskCounter, StartTs, Acc, OverloadCount) ->
-    try cbroker:dynamic_ask(BrokerRef, Side, Offer) of
+cbroker_iteration_recur(BrokerRef, Lane, Offer, AskCounter, StartTs, Acc, OverloadCount) ->
+    try cbroker:dynamic_ask(BrokerRef, Lane, Offer) of
         {await, Tag} ->
             cbroker_iteration_await(StartTs, Tag, AskCounter, Acc);
         %
@@ -389,7 +389,7 @@ cbroker_iteration_recur(BrokerRef, Side, Offer, AskCounter, StartTs, Acc, Overlo
         %
         {drop, broker_overloaded, _} ->
             cbroker_iteration_recur(
-                BrokerRef, Side, Offer, AskCounter, StartTs, Acc, OverloadCount + 1
+                BrokerRef, Lane, Offer, AskCounter, StartTs, Acc, OverloadCount + 1
             );
         %
         {drop, broker_closed, _} ->
@@ -419,12 +419,12 @@ cbroker_iteration_await(StartTs, Tag, _AskCounter, Acc) ->
 
 %%
 
-blocking_cbroker_iteration([_Pid | BrokerRef], Side, Offer, AskCounter, Acc) ->
+blocking_cbroker_iteration([_Pid | BrokerRef], Lane, Offer, AskCounter, Acc) ->
     StartTs = erlang:monotonic_time(),
-    blocking_cbroker_iteration_recur(BrokerRef, Side, Offer, AskCounter, StartTs, Acc, 0).
+    blocking_cbroker_iteration_recur(BrokerRef, Lane, Offer, AskCounter, StartTs, Acc, 0).
 
-blocking_cbroker_iteration_recur(BrokerRef, Side, Offer, AskCounter, StartTs, Acc, OverloadCount) ->
-    try cbroker:ask(BrokerRef, Side, Offer) of
+blocking_cbroker_iteration_recur(BrokerRef, Lane, Offer, AskCounter, StartTs, Acc, OverloadCount) ->
+    try cbroker:ask(BrokerRef, Lane, Offer) of
         {match, _, _, _} ->
             FinalTs = erlang:monotonic_time(),
 
@@ -437,7 +437,7 @@ blocking_cbroker_iteration_recur(BrokerRef, Side, Offer, AskCounter, StartTs, Ac
         %
         {drop, broker_overloaded, _} ->
             cbroker_iteration_recur(
-                BrokerRef, Side, Offer, AskCounter, StartTs, Acc, OverloadCount + 1
+                BrokerRef, Lane, Offer, AskCounter, StartTs, Acc, OverloadCount + 1
             );
         %
         {drop, broker_closed, _} ->

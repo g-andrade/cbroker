@@ -45,8 +45,8 @@ concurrently.
 
 #### Asks
 
-This represents a process that wishes to either enqueue its offer on one side
-of the **broker**, or instead get a counter-offer from the opposite side (a
+This represents a process that wishes to either enqueue its offer on one lane
+of the **broker**, or instead get a counter-offer from the opposite lane (a
 match).
 
 #### Broker
@@ -119,8 +119,8 @@ A tag consists of:
 
 #### Requests
 
-These are C structs used to exchange offers from the `left` side with offers
-from the `right` side.
+These are C structs used to exchange offers from the `left` lane with offers
+from the `right` lane.
 
 A request consists of:
 * the calling pid;
@@ -136,7 +136,7 @@ compare-and-swapped](https://en.cppreference.com/c/atomic/atomic_compare_exchang
 pointer to a request.
 
 It's through this single point that a request can either enqueue, or instead
-take ownership of a request from the opposite side.
+take ownership of a request from the opposite lane.
 
 At any given time, a cell is in one of five states:
 1) empty;
@@ -220,11 +220,11 @@ A batch contains an array of cells. In addition to the `ref_count`, it also cont
 #### Tracking batch tails
 
 `left_count` and `right_count` are cell position counters. Each points to the
-tail of its respective side.
+tail of its respective lane.
 
 A position counter is atomically incremented for every ask. If its value is
 `>=` that of the amount of cells in the batch, this signals that the batch is
-full on that side.
+full on that lane.
 
 #### Consuming a batch
 
@@ -263,7 +263,7 @@ Each local state contains:
 
 An ask starts with a batch in its local state, using either `left_id` or `right_id`.
 
-Both point to the batch containing the tail of its respective side.
+Both point to the batch containing the tail of its respective lane.
 
 When the ask encounters a full or consumed batch, it will look for the next
 batch in the sorted collection.

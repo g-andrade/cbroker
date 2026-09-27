@@ -302,7 +302,7 @@ typedef struct {
     ERL_NIF_TERM self_term;
     //
     ERL_NIF_TERM broker_term;
-    ERL_NIF_TERM side;
+    ERL_NIF_TERM lane;
     ERL_NIF_TERM offer;
     ptrdiff_t offer_size; // negative when it hasn't been computed yet
     ERL_NIF_TERM reply_ref;
@@ -779,7 +779,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     assert(argc == 6);
 
     ctx.broker_term = argv[0];
-    ctx.side = argv[1];
+    ERL_NIF_TERM lane = argv[1];
     ctx.offer = argv[2];
 
     if (!get_offer_size(env, argv[3], ctx.offer, &ctx.offer_size)) {
@@ -796,11 +796,11 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         return make_badarg(env, ctx.broker_term);
     }
 
-    if (ctx.side == Atoms._left) {
+    if (lane == Atoms._left) {
         ctx.is_left = true;
     }
-    else if (ctx.side != Atoms._right) {
-        return make_badarg(env, ctx.side);
+    else if (lane != Atoms._right) {
+        return make_badarg(env, lane);
     }
 
     //

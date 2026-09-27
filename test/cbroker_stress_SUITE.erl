@@ -26,7 +26,7 @@
 %% Sized by environment variables, so the defaults keep `make test` quick while
 %% `make stress` (or CI) can run the same cases for much longer:
 %%
-%%   CBROKER_STRESS_PROCS_PER_SIDE   (default 8)
+%%   CBROKER_STRESS_PROCS_PER_LANE   (default 8)
 %%   CBROKER_STRESS_ITERATIONS       (default 250, per process)
 
 -module(cbroker_stress_SUITE).
@@ -103,16 +103,16 @@ end_per_testcase(_TestCase, Config) ->
 %% ------------------------------------------------------------------
 
 % Everyone asks with a generous timeout, so every ask must match, and every
-% match must be seen by exactly one process per side, with the offers crossed
+% match must be seen by exactly one process per lane, with the offers crossed
 every_match_is_paired(Config) ->
     Broker = broker(Config),
 
-    Samples = run_workers(Broker, fun(Side, Offer) ->
-        cbroker:ask(Broker, Side, Offer, ?ASK_TIMEOUT_MS)
+    Samples = run_workers(Broker, fun(Lane, Offer) ->
+        cbroker:ask(Broker, Lane, Offer, ?ASK_TIMEOUT_MS)
     end),
 
     ?assertEqual([], [Sample || {_, _, Reply} = Sample <- Samples, not is_match(Reply)]),
-    ?assertEqual(2 * procs_per_side() * iterations(), length(Samples)),
+    ?assertEqual(2 * procs_per_lane() * iterations(), length(Samples)),
     assert_matches_are_paired(Samples).
 
 % Tiny timeouts make every ask race its own cancellation. A cancellation that
@@ -120,8 +120,8 @@ every_match_is_paired(Config) ->
 timeouts_never_lose_a_match(Config) ->
     Broker = broker(Config),
 
-    Samples = run_workers(Broker, fun(Side, Offer) ->
-        cbroker:ask(Broker, Side, Offer, rand:uniform(4) - 1)
+    Samples = run_workers(Broker, fun(Lane, Offer) ->
+        cbroker:ask(Broker, Lane, Offer, rand:uniform(4) - 1)
     end),
 
     UnexpectedDrops = [
@@ -138,7 +138,7 @@ timeouts_never_lose_a_match(Config) ->
 % never be handed a counterpart afterwards
 killed_waiters_are_reclaimed(Config) ->
     Broker = broker(Config),
-    Amount = procs_per_side(),
+    Amount = procs_per_lane(),
 
     Waiters = [spawn(fun() -> park_forever(Broker, left, {offer, N}) end) || N <- seq(Amount)],
     ok = wait_until(fun() -> length(pending_cells(Broker)) =:= Amount end),
@@ -215,24 +215,24 @@ settled(Counters, Baseline) ->
         lists:zip(Counters, Baseline)
     ).
 
-% Half the processes on each side, each running AskFun for every iteration.
-% Returns one {Side, Offer, Reply} sample per ask
+% Half the processes on each lane, each running AskFun for every iteration.
+% Returns one {Lane, Offer, Reply} sample per ask
 run_workers(_Broker, AskFun) ->
     Parent = self(),
     Iterations = iterations(),
 
     Workers = [
-        spawn_monitor(fun() -> Parent ! {self(), worker_samples(Side, Iterations, AskFun)} end)
-     || Side <- [left, right], _ <- seq(procs_per_side())
+        spawn_monitor(fun() -> Parent ! {self(), worker_samples(Lane, Iterations, AskFun)} end)
+     || Lane <- [left, right], _ <- seq(procs_per_lane())
     ],
 
     lists:append([collect_samples(Pid, MonRef) || {Pid, MonRef} <- Workers]).
 
-worker_samples(Side, Iterations, AskFun) ->
+worker_samples(Lane, Iterations, AskFun) ->
     [
         begin
-            Offer = {Side, self(), N},
-            {Side, Offer, AskFun(Side, Offer)}
+            Offer = {Lane, self(), N},
+            {Lane, Offer, AskFun(Lane, Offer)}
         end
      || N <- seq(Iterations)
     ].
@@ -249,12 +249,12 @@ collect_samples(Pid, MonRef) ->
         ct:fail({worker_timed_out, Pid})
     end.
 
-% Each match ref must show up exactly twice, once per side, and each side must
+% Each match ref must show up exactly twice, once per lane, and each lane must
 % have received the other's offer
 assert_matches_are_paired(Samples) ->
     ByMatchRef = lists:foldl(
-        fun({Side, Offer, {match, MatchRef, CounterOffer, _}}, Acc) ->
-            Sample = {Side, Offer, CounterOffer},
+        fun({Lane, Offer, {match, MatchRef, CounterOffer, _}}, Acc) ->
+            Sample = {Lane, Offer, CounterOffer},
             maps:update_with(MatchRef, fun(Pairs) -> [Sample | Pairs] end, [Sample], Acc)
         end,
         #{},
@@ -264,15 +264,15 @@ assert_matches_are_paired(Samples) ->
     Unpaired = maps:filter(fun(_, Pairs) -> not is_pair(Pairs) end, ByMatchRef),
     ?assertEqual(#{}, Unpaired).
 
-is_pair([{SideA, OfferA, CounterOfferA}, {SideB, OfferB, CounterOfferB}]) ->
-    SideA =/= SideB andalso
+is_pair([{LaneA, OfferA, CounterOfferA}, {LaneB, OfferB, CounterOfferB}]) ->
+    LaneA =/= LaneB andalso
         CounterOfferA =:= OfferB andalso
         CounterOfferB =:= OfferA;
 is_pair(_Pairs) ->
     false.
 
-park_forever(Broker, Side, Offer) ->
-    {await, _} = cbroker:async_ask(Broker, Side, Offer),
+park_forever(Broker, Lane, Offer) ->
+    {await, _} = cbroker:async_ask(Broker, Lane, Offer),
     receive
         never -> ok
     end.
@@ -285,8 +285,8 @@ is_match(_Reply) -> false.
 drop_of_reason({drop, Reason, SojournTime}, Reason) -> {drop, Reason, SojournTime};
 drop_of_reason(_Reply, _Reason) -> no_such_drop.
 
-procs_per_side() ->
-    env_int("CBROKER_STRESS_PROCS_PER_SIDE", 8).
+procs_per_lane() ->
+    env_int("CBROKER_STRESS_PROCS_PER_LANE", 8).
 
 iterations() ->
     env_int("CBROKER_STRESS_ITERATIONS", 250).
