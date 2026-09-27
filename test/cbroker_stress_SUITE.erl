@@ -53,7 +53,8 @@
 -export([
     every_match_is_paired/1,
     timeouts_never_lose_a_match/1,
-    killed_waiters_are_reclaimed/1
+    killed_waiters_are_reclaimed/1,
+    brokers_leave_nothing_allocated/1
 ]).
 
 %% ------------------------------------------------------------------
@@ -82,7 +83,8 @@ groups() ->
             _TestCases = [
                 every_match_is_paired,
                 timeouts_never_lose_a_match,
-                killed_waiters_are_reclaimed
+                killed_waiters_are_reclaimed,
+                brokers_leave_nothing_allocated
             ]
         }
     ].
@@ -147,9 +149,64 @@ killed_waiters_are_reclaimed(Config) ->
     % Nothing parked any more, so there is nothing left to match against
     ?assertMatch({drop, match_unavailable, _}, cbroker:nb_ask(Broker, right, late_offer)).
 
+% Brokers that have been worked hard enough to roll over batches must leave
+% nothing behind once collected. This is what the cell and pool assertions
+% cannot see: memory that is consistent, just unreachable
+brokers_leave_nothing_allocated(_Config) ->
+    Baseline = alloc_counters(),
+
+    lists:foreach(
+        fun(_) ->
+            {Pid, MonRef} = spawn_monitor(fun() -> churn_through_batches() end),
+            receive
+                {'DOWN', MonRef, process, Pid, normal} -> ok
+            after ?ASK_TIMEOUT_MS -> ct:fail({churn_timed_out, Pid})
+            end
+        end,
+        seq(3)
+    ),
+
+    ok = wait_until(fun() -> settled(collect_garbage(), Baseline) end),
+    ?assertEqual(Baseline, alloc_counters()).
+
 %% ------------------------------------------------------------------
 %% Internal Function Definitions
 %% ------------------------------------------------------------------
+
+% Enough asks to allocate batches beyond the first, in a process of its own, so
+% that dropping the broker leaves nothing referencing it
+churn_through_batches() ->
+    Broker = cbroker:new(),
+    {nr_of_cells_per_batch, CellsPerBatch} = lists:keyfind(
+        nr_of_cells_per_batch, 1, cbroker:debug_info(Broker)
+    ),
+
+    lists:foreach(
+        fun(N) ->
+            {await, Ticket} = cbroker:async_ask(Broker, left, {offer, N}),
+            {match, _, _, _} = cbroker:nb_ask(Broker, right, counter_offer),
+            receive
+                {Ticket, {match, _, _, _}} -> ok
+            after ?ASK_TIMEOUT_MS -> exit(no_reply)
+            end
+        end,
+        seq(2 * CellsPerBatch)
+    ).
+
+alloc_counters() ->
+    cbroker_nif:alloc_counters().
+
+collect_garbage() ->
+    lists:foreach(fun erlang:garbage_collect/1, processes()),
+    alloc_counters().
+
+% Resource destructors run on collection, so the counters only settle once every
+% reference is gone; anything below the baseline is another case's broker going
+settled(Counters, Baseline) ->
+    lists:all(
+        fun({{Key, Value}, {Key, BaselineValue}}) -> Value =< BaselineValue end,
+        lists:zip(Counters, Baseline)
+    ).
 
 % Half the processes on each side, each running AskFun for every iteration.
 % Returns one {Side, Offer, Reply} sample per ask

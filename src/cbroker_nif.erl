@@ -8,10 +8,15 @@
 %% ------------------------------------------------------------------
 
 -export([
+    alloc_counters/0,
     ask/5,
     cancel/1,
     debug_info/1,
     new/1
+]).
+
+-ignore_xref([
+    alloc_counters/0
 ]).
 
 %% ------------------------------------------------------------------
@@ -62,6 +67,10 @@ init() ->
     erlang:load_nif(SoName, 0).
 
 ask(_BrokerRef, _Side, _Offer, _OfferSizeArg, _ReplyRef, _AskType) ->
+    not_loaded(?LINE).
+
+% Live allocations across every broker, for the tests to assert nothing leaked
+alloc_counters() ->
     not_loaded(?LINE).
 
 -if(?OTP_RELEASE < 29).
