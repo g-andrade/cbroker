@@ -66,10 +66,16 @@
 -type side() :: left | right.
 -export_type([side/0]).
 
--type msg() :: {ticket(), reply()}.
+-type msg() :: {tag(), reply()}.
 -export_type([msg/0]).
 
--type ticket() :: reference().
+-type tag() :: reply_ref() | ticket().
+-export_type([tag/0]).
+
+-type reply_ref() :: reference().
+-export_type([reply_ref/0]).
+
+-opaque ticket() :: reference().
 -export_type([ticket/0]).
 
 -type reply() :: (match() | drop()).
