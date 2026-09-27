@@ -1391,7 +1391,7 @@ static request_t* ask_loop_request_prepare(ask_ctx_t* ctx, const batch_id_t batc
                                            const offset_t offset)
 {
     request_t* request = ctx->request;
-    ERL_NIF_TERM ticket_term = Atoms._none;
+    ERL_NIF_TERM ticket_term = ctx->ticket_term;
 
     if (request == NULL) {
         retry_t* retry = ctx->retry;
@@ -1448,7 +1448,6 @@ static void ask_loop_request_new(ask_ctx_t* ctx)
     if (ctx->offer_size == 0) {
         // immediate term
         request->offer = ctx->offer;
-        ctx->copied_bytes += term_size(request->env, ctx->broker_term);
     }
     else {
         request->offer = enif_make_copy(request->env, ctx->offer);
