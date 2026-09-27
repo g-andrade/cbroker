@@ -34,6 +34,16 @@ CXXFLAGS += -fPIC -I $(ERTS_INCLUDE_DIR)
 
 LDFLAGS += -shared
 
+# SANITIZE=address,undefined instruments the NIF. The resulting library only
+# loads with the sanitizer runtime preloaded into the emulator, which is what
+# the top-level `make test-sanitized` target sets up. Optimization drops to -O1
+# so that stack traces stay meaningful.
+ifneq ($(SANITIZE),)
+	CFLAGS := $(filter-out -O3,$(CFLAGS)) -O1 -g -fsanitize=$(SANITIZE) -fno-omit-frame-pointer
+	CXXFLAGS := $(filter-out -O3,$(CXXFLAGS)) -O1 -g -fsanitize=$(SANITIZE) -fno-omit-frame-pointer
+	LDFLAGS += -fsanitize=$(SANITIZE)
+endif
+
 # Verbosity.
 
 c_verbose_0 = @echo " C     " $(?F);

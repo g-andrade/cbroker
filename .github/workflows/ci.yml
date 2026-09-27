@@ -126,3 +126,43 @@ jobs:
       # Quoted: in PowerShell, the default shell here, `eunit, ct` is an array
       - name: Run Tests
         run: rebar3 do 'eunit,ct'
+
+  sanitizers:
+    # The CT suites against an ASan+UBSan build of the NIF. One Linux job is
+    # enough: the instrumentation is what matters here, not the OTP version,
+    # so this tracks whatever the latest OTP 29 happens to be.
+    name: >
+      Run sanitized tests over ${{matrix.otp_vsn}} and ${{matrix.os}}
+    runs-on: ${{matrix.os}}
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        otp_vsn: ['29']
+        os: ['ubuntu-24.04']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - id: otp-version-to-rebar3-version
+        name: "Read #{OTP version => rebar3 version} map"
+        uses: juliangruber/read-file-action@v1
+        with:
+          path: ./.github/workflows/otp_version_to_rebar3_version.json
+
+      - id: setup-beam
+        name: Setup BEAM
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{matrix.otp_vsn}}
+          rebar3-version: |
+            ${{ fromJson(steps.otp-version-to-rebar3-version.outputs.content)[matrix.otp_vsn] }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      # Larger than the defaults, since contention is what the sanitizers are
+      # here to inspect, but small enough to stay well inside the timeout
+      - name: Run Sanitized Tests
+        run: make test-sanitized
+        env:
+          CBROKER_STRESS_PROCS_PER_SIDE: 16
+          CBROKER_STRESS_ITERATIONS: 2000

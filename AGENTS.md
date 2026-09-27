@@ -17,6 +17,7 @@ make compile         # compile
 make test            # eunit + CT (+ coverage) + PropEr
 make proper          # PropEr only; `make proper PROPER_NUMTESTS=1000` for a longer run
 make stress          # the stress cases alone, sized up (see below)
+make test-sanitized  # CT suites against an ASan+UBSan build of the NIF
 make check           # check-fast + check-slow
 make check-fast      # format check (erlfmt) + xref + dead-code (hank) + lint (elvis)
 make check-slow      # dialyzer
@@ -40,6 +41,26 @@ reclaimed). The stress cases are sized by `CBROKER_STRESS_PROCS_PER_SIDE` and
 `make stress` (`STRESS_PROCS_PER_SIDE`, `STRESS_ITERATIONS`) runs them far longer.
 That suite is also the workload to run against a sanitizer build of the NIF: it
 found both a live `assert` abort and a lost-reply hang in the cancellation path.
+
+`make test-sanitized` rebuilds the NIF with `SANITIZE=address,undefined` (see
+`c_src/Makefile`) and runs the CT suites against it. Three things make that work:
+
+- The sanitizer runtime is `LD_PRELOAD`ed, because it must initialize before the
+  instrumented library is `dlopen`ed.
+- `SANITIZE` is exported so rebar3's compile hook relinks with the same flags. The
+  library depends on the always-regenerated `compile_flags.txt`, so it *is*
+  relinked, and without the flag it ends up missing the ASan symbols and fails to
+  load, which shows up as `undef` on `cbroker_nif:new/1`.
+- `ERL_FLAGS="+Mea min"` routes `erts_alloc` through libc `malloc`. Without it ASan
+  cannot see `enif_alloc`ed memory: overflowing such a block corrupts an ERTS
+  allocator and surfaces as a bare SEGV elsewhere (verified by injecting one),
+  whereas with it the report names the offending line.
+
+Leak detection stays off. Even with `+Mea min`, LSan would mostly report the
+emulator's own allocations, and suppressions can't separate them from ours because
+both reach `malloc` through `erts_alloc`. Counting `enif_alloc`/`enif_free` inside
+the NIF and asserting the balance from the test fixtures is the better tool there.
+The NIF is cleaned afterwards, as these flags don't mix with the normal `-O3` build.
 
 All checks run sequentially (`.NOTPARALLEL`). CI runs `make check-fast`, `make test`,
 and `make check-slow` over OTP 24–29 on Linux, plus a Windows job that only builds

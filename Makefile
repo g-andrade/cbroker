@@ -89,6 +89,36 @@ stress:
 	@rebar3 ct --suite=test/cbroker_stress_SUITE
 .PHONY: stress
 
+# Runs the CT suites against an instrumented NIF. The sanitizer runtime has to
+# be preloaded into the emulator, since it must initialize before the library
+# that needs it is dlopen'd. `+Mea min` routes erts_alloc through libc malloc:
+# without it ASan cannot see `enif_alloc`ed memory, so overflowing such a block
+# corrupts an ERTS allocator and surfaces as a bare SEGV somewhere else instead
+# of an attributed report. Leak detection is off: even with `+Mea min` it would
+# mostly report the emulator's own allocations, which can't be told apart from
+# ours by suppression, since both reach malloc through erts_alloc. The NIF is
+# rebuilt (and cleaned afterwards) because these flags are incompatible with the
+# normal -O3 build.
+SANITIZERS ?= address,undefined
+SANITIZER_PRELOAD ?= $(shell $(or $(CC),cc) -print-file-name=libasan.so)
+ASAN_OPTIONS ?= detect_leaks=0
+UBSAN_OPTIONS ?= print_stacktrace=1
+
+test-sanitized:
+	@$(MAKE) -C c_src clean
+	@$(MAKE) -C c_src SANITIZE=$(SANITIZERS)
+	@status=0; \
+	SANITIZE=$(SANITIZERS) \
+	ERL_FLAGS="+Mea min" \
+	LD_PRELOAD=$(SANITIZER_PRELOAD) \
+	ASAN_OPTIONS=$(ASAN_OPTIONS) \
+	UBSAN_OPTIONS=$(UBSAN_OPTIONS) \
+	rebar3 ct || status=$$?; \
+	$(MAKE) -C c_src clean; \
+	exit $$status
+.NOTPARALLEL: test-sanitized
+.PHONY: test-sanitized
+
 ## Checks
 
 check-formatted: check-formatted-erl check-formatted-c
