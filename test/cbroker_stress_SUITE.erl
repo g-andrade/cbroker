@@ -20,8 +20,9 @@
 
 %% Concurrency stress. Unlike the `proper_statem` model, which predicts every
 %% outcome from one process, these cases assert global invariants over many
-%% processes: matches pair up exactly, timeouts never swallow a match, and
-%% requests left behind by dead processes get reclaimed.
+%% processes: matches pair up exactly, timeouts never swallow a match,
+%% requests left behind by dead processes get reclaimed, and batches get
+%% released even by schedulers that only ever ask on one lane.
 %%
 %% Sized by environment variables, so the defaults keep `make test` quick while
 %% `make stress` (or CI) can run the same cases for much longer:
@@ -54,6 +55,7 @@
     every_match_is_paired/1,
     timeouts_never_lose_a_match/1,
     killed_waiters_are_reclaimed/1,
+    one_lane_schedulers_release_batches/1,
     brokers_leave_nothing_allocated/1
 ]).
 
@@ -84,6 +86,7 @@ groups() ->
                 every_match_is_paired,
                 timeouts_never_lose_a_match,
                 killed_waiters_are_reclaimed,
+                one_lane_schedulers_release_batches,
                 brokers_leave_nothing_allocated
             ]
         }
@@ -149,6 +152,53 @@ killed_waiters_are_reclaimed(Config) ->
     % Nothing parked any more, so there is nothing left to match against
     ?assertMatch({drop, match_unavailable, _}, cbroker:nb_ask(Broker, right, late_offer)).
 
+% One scheduler only ever asks on `left`, another only on `right`, so each
+% one's tail for the other lane never moves by itself. The `right` side trails
+% by a batch, so every batch is still unconsumed when the `left` tail leaves
+% it. Consumed batches must be released regardless, or they pile up for as
+% long as the broker runs
+one_lane_schedulers_release_batches(Config) ->
+    case erlang:system_info(schedulers) of
+        1 ->
+            {skip, "needs two schedulers"};
+        %
+        _ ->
+            assert_one_lane_schedulers_release_batches(broker(Config))
+    end.
+
+assert_one_lane_schedulers_release_batches(Broker) ->
+    CellsPerBatch = nr_of_cells_per_batch(Broker),
+    Rounds = 20,
+
+    Left = spawn_pinned(1, fun({enqueue, Amount}) ->
+        lists:foreach(
+            fun(N) -> {await, _} = cbroker:async_ask(Broker, left, {offer, N}) end,
+            seq(Amount)
+        )
+    end),
+    Right = spawn_pinned(2, fun({consume, Amount}) ->
+        lists:foreach(
+            fun(_) -> {match, _, _, _} = cbroker:nb_ask(Broker, right, counter_offer) end,
+            seq(Amount)
+        )
+    end),
+
+    call_pinned(Left, {enqueue, 2 * CellsPerBatch}),
+    BatchCounts = [
+        begin
+            call_pinned(Right, {consume, CellsPerBatch}),
+            call_pinned(Left, {enqueue, CellsPerBatch}),
+            length(batches(Broker))
+        end
+     || _ <- seq(Rounds)
+    ],
+    call_pinned(Right, {consume, 2 * CellsPerBatch}),
+
+    ct:log("Live batches per round: ~p", [BatchCounts]),
+    stop_pinned(Left, (Rounds + 2) * CellsPerBatch),
+    stop_pinned(Right, 0),
+    ?assert(lists:max(BatchCounts) =< 4, BatchCounts).
+
 % Brokers that have been worked hard enough to roll over batches must leave
 % nothing behind once collected. This is what the cell and pool assertions
 % cannot see: memory that is consistent, just unreachable
@@ -184,9 +234,7 @@ assert_nothing_stays_allocated(Baseline) ->
 % that dropping the broker leaves nothing referencing it
 churn_through_batches() ->
     Broker = cbroker:new(),
-    {nr_of_cells_per_batch, CellsPerBatch} = lists:keyfind(
-        nr_of_cells_per_batch, 1, cbroker:debug_info(Broker)
-    ),
+    CellsPerBatch = nr_of_cells_per_batch(Broker),
 
     lists:foreach(
         fun(N) ->
@@ -271,6 +319,42 @@ is_pair([{LaneA, OfferA, CounterOfferA}, {LaneB, OfferB, CounterOfferB}]) ->
 is_pair(_Pairs) ->
     false.
 
+% A process bound to one scheduler, running Fun for each call. Linked, so that
+% its crash fails the case rather than time it out
+spawn_pinned(Scheduler, Fun) ->
+    spawn_opt(fun() -> serve_pinned(Fun) end, [{scheduler, Scheduler}, link]).
+
+% Calls are tagged, as the mailbox also collects `{Ticket, Reply}` messages
+serve_pinned(Fun) ->
+    receive
+        {pinned_call, From, {stop, ExpectedMatches}} ->
+            From ! {pinned_reply, self(), receive_matches(ExpectedMatches)};
+        %
+        {pinned_call, From, Request} ->
+            Fun(Request),
+            From ! {pinned_reply, self(), ok},
+            serve_pinned(Fun)
+    end.
+
+receive_matches(0) ->
+    ok;
+receive_matches(Amount) ->
+    receive
+        {_Ticket, {match, _, _, _}} -> receive_matches(Amount - 1)
+    after ?SETTLE_TIMEOUT_MS -> {missing_matches, Amount}
+    end.
+
+call_pinned(Pid, Request) ->
+    Pid ! {pinned_call, self(), Request},
+    receive
+        {pinned_reply, Pid, Reply} -> Reply
+    after ?ASK_TIMEOUT_MS -> ct:fail({pinned_call_timed_out, Pid, Request})
+    end.
+
+% Stops the process once it has received every match it was owed
+stop_pinned(Pid, ExpectedMatches) ->
+    ?assertEqual(ok, call_pinned(Pid, {stop, ExpectedMatches})).
+
 park_forever(Broker, Lane, Offer) ->
     {await, _} = cbroker:async_ask(Broker, Lane, Offer),
     receive
@@ -324,10 +408,9 @@ broker(Config) ->
 
 % Cells still parking a request; `matched` and `cancelled` are spent sentinels
 pending_cells(Broker) ->
-    {batches, Batches} = lists:keyfind(batches, 1, cbroker:debug_info(Broker)),
     [
         {BatchId, Cell}
-     || Batch <- Batches,
+     || Batch <- batches(Broker),
         {id, BatchId} <- Batch,
         {cells, Cells} <- Batch,
         Cell <- Cells,
@@ -335,6 +418,17 @@ pending_cells(Broker) ->
         Cell =/= matched,
         Cell =/= cancelled
     ].
+
+% Every live batch, as held by the global state
+batches(Broker) ->
+    {batches, Batches} = lists:keyfind(batches, 1, cbroker:debug_info(Broker)),
+    Batches.
+
+nr_of_cells_per_batch(Broker) ->
+    {nr_of_cells_per_batch, CellsPerBatch} = lists:keyfind(
+        nr_of_cells_per_batch, 1, cbroker:debug_info(Broker)
+    ),
+    CellsPerBatch.
 
 flush_mailbox() ->
     receive
