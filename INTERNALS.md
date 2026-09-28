@@ -101,7 +101,7 @@ stateDiagram-v2
 ```
 
 `matched` and `cancelled` point to static sentinel values; only `waiting`
-points to an allocation. Closing the broker reuses `cancelled`.
+points to an allocation.
 
 ## Asking
 
@@ -126,7 +126,7 @@ flowchart TD
 ```
 
 Each cell tried costs one credit, out of 400 per call. When they run out, the
-NIF reschedules itself (`enif_schedule_nif`), carrying its request over in a
+NIF reschedules itself with `enif_schedule_nif`, carrying its request over in a
 retry resource. After 10 retries, the ask gives up with `broker_overloaded`.
 
 A request is allocated lazily, only when an ask tries to enqueue. If it then
@@ -137,24 +137,21 @@ request's env, so the offer isn't copied twice.
 
 The winner of the `matched` CAS owns the request. A synchronous asker gets the
 counter-offer as its return value, and the counterpart gets a message. An
-`async_ask` gets its reply as a message too, tagged with a throwaway reference,
-so a later `cancel/1` on it answers `too_late`.
+`async_ask` gets its reply as a message, too.
 
 If demonitoring the counterpart fails, either it died or a concurrent
-`cancel/1` demonitored first. The match stands either way: the cancel then
-loses the cell CAS and answers `too_late`, and a dead counterpart's message
-goes nowhere.
+`cancel/1` demonitored first. The match proceeds either way: the concurrent
+cancel call then loses the cell CAS and answers `too_late`.
 
 When both sides are replied to by message, the `right` lane is messaged first,
-so the order is predictable. `sbroker` does the same for its bid side.
+so the order is predictable. `sbroker` does the same for its bids.
 
 ## Ownership
 
 Three parties race for a waiting request: the matcher, `cancel/1`, and the
-asker's DOWN callback. Two rules settle it:
+asker's DOWN callback. Two rules apply:
 
-- **Whoever demonitors the ticket first owns the ticket.** A failed demonitor
-  means someone else got there first.
+- **Whoever demonitors the ticket first owns the ticket.**
 - **Whoever moves the cell out of `waiting` owns the request** and counts the
   cell as consumed.
 
@@ -196,18 +193,18 @@ stateDiagram-v2
 - **Advancing.** A lane's tail moves to the next batch in the local state.
   If there is none, the global lock is taken, every unspent batch with a
   higher ID is checked out, and if there are none, a batch from the pool is
-  added as ID + 1. One lock covers many asks.
+  added as ID + 1.
 - **Dropping.** A local state drops a batch once both of its tails are past
   it, or when it consumes the batch's last cell.
-- **Removing.** Whoever brings `ref_count` to 1 takes the lock and rechecks.
-  If the batch had the highest ID, it is reset and reinserted as ID + 1, so
-  the global state is never empty and IDs are never reused. Otherwise it goes
-  back to the pool, or is freed if the pool is full.
+- **Removing.** Whoever brings `ref_count` to 1 takes the lock and checks
+  again. If the batch had the highest ID, it is reset and reinserted as ID + 1,
+  so the global state is never empty and IDs are never reused. Otherwise it
+  goes back to the batch pool (or is freed if the pool is full).
 
 ## Closing
 
-With the `depends_on_creator` option, the broker closes when its creator dies,
-from the monitor callback:
+When using the `depends_on_creator` option, the broker will close when its
+creator dies. The monitor callback will then:
 
 1. Mark the global and local states closed. New asks fail with
    `error(broker_closed)`.

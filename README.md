@@ -4,14 +4,17 @@
 [![](https://github.com/g-andrade/cbroker/actions/workflows/ci.yml/badge.svg)](https://github.com/g-andrade/cbroker/actions/workflows/ci.yml)
 [![Erlang Versions](https://img.shields.io/badge/Supported%20Erlang%2FOTP-24%20to%2029-blue)](https://www.erlang.org)
 
-Brokers for Erlang/OTP: processes on two lanes meet and swap offers, like in
-worker pools and other producer-consumer setups. There is no broker process.
-Matching runs in a NIF, concurrently on every online scheduler.
+`cbroker` provides brokers for Erlang/OTP. Processes enqueue on either of two
+lanes of a broker, meeting and swapping offers. This is useful for worker pools
+and other producer-consumer setups.
+
+There is no broker process: matching is done concurrently through a NIF, making
+use of every online ERTS scheduler.
 
 ## What it strives for
 
 - **No bottleneck process**: `cbroker` contends only on a few atomic counters
-  and the rare global lock;
+  and an infrequent global lock;
 - **Offers are copied concurrently**, by the processes that match them.
 - **Familiar model.** Offers (asks and bids), matches and drops follow
   [`sbroker`](https://hex.pm/packages/sbroker), which inspired it.
@@ -30,8 +33,8 @@ Building needs a C compiler: `cc`/`gcc` on Unix, and MSVC on Windows.
 
 ## Quick start
 
-A worker pool. Clients offer jobs on the `left`; workers offer themselves on
-the `right`.
+We have a worker pool. Clients offer jobs on the `left`; workers offer
+themselves on the `right`.
 
 ```erlang
 worker(Pool) ->
@@ -40,10 +43,10 @@ worker(Pool) ->
     worker(Pool).
 
 submit(Pool, Job) ->
-    case cbroker:ask(Pool, left, {self(), Job}, 1_000) of
+    case cbroker:ask(Pool, left, {self(), Job}) of
         {match, _, Worker, _} ->
             Mon = monitor(process, Worker),
-            receive 
+            receive
                 {Worker, Result} -> {ok, Result} ;
                 {'DOWN', Mon, _, _, _} -> {error, worker_stopped}
             end;
@@ -67,9 +70,9 @@ sequenceDiagram
 
 ## Asking
 
-Every ask goes on a lane (`left` or `right`) and matches the roughly-oldest[*]
-offer on the other lane. The variants differ in what happens when there is none
-yet.
+Every offer goes on a lane (`left` or `right`) and matches the
+roughly-oldest[*] offer on the other lane. The variants differ in what happens
+when there is none yet.
 
 | Function        | If no match yet                                         |
 |-----------------|---------------------------------------------------------|
@@ -101,8 +104,8 @@ deterministic.
 ## Named brokers
 
 `cbroker:new/0,1` returns a reference; the broker lives as long as it is
-referenced. With the option `depends_on_creator`, the broker closes when its
-creator dies.
+referenced. If you use the option `depends_on_creator`, the broker closes when
+its creator dies.
 
 To give it a name and a place in your supervision tree:
 
@@ -112,16 +115,16 @@ Children = [cbroker:child_spec({local, my_pool})],
 cbroker:ask(my_pool, left, Job).
 ```
 
-Names take the same forms as OTP process names: 
-* `{local, atom()}`, 
-* `{global, term()}`, 
+Names take the same forms as OTP process names:
+* `{local, atom()}`,
+* `{global, term()}`,
 * or `{via, module(), term()}`.
 
 ## How it works
 
 Each ask claims a cell in a shared array by atomically incrementing its lane's
 tail, then comparing-and-swapping its offer in, or taking the offer already
-there. 
+there.
 
 Arrays are handed out in order from a mutex-guarded pool, and each scheduler
 caches the ones it is using, so the lock is taken once per array rather than
