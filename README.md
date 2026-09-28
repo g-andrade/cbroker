@@ -4,369 +4,133 @@
 [![](https://github.com/g-andrade/cbroker/actions/workflows/ci.yml/badge.svg)](https://github.com/g-andrade/cbroker/actions/workflows/ci.yml)
 [![Erlang Versions](https://img.shields.io/badge/Supported%20Erlang%2FOTP-24%20to%2029-blue)](https://www.erlang.org)
 
-cbroker provides **brokers** for Erlang/OTP: shared execution paths through
-which processes can message each other. Brokers are useful for
-producer-consumer problems like worker pools.
+Brokers for Erlang/OTP: processes on two lanes meet and swap offers, like in
+worker pools and other producer-consumer setups. There is no broker process.
+Matching runs in a NIF, concurrently on every online scheduler.
 
-Rather than provide a single process as the broker (commonly a `gen_server`),
-`cbroker` **runs concurrently** through NIF code that uses [C
-atomics](https://en.cppreference.com/c/header/stdatomic).
+## What it strives for
 
-It reduces contention to a few atomic counters and critical sections spaced in
-time, allowing for the copying of messages between processes to happen
-concurrently.
+- **No bottleneck process**: `cbroker` contends only on a few atomic counters
+  and the rare global lock;
+- **Offers are copied concurrently**, by the processes that match them.
+- **Familiar model.** Offers (asks and bids), matches and drops follow
+  [`sbroker`](https://hex.pm/packages/sbroker), which inspired it.
 
-`cbroker` took inspiration from [`sbroker`](https://hex.pm/packages/sbroker).
+TODO: one benchmark figure against `cbroker_simple`.
 
-## Usage
+## Installation
 
 ```erlang
-% 1> Broker = cbroker:new().
-#Ref<0.1273379340.4036100100.216922>
-
-% 2> {await, Tag} = cbroker:async_ask(Broker, left, {self(), consumer}).
-{await,#Ref<0.1273379340.4036100100.216931>}
-
-% 3> cbroker:ask(Broker, right, {self(), producer}).
-{match,#Ref<0.1273379340.4035969028.217112>,
-       {<0.345.0>,consumer},
-       11734}
-
-% 4> flush().
-% Shell got {#Ref<0.1273379340.4036100100.216931>,
-%            {match,#Ref<0.1273379340.4035969028.217112>,
-%                   {<0.345.0>,producer},
-%                   10459904224}}
+{deps, [
+    {cbroker, "~> 0.1"}
+]}.
 ```
 
-## Architecture
+Building needs a C compiler: `cc`/`gcc` on Unix, and MSVC on Windows.
 
-### Overview (top-to-bottom)
+## Quick start
 
-#### Asks
+A worker pool. Clients offer jobs on the `left`; workers offer themselves on
+the `right`.
 
-This represents a process that wishes to either enqueue its offer on one lane
-of the **broker**, or instead get a counter-offer from the opposite lane (a
-match).
+```erlang
+worker(Pool) ->
+    {match, _, {Client, Job}, _} = cbroker:ask(Pool, right, self(), infinity),
+    Client ! {self(), run(Job)},
+    worker(Pool).
 
-#### Broker
+submit(Pool, Job) ->
+    case cbroker:ask(Pool, left, {self(), Job}, 1_000) of
+        {match, _, Worker, _} ->
+            Mon = monitor(process, Worker),
+            receive 
+                {Worker, Result} -> {ok, Result} ;
+                {'DOWN', Mon, _, _, _} -> {error, worker_stopped}
+            end;
 
-A broker is a ref-counted NIF resource used by asks.
-
-It consists of:
-* a **global state**;
-* one or more **local states**.
-
-It will also optionally monitor the process that created it, and close the
-broker if that process dies; this will close the broker to new asks,
-and cancel all enqueued requests one at a time.
-
-#### Global state
-
-The global state contains:
-* a mutex
-* a sorted collection of all checked-out **batches**
-* a pool of free batches
-
-The mutex guards all accesses to the global state.
-
-The collection of batches keeps at least one entry at all times.
-
-#### Local states
-
-The local state is picked based on the running thread.
-
-It's lock-free, and there is one per regular VM scheduler.
-
-A local state contains:
-* a sorted collection of **batches** currently **checked-out** of the global state;
-* the batch ID of the left tail;
-* the batch ID of the right tail;
-* pools of free **requests** and **tags**.
-
-Like in global state, the collection of batches keeps at least one entry at all
-times.
-
-#### Batches and cells
-
-A batch consists of:
-* a `ref_count` to track **check-outs**;
-* a few other atomic counters;
-* an array of cells.
-
-Each cell is an atomically compare-exchanged (CAS) pointer to a **request**.
-
-#### Requests and tags
-
-A request can be a sentinel value that signals a consumed cell.
-
-Otherwise, it must be either nothing (empty), or an enqueued request.
-
-An enqueued request also points to a tag, and the tag monitors the calling process.
-
-### Details (bottom-to-top)
-
-#### Tags
-
-These are ref-counted ([resource
-objects](https://www.erlang.org/doc/apps/erts/erl_nif.html#functionality) used
-to monitor the calling process. They also provide a reference to cancel an
-enqueued request.
-
-A tag consists of:
-* a monitor ([`ErlNifMonitor`](https://www.erlang.org/doc/apps/erts/erl_nif.html#data-types);
-* a pointer to a **request**.
-
-#### Requests
-
-These are C structs used to exchange offers from the `left` lane with offers
-from the `right` lane.
-
-A request consists of:
-* the calling pid;
-* a copy of its `offer`;
-* a reference to the broker;
-* the location of the cell;
-* a pointer to **tag**.
-
-#### Cells
-
-A cell is an [atomically
-compare-and-swapped](https://en.cppreference.com/c/atomic/atomic_compare_exchange)
-pointer to a request.
-
-It's through this single point that a request can either enqueue, or instead
-take ownership of a request from the opposite lane.
-
-At any given time, a cell is in one of five states:
-1) empty;
-2) enqueued request;
-3) matched;
-4) cancelled;
-5) closed.
-
-The 'empty' state is `NULL`.
-
-The 'matched', 'cancelled', and 'closed' states are pointers to static sentinel
-values.
-
-Only the enqueued request is dynamically allocated.
-
-##### Swap algorithm
-
-In pseudo-Python, with `load` and `compare_and_swap` being atomic operations:
-
-```Python
-## Are we the first to change the cell?
-
-counter_request = cell.load()
-
-if counter_request is None:
-    if request is None:
-        tag = new Tag(self)
-        request = new Request(self, tag, offer) # will copy our offer
-        tag.request = request
-    else:
-        request.location = cell_location
-
-    counter_request = cell.compare_and_swap(counter_request, request):
-
-    if counter_request is None:
-        # Enqueued
-        return Await(tag)
-
-## We're definitely second.
-
-if counter_request in [SENTINEL_CANCELLED, SENTINELL_CLOSED]:
-    return Skip(request, tag)
-
-cell_request = cell.compare_and_swap(counter_request, SENTINEL_MATCHED)
-
-if cell_request is counter_request:
-    # Matched
-    counter_tag = counter_request.tag
-
-    if counter_tag.demonitor():
-        tag.demonitor()
-
-        if request is None:
-            send(counter_request.pid, offer)
-        else:
-            # Re-use copy of our offer that we ended up not placing in cell
-            send_using_request_env(counter_request.pid, request)
-
-        release(tag)
-        release(request)
-
-        counter_offer = copy(counter_request.offer)
-        release(counter_tag)
-        release(counter_request)
-
-        return Matched(counter_offer)
-
-    else:
-        # Too late, the other process died
-        release(counter_tag)
-        return Skip(request, tag)
+        {drop, Reason, _} ->
+            {error, Reason}
+    end.
 ```
 
-### Batches
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant B as Broker
+    participant W as Worker
+    C->>B: ask(left, {self(), Job})
+    Note over B: no match yet: enqueued
+    W->>B: ask(right, self())
+    B-->>C: {match, _, Worker, _}
+    B-->>W: {match, _, {Client, Job}, _}
+```
 
-A batch contains an array of cells. In addition to the `ref_count`, it also contains:
-* `left_count`
-* `right_count`
-* `consumed_count`
+## Asking
 
-#### Tracking batch tails
+Every ask goes on a lane (`left` or `right`) and matches the roughly-oldest[*]
+offer on the other lane. The variants differ in what happens when there is none
+yet.
 
-`left_count` and `right_count` are cell position counters. Each points to the
-tail of its respective lane.
+| Function        | If no match yet                                         |
+|-----------------|---------------------------------------------------------|
+| `ask`           | waits up to a timeout, then `{drop, timeout, _}`        |
+| `nb_ask`        | returns `{drop, match_unavailable, _}` at once          |
+| `dynamic_ask`   | returns `{await, Ticket}`; the reply arrives as a message |
+| `async_ask`     | always returns `{await, Ticket}`, even if a match is available |
+| `resumable_ask` | waits up to a timeout, then `{timeout, ReplyRef, Ticket}` and stays enqueued |
 
-A position counter is atomically incremented for every ask. If its value is
-`>=` that of the amount of cells in the batch, this signals that the batch is
-full on that lane.
+Asynchronous replies arrive as `{Tag, Reply}`, where `Tag` is either the
+`Ticket` or a `ReplyRef` you pass in. `cancel(Ticket)` withdraws an enqueued
+offer.
 
-#### Consuming a batch
+[*]: As requests are matched concurrently, the exact order is not
+deterministic.
 
-`consumed_count` indicates how many cells were used in that batch. It's
-atomically incremented when either of 2 things happen:
-1. a successful match;
-2. a successful cancellation.
+### Replies
 
-It's also atomically set to its maximum when the broker closes.
+- `{match, MatchRef, CounterOffer, SojournTime}`
+- `{drop, Reason, SojournTime}`, with `Reason` one of:
+  - `timeout`: `ask` gave up
+  - `match_unavailable`: `nb_ask` found no match
+  - `broker_overloaded`: skipped too many cancelled offers
+  - `broker_closed`: the broker closed while you waited
+  - `cancelled`: a concurrent process cancelled the request
 
-If its value is `>=` that of the amount of cells in the batch, this signals
-that the batch was consumed and is to be discarded.
+`SojournTime` is the time spent enqueued, in nanoseconds.
 
-#### Skipping cells
+## Named brokers
 
-Whenever an ask encounters a cancelled cell, it will re-increment the
-respective counter and try again.
+`cbroker:new/0,1` returns a reference; the broker lives as long as it is
+referenced. With the option `depends_on_creator`, the broker closes when its
+creator dies.
 
-It will do this up to a number of times before giving the NIF an opportunity to
-reschedule.
+To give it a name and a place in your supervision tree:
 
-If it sees a full batch, the ask will advance to the **next batch in the
-sequence**.
+```erlang
+Children = [cbroker:child_spec({local, my_pool})],
+%% ...
+cbroker:ask(my_pool, left, Job).
+```
 
-If it sees a consumed batch, it will advance as well as **discard the batch**
-from the local sequence.
+Names take the same forms as OTP process names: 
+* `{local, atom()}`, 
+* `{global, term()}`, 
+* or `{via, module(), term()}`.
 
-### Batch sequences
+## How it works
 
-#### Local state
+Each ask claims a cell in a shared array by atomically incrementing its lane's
+tail, then comparing-and-swapping its offer in, or taking the offer already
+there. 
 
-Each local state contains:
-* a sorted collection of batches
-* `left_id`
-* `right_id`
+Arrays are handed out in order from a mutex-guarded pool, and each scheduler
+caches the ones it is using, so the lock is taken once per array rather than
+once per ask.
 
-An ask starts with a batch in its local state, using either `left_id` or `right_id`.
+TODO: structure diagram (broker → schedulers → batches → cells).
 
-Both point to the batch containing the tail of its respective lane.
-
-When the ask encounters a full or consumed batch, it will look for the next
-batch in the sorted collection.
-
-If it finds one, it will update the respective ID; if not, it will **checkout
-the next batch** from global state.
-
-Any remaining batches with ID lower than `min(left_id, right_id)` can be
-**discarded** from the local state.
-
-
-#### Global state
-
-The global state contains:
-* a mutex
-* a sorted collection of _all_ batches with `ref_count` >= 2.
-* a pool of free batches
-
-All accesses to it are guarded by the mutex.
-
-##### Checking-out of the next batch
-
-Using the previous batch ID from the local state, we look up for a batch
-with a larger ID.
-
-If we find one, we'll increment its `ref_count` and place a copy in the local state.
-
-If we don't find one, we'll assign (previous ID + 1) to a free batch, set its
-`ref_count` to 2, and place in both global and local states.
-
-To avoid allocating a batch in the critical section, the free batch will
-usually come from the pool.
-
-##### Discarding a batch
-
-When a batch is discarded from a local state, its `ref_count` is lowered.
-
-When `ref_count` reaches 1, we lock into the global state and re-check.
-
-If the batch is already gone, that the batch ID was already removed everywhere.
-
-If the ID is present and the `ref_count` is still 1, we remove it from the collection.
-
-If, after removal, there's no larger ID left in the collection, we reset the
-discarded batch, assign it (ID + 1), and place it batck in the collection. This
-both prevents batch IDs from being reused, as well as an additional allocation.
-
-Otherwise, we return the discarded batch to the pool, which free the batch if
-full, or retain it.
-
-### On cancellations
-
-Cancelling an enqueued request is done through a `tag`.
-
-We start by demonitoring: if this fails, it's too late.
-
-Otherwise, we now have implicit ownership of the tag. Now we try to CAS the
-original `cell` with the sentinel request signalling cancellation.
-
-If this succeeds, now we have ownership of the `request` and can return it to
-the pool, as well as release our own tag.
-
-If it fails, it is also too late: another thread tried taking ownership of the
-`match`, failed to demonitor, and therefore released the tag.
-
-### On triggered monitors
-
-It's similar to cancelling, with the caveat that the triggering of the monitor
-now gives the callback implicit ownership of the `tag`.
-
-Therefore, one of two things must now happen:
-
-#### A) we successfully CAS the original cell
-
-Therefore also taking ownership of the `match`, allowing us to release our own
-tag, and return the match to the pool.
-
-#### B) we're too late
-
-Whoever tried to take ownership of the `match` failed to then demonitor, and
-therefore released us (or is about to).
+Details: [INTERNALS.md](INTERNALS.md).
 
 ## License
 
-MIT License
-
-Copyright (c) 2026 Guilherme Andrade
-
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+[MIT](LICENSE)

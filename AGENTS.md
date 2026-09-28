@@ -23,6 +23,7 @@ make check-fast      # format check (erlfmt) + xref + dead-code (hank) + lint (e
 make check-slow      # dialyzer
 make format          # auto-format sources with erlfmt
 make doc             # build docs with ex_doc (downloads the ex_doc escript to tmp/)
+make doc-watch       # rebuild docs on every save (needs inotifywait; Linux only)
 make shell           # interactive REPL with the app started
 make bench-shell     # same, plus the benchmarks in bench/
 ```
@@ -144,3 +145,14 @@ gated plugin set changes, bump the `_build` cache prefix in `.github/workflows/c
 
 `make publish` runs `rebar3 hex publish --doc-dir=doc`. Versioning is SemVer;
 history is in `CHANGELOG.md` (Keep a Changelog format).
+
+## Open questions
+
+- **Batches pinned by a one-lane scheduler (suspected, unverified).** A local
+  state drops a batch only once both of its tails are past it
+  (`ask_loop_tail_skip`), or when it consumes the batch's last cell. A scheduler
+  that keeps asking on one lane but never on the other would then keep every
+  batch its moving tail passes, locally and globally, without bound, until it
+  asks on the other lane again. To confirm, add a stress case that pins one
+  lane's asks to one scheduler and watches `debug_info/1` grow. A possible fix
+  is to drop consumed batches when advancing.

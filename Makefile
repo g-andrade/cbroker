@@ -196,6 +196,18 @@ doc:
 		--source-ref "${SOURCE_REF}";
 .PHONY: doc
 
+# Rebuilds the docs whenever a source of them is saved; reload the browser to see it.
+# Watches directories, not files: editors that save by renaming over the file would
+# otherwise remove the watch. Runs one monitor (-m) rather than one inotifywait per
+# save, so that events arriving while it would be restarting aren't lost.
+doc-watch: doc
+	@inotifywait -mqe close_write,moved_to --format %w%f . src | while read -r f; do \
+		case "$$f" in \
+		./*.md|./ex_doc.config|src/*.erl) $(MAKE) --no-print-directory doc;; \
+		esac; \
+	done
+.PHONY: doc-watch
+
 tmp/ex_doc: EX_DOC_VER=0.40.2
 tmp/ex_doc: OTP_VER := $(shell erl -noshell -eval 'io:fwrite("~s", [erlang:system_info(otp_release)]), init:stop().')
 tmp/ex_doc: | tmp
