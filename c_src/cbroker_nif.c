@@ -1384,6 +1384,43 @@ static ask_result_t ask_loop_tail_offset_ask(ask_ctx_t* ctx, lease_t* lease, con
     return ASK_RESULT_NONE;
 }
 
+static void ask_loop_tail_skip_consumed_opposite(ask_ctx_t* ctx, batch_id_t next_id)
+{
+    broker_t* broker = ctx->broker;
+    local_state_t* local_state = ctx->local_state;
+    batch_id_t opposite_tail_id = 0;
+    batch_t* batch = NULL;
+    lease_t lease;
+
+    while ((opposite_tail_id = *(ctx->opposite_tail_id_ptr)) < next_id) {
+        if (cbroker_omap_lookup(local_state->batches, opposite_tail_id, (void**)&batch)) {
+            assert(batch != NULL);
+
+            if (batch_is_consumed(batch)) {
+                lease_init(&lease, batch, true, broker, local_state);
+                bool res =
+                    cbroker_omap_next(local_state->batches, opposite_tail_id, NULL, (void**)&batch);
+                assert(res);
+                assert(batch != NULL);
+                lease_ref_count_dec(&lease);
+                *(ctx->opposite_tail_id_ptr) = batch->id;
+            }
+            else {
+                break;
+            }
+        }
+        else {
+            bool res =
+                cbroker_omap_next(local_state->batches, opposite_tail_id, NULL, (void**)&batch);
+            assert(res);
+            assert(batch != NULL);
+            *(ctx->opposite_tail_id_ptr) = batch->id;
+        }
+    }
+
+    assert(*(ctx->opposite_tail_id_ptr) <= next_id);
+}
+
 static void ask_loop_tail_skip(ask_ctx_t* ctx, const batch_id_t batch_id)
 {
     cbroker_omap_result_t map_res = CBROKER_OMAP_NOMEM;
@@ -1453,10 +1490,15 @@ static void ask_loop_tail_skip(ask_ctx_t* ctx, const batch_id_t batch_id)
         assert(next_batch->id > batch_id);
     }
 
+    //
+
     *(ctx->tail_id_ptr) = next_batch->id;
 
     if (*(ctx->opposite_tail_id_ptr) > batch_id && lease->batch != NULL) {
         lease_ref_count_dec(lease);
+    }
+    else {
+        ask_loop_tail_skip_consumed_opposite(ctx, next_batch->id);
     }
 
     lease->batch = next_batch;
