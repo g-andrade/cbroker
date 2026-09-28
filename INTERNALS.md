@@ -75,8 +75,13 @@ For example (L and R mark each scheduler's tails):
 | Scheduler 1 |   | L | R |    |
 | Scheduler 2 | R | ● | ● | L  |
 
-Batch 7's `ref_count` is 2 (global and scheduler 2). Once scheduler 2's right
-tail moves past it, it drops to 1 and the batch is recycled.
+Tails drift apart when one lane has more asks than the other, or when a
+scheduler hasn't asked on a lane for a while.
+
+In the example above, batch 7's `ref_count` is 2 (global and scheduler 2).
+It drops to 1, and the batch is recycled, once scheduler 2's right tail moves
+past it, or once batch 7 is spent and scheduler 2's left tail advances again
+(see [Dropping](#lifecycle)).
 
 A request holds a copy of the broker term, so a broker with waiting asks
 stays alive even if nobody else references it.
@@ -190,12 +195,17 @@ stateDiagram-v2
     recycled --> [*]: pool full, freed
 ```
 
-- **Advancing.** A lane's tail moves to the next batch in the local state.
-  If there is none, the global lock is taken, every unspent batch with a
-  higher ID is checked out, and if there are none, a batch from the pool is
-  added as ID + 1.
-- **Dropping.** A local state drops a batch once both of its tails are past
-  it, or when it consumes the batch's last cell.
+- **Advancing.** A lane's tail moves to the next batch in the local state. If
+  there is none, the global lock is taken and every unspent batch with a higher
+  ID is checked out, with the tail moving to the oldest of them. The newer ones
+  stay in the local state, to be reached without the lock. If there are none, a
+  batch from the pool is added as ID + 1.
+- **Dropping.** A local state drops a batch once both of its tails are past it,
+  or when it consumes the batch's last cell. Also, whenever a tail advances
+  without the other tail being ahead of it, the other tail is walked forward
+  past every spent batch, dropping each, until it reaches one that isn't spent.
+  Without this, a scheduler that only asks on one lane would never move its
+  other tail.
 - **Removing.** Whoever brings `ref_count` to 1 takes the lock and checks
   again. If the batch had the highest ID, it is reset and reinserted as ID + 1,
   so the global state is never empty and IDs are never reused. Otherwise it
