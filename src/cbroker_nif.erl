@@ -8,7 +8,7 @@
 %% ------------------------------------------------------------------
 
 -export([
-    alloc_counters/0,
+    alloc_perfcounters/0,
     ask/5,
     cancel/1,
     debug_info/1,
@@ -16,7 +16,7 @@
 ]).
 
 -ignore_xref([
-    alloc_counters/0
+    alloc_perfcounters/0
 ]).
 
 %% ------------------------------------------------------------------
@@ -70,7 +70,7 @@ ask(_BrokerRef, _Lane, _Offer, _OfferSizeArg, _ReplyRef, _AskType) ->
     not_loaded(?LINE).
 
 % Live allocations across every broker, for the tests to assert nothing leaked
-alloc_counters() ->
+alloc_perfcounters() ->
     not_loaded(?LINE).
 
 -if(?OTP_RELEASE < 29).

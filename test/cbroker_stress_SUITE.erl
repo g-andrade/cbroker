@@ -153,7 +153,7 @@ killed_waiters_are_reclaimed(Config) ->
 % nothing behind once collected. This is what the cell and pool assertions
 % cannot see: memory that is consistent, just unreachable
 brokers_leave_nothing_allocated(_Config) ->
-    case alloc_counters() of
+    case alloc_perfcounters() of
         unavailable ->
             {skip, "built without allocation counters; see `make test-sanitized`"};
         %
@@ -174,7 +174,7 @@ assert_nothing_stays_allocated(Baseline) ->
     ),
 
     ok = wait_until(fun() -> settled(collect_garbage(), Baseline) end),
-    ?assertEqual(Baseline, alloc_counters()).
+    ?assertEqual(Baseline, alloc_perfcounters()).
 
 %% ------------------------------------------------------------------
 %% Internal Function Definitions
@@ -200,12 +200,12 @@ churn_through_batches() ->
         seq(2 * CellsPerBatch)
     ).
 
-alloc_counters() ->
-    cbroker_nif:alloc_counters().
+alloc_perfcounters() ->
+    cbroker_nif:alloc_perfcounters().
 
 collect_garbage() ->
     lists:foreach(fun erlang:garbage_collect/1, processes()),
-    alloc_counters().
+    alloc_perfcounters().
 
 % Resource destructors run on collection, so the counters only settle once every
 % reference is gone; anything below the baseline is another case's broker going

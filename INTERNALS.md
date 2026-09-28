@@ -219,5 +219,5 @@ closes when that server stops.
 ## Memory
 
 Requests and tickets come from per-scheduler pools, and batches from the global
-pool. With `COUNT_ALLOCS=1`, `cbroker_nif:alloc_counters/0` reports what is
+pool. With `COUNT_ALLOCS=1`, `cbroker_nif:alloc_perfcounters/0` reports what is
 live; see `AGENTS.md`.
