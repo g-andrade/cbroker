@@ -70,7 +70,7 @@
     X(_global_state,          "global_state") \
     X(_id,                    "id") \
     X(_left,                  "left")  \
-    X(_left_count,            "left_count")  \
+    X(_left_tail,             "left_tail")  \
     X(_local_states,          "local_states")  \
     X(_match,                 "match") \
     X(_match_unavailable,     "match_unavailable") \
@@ -84,7 +84,7 @@
     X(_retries,               "retries") \
     X(_retry,                 "retry") \
     X(_right,                 "right") \
-    X(_right_count,           "right_count") \
+    X(_right_tail,            "right_tail") \
     X(_stats,                 "stats") \
     X(_stopped,               "stopped") \
     X(_sum,                   "sum") \
@@ -166,8 +166,8 @@ typedef _Atomic(request_t*) cell_t;
 typedef struct {
     batch_id_t id;
     _Atomic(ref_count_t) ref_count;
-    _Atomic(offset_t) left_count;
-    _Atomic(offset_t) right_count;
+    _Atomic(offset_t) left_tail;
+    _Atomic(offset_t) right_tail;
     atomic_size_t consumed_count;
     size_t nr_of_cells;
     cell_t cells[];
@@ -1302,7 +1302,7 @@ static ask_result_t ask_loop_tail_ask(ask_ctx_t* ctx)
     batch_t* batch = lease->batch;
     assert(batch != NULL);
 
-    _Atomic(offset_t)* offset_counter = (ctx->is_left ? &batch->left_count : &batch->right_count);
+    _Atomic(offset_t)* offset_counter = (ctx->is_left ? &batch->left_tail : &batch->right_tail);
 
     while (ctx->credits-- > 0) {
         const offset_t offset = atomic_fetch_add_explicit(offset_counter, 1, memory_order_relaxed);
@@ -1975,8 +1975,8 @@ static void broker_cancel_all_batch_cells(ErlNifEnv* env, broker_t* broker,
     }
 
     atomic_store(&batch->consumed_count, batch->nr_of_cells);
-    offset_t left_offset = atomic_exchange(&batch->left_count, batch->nr_of_cells);
-    offset_t right_offset = atomic_exchange(&batch->right_count, batch->nr_of_cells);
+    offset_t left_offset = atomic_exchange(&batch->left_tail, batch->nr_of_cells);
+    offset_t right_offset = atomic_exchange(&batch->right_tail, batch->nr_of_cells);
     offset_t starting_offset = MIN(left_offset, right_offset);
 
     for (offset_t offset = starting_offset; offset < batch->nr_of_cells; offset++) {
@@ -2330,8 +2330,8 @@ static void batch_init(batch_t* batch, const batch_id_t id)
     memset(batch, 0, batch_size(nr_of_cells));
     batch->id = id;
     atomic_store(&batch->ref_count, 1);
-    atomic_store(&batch->left_count, 0);
-    atomic_store(&batch->right_count, 0);
+    atomic_store(&batch->left_tail, 0);
+    atomic_store(&batch->right_tail, 0);
     atomic_store(&batch->consumed_count, 0);
     batch->nr_of_cells = nr_of_cells;
 }
@@ -2373,8 +2373,8 @@ static ERL_NIF_TERM batch_to_term(ErlNifEnv* env, const batch_t* batch)
     }
 
     const ref_count_t ref_count = atomic_load(&batch->ref_count);
-    const offset_t left_count = atomic_load(&batch->left_count);
-    const offset_t right_count = atomic_load(&batch->right_count);
+    const offset_t left_tail = atomic_load(&batch->left_tail);
+    const offset_t right_tail = atomic_load(&batch->right_tail);
     const size_t consumed_count = atomic_load(&batch->consumed_count);
 
     ERL_NIF_TERM cell_terms_list =
@@ -2388,9 +2388,9 @@ static ERL_NIF_TERM batch_to_term(ErlNifEnv* env, const batch_t* batch)
         //
         enif_make_tuple2(env, Atoms._ref_count, enif_make_int64(env, ref_count)),
         //
-        enif_make_tuple2(env, Atoms._left_count, enif_make_uint64(env, left_count)),
+        enif_make_tuple2(env, Atoms._left_tail, enif_make_uint64(env, left_tail)),
         //
-        enif_make_tuple2(env, Atoms._right_count, enif_make_uint64(env, right_count)),
+        enif_make_tuple2(env, Atoms._right_tail, enif_make_uint64(env, right_tail)),
         //
         enif_make_tuple2(env, Atoms._consumed_count, enif_make_uint64(env, consumed_count)),
         //

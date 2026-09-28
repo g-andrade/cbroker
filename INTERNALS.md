@@ -44,8 +44,8 @@ classDiagram
     class Batch {
         ID
         ref_count
-        left_count
-        right_count
+        left_tail
+        right_tail
         consumed_count
         cells
     }
@@ -169,7 +169,7 @@ If `cancel/1` is called by a process other than the asker, the asker also gets
 
 ### Counters
 
-- `left_count` / `right_count`: next offset per lane. Once at or past the end,
+- `left_tail` / `right_tail`: next offset per lane. Once at or past the end,
   the batch is full on that lane.
 - `consumed_count`: cells that reached `matched` or `cancelled`. Once it reaches
   the end, the batch is spent.
