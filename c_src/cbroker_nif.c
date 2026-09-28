@@ -1481,7 +1481,7 @@ static void ask_loop_tail_skip(ask_ctx_t* ctx, const batch_id_t batch_id)
                 assert(map_res == CBROKER_OMAP_OK);
             }
 
-            next_batch = batches_to_checkout[checkout_amount - 1];
+            next_batch = batches_to_checkout[0];
         }
 
         cbroker_free(batches_to_checkout);
