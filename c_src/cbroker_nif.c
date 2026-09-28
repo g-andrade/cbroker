@@ -1148,8 +1148,8 @@ static void local_states_init(local_state_t local_states[], const size_t nr_of_s
         batch_ref_count_inc(first_batch);
 
         LOG("[local_states_init] First batch is %llu", first_batch->id);
-        local_states->left_tail_id = first_batch->id;
-        local_states->right_tail_id = first_batch->id;
+        local_state->left_tail_id = first_batch->id;
+        local_state->right_tail_id = first_batch->id;
 
         request_pool_init(&local_state->request_pool);
         ticket_pool_init(&local_state->ticket_pool);
