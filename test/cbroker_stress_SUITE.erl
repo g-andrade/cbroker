@@ -56,6 +56,7 @@
     timeouts_never_lose_a_match/1,
     killed_waiters_are_reclaimed/1,
     one_lane_schedulers_release_batches/1,
+    lagging_lane_skips_batch_it_dropped/1,
     brokers_leave_nothing_allocated/1
 ]).
 
@@ -87,6 +88,7 @@ groups() ->
                 timeouts_never_lose_a_match,
                 killed_waiters_are_reclaimed,
                 one_lane_schedulers_release_batches,
+                lagging_lane_skips_batch_it_dropped,
                 brokers_leave_nothing_allocated
             ]
         }
@@ -198,6 +200,32 @@ assert_one_lane_schedulers_release_batches(Broker) ->
     stop_pinned(Left, (Rounds + 2) * CellsPerBatch),
     stop_pinned(Right, 0),
     ?assert(lists:max(BatchCounts) =< 4, BatchCounts).
+
+% One scheduler parks `right` asks three batches' worth, then matches them from
+% `left`. Consuming the last cell of the `left` tail's batch drops that batch
+% from the local state while the tail still points at it, so the next `left` ask
+% skips a batch it no longer holds, with the `right` tail already past the one
+% that follows. That used to trip an assertion and abort the emulator
+lagging_lane_skips_batch_it_dropped(Config) ->
+    Broker = broker(Config),
+    Parked = 3 * nr_of_cells_per_batch(Broker),
+
+    Asker = spawn_pinned(1, fun
+        ({park, Amount}) ->
+            lists:foreach(
+                fun(N) -> {await, _} = cbroker:async_ask(Broker, right, {offer, N}) end,
+                seq(Amount)
+            );
+        ({consume, Amount}) ->
+            lists:foreach(
+                fun(_) -> {match, _, _, _} = cbroker:nb_ask(Broker, left, counter_offer) end,
+                seq(Amount)
+            )
+    end),
+
+    call_pinned(Asker, {park, Parked}),
+    call_pinned(Asker, {consume, Parked}),
+    stop_pinned(Asker, Parked).
 
 % Brokers that have been worked hard enough to roll over batches must leave
 % nothing behind once collected. This is what the cell and pool assertions

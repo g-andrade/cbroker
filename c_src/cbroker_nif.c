@@ -1458,8 +1458,10 @@ static void ask_loop_tail_skip(ask_ctx_t* ctx, const batch_id_t batch_id)
 
     *(ctx->tail_id_ptr) = next_batch->id;
 
-    if (*(ctx->opposite_tail_id_ptr) > batch_id && lease->batch != NULL) {
-        lease_ref_count_dec(lease);
+    if (*(ctx->opposite_tail_id_ptr) > batch_id) {
+        if (lease->batch != NULL) {
+            lease_ref_count_dec(lease);
+        }
     }
     else {
         ask_loop_tail_skip_consumed_opposite(ctx, next_batch->id);
