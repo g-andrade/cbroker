@@ -143,6 +143,7 @@
     (cancelled
     | match_unavailable
     | broker_overloaded
+    | broker_full
     | broker_closed).
 -export_type([known_drop_reason/0]).
 
