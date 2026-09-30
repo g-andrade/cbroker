@@ -57,6 +57,7 @@
     killed_waiters_are_reclaimed/1,
     one_lane_schedulers_release_batches/1,
     lagging_lane_skips_batch_it_dropped/1,
+    queue_limit_keeps_its_accounting/1,
     brokers_leave_nothing_allocated/1
 ]).
 
@@ -89,6 +90,7 @@ groups() ->
                 killed_waiters_are_reclaimed,
                 one_lane_schedulers_release_batches,
                 lagging_lane_skips_batch_it_dropped,
+                queue_limit_keeps_its_accounting,
                 brokers_leave_nothing_allocated
             ]
         }
@@ -100,6 +102,7 @@ init_per_testcase(_TestCase, Config) ->
 end_per_testcase(_TestCase, Config) ->
     Broker = broker(Config),
     ?assertEqual([], pending_cells(Broker)),
+    ?assertEqual(0, queue_balance(Broker)),
     ?assertEqual([], flush_mailbox()),
     Config.
 
@@ -226,6 +229,33 @@ lagging_lane_skips_batch_it_dropped(Config) ->
     call_pinned(Asker, {park, Parked}),
     call_pinned(Asker, {consume, Parked}),
     stop_pinned(Asker, Parked).
+
+% Asks on both lanes race a tight queue limit and their own tiny timeouts. Each
+% one either matches, is refused for the lane being full, or times out; matches
+% still pair up, and once everyone is done no weight is left in the balance
+queue_limit_keeps_its_accounting(_Config) ->
+    Broker = cbroker:new([{max_queue_len, 2}]),
+
+    Samples = run_workers(Broker, fun(Lane, Offer) ->
+        cbroker:ask(Broker, Lane, Offer, rand:uniform(4) - 1)
+    end),
+
+    UnexpectedReplies = [
+        Sample
+     || {_, _, Reply} = Sample <- Samples,
+        not is_match(Reply),
+        Reply =/= drop_of_reason(Reply, timeout),
+        Reply =/= drop_of_reason(Reply, broker_full)
+    ],
+    ct:log("Refused for being full: ~b of ~b", [
+        length([R || {_, _, R} <- Samples, R =:= drop_of_reason(R, broker_full)]),
+        length(Samples)
+    ]),
+
+    ?assertEqual([], UnexpectedReplies),
+    assert_matches_are_paired([Sample || {_, _, Reply} = Sample <- Samples, is_match(Reply)]),
+    ?assertEqual([], pending_cells(Broker)),
+    ?assertEqual(0, queue_balance(Broker)).
 
 % Brokers that have been worked hard enough to roll over batches must leave
 % nothing behind once collected. This is what the cell and pool assertions
@@ -446,6 +476,12 @@ pending_cells(Broker) ->
         Cell =/= matched,
         Cell =/= cancelled
     ].
+
+% Parked `right` asks minus parked `left` ones, plus any asks in flight
+queue_balance(Broker) ->
+    {stats, Stats} = lists:keyfind(stats, 1, cbroker:debug_info(Broker)),
+    {queue_balance, Balance} = lists:keyfind(queue_balance, 1, Stats),
+    Balance.
 
 % Every live batch, as held by the global state
 batches(Broker) ->

@@ -17,6 +17,11 @@
 
 /*********************************************************************/
 
+#define ASK_DEFAULT_CREDITS 400
+#define ASK_DEFAULT_MAX_TRIES 10
+
+//
+
 #define BATCH_POOL_SIZE 4
 #define BATCH_POOL_INITIAL_COUNT 1
 
@@ -25,11 +30,6 @@
 
 #define TICKET_POOL_DEFAULT_SIZE 8
 #define TICKET_POOL_DEFAULT_INITIAL_COUNT 0
-
-//
-
-#define ASK_DEFAULT_CREDITS 400
-#define ASK_DEFAULT_MAX_TRIES 10
 
 //
 
@@ -51,6 +51,7 @@
     X(_batches,               "batches") \
     X(_blocks,                "blocks") \
     X(_broker_closed,         "broker_closed") \
+    X(_broker_full,           "broker_full") \
     X(_broker_overloaded,     "broker_overloaded") \
     X(_brokers,               "brokers") \
     X(_cancelled,             "cancelled") \
@@ -77,10 +78,14 @@
     X(_match,                 "match") \
     X(_match_unavailable,     "match_unavailable") \
     X(_matched,               "matched") \
+    X(_max_queue_len,         "max_queue_len") \
+    X(_max_right_balance,     "max_right_balance") \
+    X(_min_left_balance,      "min_left_balance") \
     X(_non_blocking,          "non_blocking") \
     X(_none,                  "none") \
     X(_ok,                    "ok") \
     X(_opts,                  "opts") \
+    X(_queue_balance,         "queue_balance") \
     X(_ref_count,             "ref_count") \
     X(_request_pool,          "request_pool") \
     X(_retries,               "retries") \
@@ -98,6 +103,7 @@
     X(_too_late,              "too_late") \
     X(_true,                  "true") \
     X(_unavailable,           "unavailable") \
+    X(_unlimited,             "unlimited") \
     X(_waiting,               "waiting") \
     X(_zzzzzz,                "zzzzzzz")
 /* clang-format on */
@@ -139,6 +145,15 @@ typedef ptrdiff_t ref_count_t;
 
 //
 
+typedef ptrdiff_t queue_balance_t;
+// #define QUEUE_BALANCE_MIN PTRDIFF_MIN
+#define QUEUE_BALANCE_MAX PTRDIFF_MAX
+
+#define QUEUE_BALANCE_UNLIMITED_LEFT +1
+#define QUEUE_BALANCE_UNLIMITED_RIGHT -1
+
+//
+
 typedef struct {
     ErlNifEnv* env;
     //
@@ -146,6 +161,7 @@ typedef struct {
     ErlNifPid pid;
     ERL_NIF_TERM offer;
     size_t offer_size;
+    queue_balance_t weight;
     ERL_NIF_TERM reply_ref;
     //
     ERL_NIF_TERM broker_term;
@@ -227,6 +243,8 @@ typedef struct {
 typedef struct {
     bool depends_on_creator;
     size_t cells_per_batch;
+    queue_balance_t min_left_balance;  // negative, or +1 to signal unlimited
+    queue_balance_t max_right_balance; // positive, or -1 to signal unlimited
     int ask_credits;
     size_t ask_max_tries;
     pool_opts_t batch_pool;
@@ -245,6 +263,7 @@ typedef struct {
 } rolling_avg_t;
 
 typedef struct {
+    _Atomic(queue_balance_t) queue_balance;
     rolling_avg_t credits_left;
 } stats_t;
 
@@ -283,6 +302,7 @@ typedef enum {
     DROP_REASON_CANCELLED,
     DROP_REASON_NON_BLOCKING,
     DROP_REASON_TOO_MANY_RETRIES,
+    DROP_REASON_FULL,
     DROP_REASON_CLOSED
 } drop_reason_t;
 
@@ -303,6 +323,7 @@ typedef enum {
     ASK_RESULT_AWAIT,
     ASK_RESULT_MATCHED,
     ASK_RESULT_NO_MATCH_AVAILABLE,
+    ASK_RESULT_FULL,
     ASK_RESULT_CLOSED,
     ASK_RESULT_OUT_OF_CREDITS
 } ask_result_t;
@@ -321,6 +342,7 @@ typedef struct {
     ERL_NIF_TERM offer;
     ptrdiff_t offer_size; // negative when it hasn't been computed yet
     ERL_NIF_TERM reply_ref;
+    queue_balance_t request_weight;
     retry_t* retry;
     //
     broker_t* broker;
@@ -344,7 +366,7 @@ typedef struct {
     request_t* counter_request;
     bool consume_slot;
     bool demonitoring_failed;
-    ERL_NIF_TERM term_res;
+    ERL_NIF_TERM nif_res;
 } ask_ctx_t;
 
 //
@@ -424,7 +446,7 @@ static void ask_reply_closed(ask_ctx_t* ctx);
 static bool ask_retry_can(ask_ctx_t* ctx);
 static void ask_retry(ask_ctx_t* ctx, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM ask_retry_schedule(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
-static void ask_retry_clear(ask_ctx_t* ctx, const bool expect_no_request);
+static void ask_retry_clear(ask_ctx_t* ctx);
 static void ask_drop(ask_ctx_t* ctx, drop_reason_t reason);
 
 //
@@ -518,6 +540,9 @@ static ERL_NIF_TERM mempool_to_term(ErlNifEnv* env, mempool_t* pool);
 
 //
 
+static queue_balance_t stats_queue_balance_add(stats_t* stats, queue_balance_t weight);
+static void stats_queue_balance_sub(stats_t* stats, queue_balance_t weight);
+
 static void stats_push_after_ask(stats_t* stats, int credits_left);
 static ERL_NIF_TERM stats_to_term(ErlNifEnv* env, stats_t* stats);
 static void rolling_avg_push(rolling_avg_t* rolling_avg, int64_t sample);
@@ -540,6 +565,7 @@ static int get_pool_opts(ErlNifEnv* env, ERL_NIF_TERM term, pool_opts_t* out_opt
 
 static int get_retry(ErlNifEnv* env, ERL_NIF_TERM term, retry_t** out_retry);
 
+static int get_ptrdiff_t(ErlNifEnv* env, ERL_NIF_TERM term, ptrdiff_t* out);
 static int get_size_t(ErlNifEnv* env, ERL_NIF_TERM term, size_t* out);
 
 static int get_ticket(ErlNifEnv* env, ERL_NIF_TERM term, ticket_t** out_ticket);
@@ -747,6 +773,8 @@ static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     memset(&opts, 0, sizeof(broker_opts_t));
 
     opts.cells_per_batch = 32 * schedulers;
+    opts.min_left_balance = QUEUE_BALANCE_UNLIMITED_LEFT;
+    opts.max_right_balance = QUEUE_BALANCE_UNLIMITED_RIGHT;
     opts.ask_credits = ASK_DEFAULT_CREDITS;
     opts.ask_max_tries = ASK_DEFAULT_MAX_TRIES;
 
@@ -827,8 +855,12 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     if (lane == Atoms._left) {
         ctx.is_left = true;
+        ctx.request_weight = -1;
     }
-    else if (lane != Atoms._right) {
+    else if (lane == Atoms._right) {
+        ctx.request_weight = +1;
+    }
+    else {
         return make_badarg(env, lane);
     }
 
@@ -884,7 +916,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     }
 
     ctx.credits = ctx.broker->opts.ask_credits;
-    ctx.term_res = Atoms._none;
+    ctx.nif_res = Atoms._none;
 
     ask_result_t ask_res = ask_loop(&ctx);
     stats_push_after_ask(&ctx.broker->stats, ctx.credits);
@@ -913,13 +945,21 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             ask_retry(&ctx, argc, argv);
         }
         else {
-            ask_retry_clear(&ctx, false);
+            ask_retry_clear(&ctx);
             ask_drop(&ctx, DROP_REASON_TOO_MANY_RETRIES);
         }
     }
     else {
-        ask_retry_clear(&ctx, true);
+        ask_retry_clear(&ctx);
+
+        if (ask_res == ASK_RESULT_FULL) {
+            const drop_reason_t drop_reason =
+                (ctx.is_non_blocking ? DROP_REASON_NON_BLOCKING : DROP_REASON_FULL);
+            ask_drop(&ctx, drop_reason);
+        }
     }
+
+    //
 
     if (ctx.request != NULL) {
         bool demonitor_res =
@@ -931,8 +971,8 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     consume_timeslice(env, ctx.copied_bytes);
 
-    assert(ctx.term_res != Atoms._none);
-    return ctx.term_res;
+    assert(ctx.nif_res != Atoms._none);
+    return ctx.nif_res;
 }
 
 //
@@ -995,6 +1035,7 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
 
         if (atomic_compare_exchange_strong(cell, &cell_request, &sentinel_request_cancelled)) {
             LOG("[cancel] Consuming lease slot");
+            stats_queue_balance_sub(&broker->stats, request->weight);
             lease_consume_slot(&lease);
             was_cell_swapped = true;
         }
@@ -1251,6 +1292,21 @@ static ask_result_t ask_loop(ask_ctx_t* ctx)
     broker_t* broker = ctx->broker;
     local_state_t* local_state = ctx->local_state;
     ask_result_t ask_res = 0;
+    request_t* counter_request = NULL;
+
+    //
+
+    const broker_opts_t* broker_opts = &broker->opts;
+    stats_t* stats = &ctx->broker->stats;
+    queue_balance_t queue_balance = stats_queue_balance_add(stats, ctx->request_weight);
+
+    if ((broker_opts->min_left_balance <= 0 && queue_balance < broker_opts->min_left_balance) ||
+        (broker_opts->max_right_balance >= 0 && queue_balance > broker_opts->max_right_balance)) {
+        stats_queue_balance_sub(stats, ctx->request_weight);
+        return ASK_RESULT_FULL;
+    }
+
+    //
 
     lease_t* lease = &ctx->lease;
     lease_init(lease, NULL, false, broker, local_state);
@@ -1274,23 +1330,30 @@ static ask_result_t ask_loop(ask_ctx_t* ctx)
             break;
         //
         case ASK_RESULT_MATCHED:
+            counter_request = ctx->counter_request;
+            assert(counter_request != NULL);
+            stats_queue_balance_sub(stats, ctx->request_weight + counter_request->weight);
             ask_reply_match(ctx);
             break;
         //
         case ASK_RESULT_NO_MATCH_AVAILABLE:
+            stats_queue_balance_sub(stats, ctx->request_weight);
             ask_reply_nomatch(ctx);
             break;
         //
         case ASK_RESULT_CLOSED:
+            stats_queue_balance_sub(stats, ctx->request_weight);
             ask_reply_closed(ctx);
             break;
         //
         default:
+            stats_queue_balance_sub(stats, ctx->request_weight);
             break;
         }
         return ask_res;
     }
 
+    stats_queue_balance_sub(stats, ctx->request_weight);
     return ASK_RESULT_OUT_OF_CREDITS;
 }
 
@@ -1607,6 +1670,10 @@ static void ask_loop_request_new(ask_ctx_t* ctx)
 
     //
 
+    request->weight = ctx->request_weight;
+
+    //
+
     ticket_t* ticket = mempool_get(&local_state->ticket_pool, NULL);
 
     bool mon_res = enif_monitor_process(ctx->env, ticket, &ctx->self, &ticket->mon);
@@ -1631,7 +1698,7 @@ static void ask_reply_await(ask_ctx_t* ctx)
     assert(ctx->counter_request == NULL);
     assert(!ctx->consume_slot);
 
-    ctx->term_res = make_await(ctx->env, ctx->ticket_term);
+    ctx->nif_res = make_await(ctx->env, ctx->ticket_term);
 }
 
 static void ask_reply_match(ask_ctx_t* ctx)
@@ -1647,12 +1714,12 @@ static void ask_reply_match(ask_ctx_t* ctx)
     ERL_NIF_TERM match_ref = enif_make_ref(ctx->env);
 
     if (we_go_first) {
-        ctx->term_res = ask_reply_match_self(ctx, match_ref);
+        ctx->nif_res = ask_reply_match_self(ctx, match_ref);
         ask_reply_match_notify_other(ctx, match_ref);
     }
     else {
         ask_reply_match_notify_other(ctx, match_ref);
-        ctx->term_res = ask_reply_match_self(ctx, match_ref);
+        ctx->nif_res = ask_reply_match_self(ctx, match_ref);
     }
 }
 
@@ -1692,26 +1759,26 @@ static ERL_NIF_TERM ask_reply_match_self(ask_ctx_t* ctx, ERL_NIF_TERM match_ref)
         // We reuse the counter request's env, which already contains their offer
         ErlNifEnv* msg_env = counter_request->env;
         ERL_NIF_TERM msg;
-        ERL_NIF_TERM faux_tag;
+        ERL_NIF_TERM faux_ticket;
         ERL_NIF_TERM msg_ref = enif_make_copy(msg_env, match_ref);
         ERL_NIF_TERM msg_tag;
 
         if (ctx->reply_ref == Atoms._ticket) {
             ERL_NIF_TERM faux_ticket_term = enif_make_ref(ctx->env);
             msg_tag = enif_make_copy(msg_env, faux_ticket_term);
-            faux_tag = faux_ticket_term;
+            faux_ticket = faux_ticket_term;
         }
         else {
-            // No need to allocate another ref, reuse custom reply
+            // Reuse custom reply
             msg_tag = enif_make_copy(msg_env, ctx->reply_ref);
-            faux_tag = ctx->reply_ref;
+            faux_ticket = ctx->reply_ref;
         }
 
         ERL_NIF_TERM msg_match = make_match(msg_env, msg_ref, counter_request->offer, sojourn_time);
         msg = make_reply(msg_env, msg_tag, msg_match);
         either_notify_or_assert_not_alive(ctx->env, &ctx->self, msg_env, msg);
 
-        return make_await(ctx->env, faux_tag);
+        return make_await(ctx->env, faux_ticket);
     }
     else {
         ERL_NIF_TERM counter_offer;
@@ -1736,12 +1803,12 @@ static void ask_reply_nomatch(ask_ctx_t* ctx)
     assert(ctx->counter_request == NULL);
 
     int64_t sojourn_time = monotonic_ts() - ctx->enqueue_ts;
-    ctx->term_res = make_drop(ctx->env, DROP_REASON_NON_BLOCKING, sojourn_time);
+    ctx->nif_res = make_drop(ctx->env, DROP_REASON_NON_BLOCKING, sojourn_time);
 }
 
 static void ask_reply_closed(ask_ctx_t* ctx)
 {
-    ctx->term_res = make_error(ctx->env, Atoms._broker_closed);
+    ctx->nif_res = make_error(ctx->env, Atoms._broker_closed);
 }
 
 //
@@ -1783,7 +1850,7 @@ static void ask_retry(ask_ctx_t* ctx, int argc, const ERL_NIF_TERM argv[])
             assert(ticket_term == Atoms._none);
         }
 
-        ctx->term_res = ask_retry_schedule(ctx->env, argc, argv);
+        ctx->nif_res = ask_retry_schedule(ctx->env, argc, argv);
     }
     else {
         assert(enif_is_atom(ctx->env, argv[retry_idx]));
@@ -1805,7 +1872,7 @@ static void ask_retry(ask_ctx_t* ctx, int argc, const ERL_NIF_TERM argv[])
 
         ERL_NIF_TERM res = ask_retry_schedule(ctx->env, argc, retry_argv);
         cbroker_free(retry_argv);
-        ctx->term_res = res;
+        ctx->nif_res = res;
     }
 }
 
@@ -1814,7 +1881,7 @@ static ERL_NIF_TERM ask_retry_schedule(ErlNifEnv* env, int argc, const ERL_NIF_T
     return enif_schedule_nif(env, "nif_ask", 0, nif_ask, argc, argv);
 }
 
-static void ask_retry_clear(ask_ctx_t* ctx, const bool expect_no_request)
+static void ask_retry_clear(ask_ctx_t* ctx)
 {
     retry_t* retry = ctx->retry;
     if (retry == NULL) {
@@ -1822,10 +1889,6 @@ static void ask_retry_clear(ask_ctx_t* ctx, const bool expect_no_request)
     }
 
     request_t* request = retry->request;
-
-    if (expect_no_request) {
-        assert(request == NULL);
-    }
 
     if (request != NULL) {
         assert(retry->ticket_term != Atoms._none);
@@ -1844,7 +1907,20 @@ static void ask_retry_clear(ask_ctx_t* ctx, const bool expect_no_request)
 static void ask_drop(ask_ctx_t* ctx, drop_reason_t reason)
 {
     int64_t sojourn_time = monotonic_ts() - ctx->enqueue_ts;
-    ctx->term_res = make_drop(ctx->env, reason, sojourn_time);
+    ERL_NIF_TERM drop = ctx->nif_res = make_drop(ctx->env, reason, sojourn_time);
+
+    if (ctx->is_async) {
+        ERL_NIF_TERM faux_ticket =
+            (ctx->reply_ref == Atoms._ticket ? enif_make_ref(ctx->env) : ctx->reply_ref);
+
+        ERL_NIF_TERM msg = make_reply(ctx->env, faux_ticket, drop);
+        either_notify_or_assert_not_alive(ctx->env, &ctx->self, NULL, msg);
+
+        ctx->nif_res = make_await(ctx->env, faux_ticket);
+    }
+    else {
+        ctx->nif_res = drop;
+    }
 }
 
 /*********************************************************************/
@@ -1953,8 +2029,9 @@ static void ticket_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNif
 
         if (atomic_compare_exchange_strong(cell, &request, &sentinel_request_cancelled)) {
             LOG("[request DOWN %T] request cancelled", pid_term, request->batch_id);
-            request_reclaim(request, true, opt_local_state);
+            stats_queue_balance_sub(&broker->stats, request->weight);
             lease_consume_slot(&lease);
+            request_reclaim(request, true, opt_local_state);
         }
         else {
             LOG("[request DOWN %T] Too late to cancel request", pid_term);
@@ -2049,6 +2126,8 @@ static void broker_cancel_all_batch_cells(ErlNifEnv* env, broker_t* broker,
 
         if (atomic_compare_exchange_strong(cell, &request, &sentinel_request_cancelled)) {
             if (request != NULL) {
+                stats_queue_balance_sub(&broker->stats, request->weight);
+
                 ticket_t* ticket = (ticket_t*)request->ticket;
                 assert(ticket != NULL);
 
@@ -2639,6 +2718,19 @@ static ERL_NIF_TERM mempool_to_term(ErlNifEnv* env, mempool_t* pool)
 
 /*********************************************************************/
 
+static queue_balance_t stats_queue_balance_add(stats_t* stats, queue_balance_t weight)
+{
+    queue_balance_t balance =
+        weight + atomic_fetch_add_explicit(&stats->queue_balance, weight, memory_order_relaxed);
+
+    return balance;
+}
+
+static void stats_queue_balance_sub(stats_t* stats, queue_balance_t weight)
+{
+    atomic_fetch_sub_explicit(&stats->queue_balance, weight, memory_order_relaxed);
+}
+
 static void stats_push_after_ask(stats_t* stats, int credits_left)
 {
     rolling_avg_push(&stats->credits_left, credits_left);
@@ -2646,8 +2738,13 @@ static void stats_push_after_ask(stats_t* stats, int credits_left)
 
 static ERL_NIF_TERM stats_to_term(ErlNifEnv* env, stats_t* stats)
 {
-    return enif_make_list1(
+    queue_balance_t queue_balance =
+        atomic_load_explicit(&stats->queue_balance, memory_order_relaxed);
+
+    return enif_make_list2(
         env,
+        //
+        enif_make_tuple2(env, Atoms._queue_balance, enif_make_int64(env, queue_balance)),
         //
         enif_make_tuple2(env, Atoms._credits_left, rolling_avg_to_term(env, &stats->credits_left)));
 }
@@ -2706,6 +2803,45 @@ static int get_broker_opt(ErlNifEnv* env, ERL_NIF_TERM key, ERL_NIF_TERM value,
     else if (key == Atoms._cells_per_batch) {
         return (get_size_t(env, value, &out_opts->cells_per_batch) &&
                 out_opts->cells_per_batch > 0);
+    }
+    else if (key == Atoms._max_queue_len) {
+        // shorthand for setting both min and max balance at the same time
+        size_t max_queue_len = 0;
+
+        if (value == Atoms._unlimited) {
+            out_opts->min_left_balance = QUEUE_BALANCE_UNLIMITED_LEFT;
+            out_opts->max_right_balance = QUEUE_BALANCE_UNLIMITED_RIGHT;
+            return 1;
+        }
+        else if (get_size_t(env, value, &max_queue_len) && max_queue_len > 0 &&
+                 max_queue_len <= (size_t)QUEUE_BALANCE_MAX) {
+            out_opts->min_left_balance = -(queue_balance_t)max_queue_len;
+            out_opts->max_right_balance = (queue_balance_t)max_queue_len;
+            return 1;
+        }
+        else {
+            return 0;
+        }
+    }
+    else if (key == Atoms._min_left_balance) {
+        if (value == Atoms._unlimited) {
+            out_opts->min_left_balance = QUEUE_BALANCE_UNLIMITED_LEFT;
+            return 1;
+        }
+        else {
+            return (get_ptrdiff_t(env, value, &out_opts->min_left_balance) &&
+                    out_opts->min_left_balance < 0);
+        }
+    }
+    else if (key == Atoms._max_right_balance) {
+        if (value == Atoms._unlimited) {
+            out_opts->max_right_balance = QUEUE_BALANCE_UNLIMITED_RIGHT;
+            return 1;
+        }
+        else {
+            return (get_ptrdiff_t(env, value, &out_opts->max_right_balance) &&
+                    out_opts->max_right_balance > 0);
+        }
     }
     else if (key == Atoms._ask_credits) {
         return (enif_get_int(env, value, &out_opts->ask_credits) && out_opts->ask_credits > 0);
@@ -2864,9 +3000,27 @@ static int get_retry(ErlNifEnv* env, ERL_NIF_TERM term, retry_t** out_retry)
 
 //
 
+static int get_ptrdiff_t(ErlNifEnv* env, ERL_NIF_TERM term, ptrdiff_t* out)
+{
+    int64_t value;
+
+    if (!enif_get_int64(env, term, &value)) {
+        return 0;
+    }
+#if PTRDIFF_MAX < INT64_MAX
+    if (value < PTRDIFF_MIN || value > PTRDIFF_MAX) {
+        return 0;
+    }
+#endif
+    *out = (ptrdiff_t)value;
+    return 1;
+}
+
+//
+
 static int get_size_t(ErlNifEnv* env, ERL_NIF_TERM term, size_t* out)
 {
-    ErlNifUInt64 value;
+    uint64_t value;
 
     if (!enif_get_uint64(env, term, &value)) {
         return 0;
@@ -2913,12 +3067,24 @@ static ERL_NIF_TERM make_boolean(int value) { return (value ? Atoms._true : Atom
 
 static ERL_NIF_TERM make_broker_opts(ErlNifEnv* env, const broker_opts_t* opts)
 {
-    return enif_make_list7(
+    ERL_NIF_TERM term_min_left_balance =
+        (opts->min_left_balance > 0 ? Atoms._unlimited
+                                    : enif_make_int64(env, opts->min_left_balance));
+
+    ERL_NIF_TERM term_max_right_balance =
+        (opts->max_right_balance < 0 ? Atoms._unlimited
+                                     : enif_make_int64(env, opts->max_right_balance));
+
+    return enif_make_list9(
         env,
         //
         enif_make_tuple2(env, Atoms._depends_on_creator, make_boolean(opts->depends_on_creator)),
         //
         enif_make_tuple2(env, Atoms._cells_per_batch, enif_make_uint64(env, opts->cells_per_batch)),
+        //
+        enif_make_tuple2(env, Atoms._min_left_balance, term_min_left_balance),
+        //
+        enif_make_tuple2(env, Atoms._max_right_balance, term_max_right_balance),
         //
         enif_make_tuple2(env, Atoms._ask_credits, enif_make_int(env, opts->ask_credits)),
         //
@@ -2953,6 +3119,9 @@ static ERL_NIF_TERM make_drop_reason(ErlNifEnv* env, const drop_reason_t reason)
 
     case DROP_REASON_TOO_MANY_RETRIES:
         return Atoms._broker_overloaded;
+
+    case DROP_REASON_FULL:
+        return Atoms._broker_full;
 
     default:
         assert(reason == DROP_REASON_CLOSED);

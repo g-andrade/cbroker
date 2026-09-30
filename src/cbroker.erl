@@ -95,6 +95,9 @@
     | {cells_per_batch, pos_integer()}
     | {ask_credits, pos_integer()}
     | {ask_max_tries, pos_integer()}
+    | {max_queue_len, pos_integer() | unlimited}
+    | {min_left_balance, neg_integer() | unlimited}
+    | {max_right_balance, pos_integer() | unlimited}
     | {batch_pool, [broker_pool_opt()]}
     | {request_pool, [broker_pool_opt()]}
     | {ticket_pool, [broker_pool_opt()]}).

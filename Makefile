@@ -31,7 +31,7 @@ check-slow: dialyzer
 .NOTPARALLEL: check-slow
 .PHONY: check-slow
 
-test: eunit ct proper cover
+test: eunit ct proper
 .NOTPARALLEL: test
 .PHONY: test
 

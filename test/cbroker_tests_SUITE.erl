@@ -60,7 +60,15 @@
     pools_start_with_their_initial_count/1,
     pool_opts_can_be_given_alone/1,
     request_pool_size_caps_what_it_keeps/1,
-    invalid_opts_are_rejected/1
+    invalid_opts_are_rejected/1,
+    %
+    queue_limit_opts_are_reported/1,
+    queue_balance_follows_waiters/1,
+    queue_balance_settles_after_every_outcome/1,
+    full_lane_refuses_every_flavour/1,
+    full_lane_still_matches_the_other/1,
+    room_comes_back_once_a_waiter_leaves/1,
+    one_sided_limits_leave_the_other_lane_alone/1
 ]).
 
 %% ------------------------------------------------------------------
@@ -122,6 +130,19 @@ groups() ->
                 request_pool_size_caps_what_it_keeps,
                 invalid_opts_are_rejected
             ]
+        },
+        {
+            queue_limits,
+            [parallel],
+            [
+                queue_limit_opts_are_reported,
+                queue_balance_follows_waiters,
+                queue_balance_settles_after_every_outcome,
+                full_lane_refuses_every_flavour,
+                full_lane_still_matches_the_other,
+                room_comes_back_once_a_waiter_leaves,
+                one_sided_limits_leave_the_other_lane_alone
+            ]
         }
     ].
 
@@ -132,6 +153,7 @@ init_per_testcase(_TestCase, Config) ->
 end_per_testcase(_TestCase, Config) ->
     Broker = broker(Config),
     ?assertEqual([], pending_cells(Broker)),
+    ?assertEqual(0, queue_balance(Broker)),
     ?assertEqual([], flush_mailbox()),
     Config.
 
@@ -259,6 +281,8 @@ defaults_are_reported(_Config) ->
         [
             {depends_on_creator, false},
             {cells_per_batch, 32 * Schedulers},
+            {min_left_balance, unlimited},
+            {max_right_balance, unlimited},
             {ask_credits, 400},
             {ask_max_tries, 10},
             {batch_pool, [{size, 4}, {initial_count, 1}]},
@@ -390,7 +414,15 @@ invalid_opts_are_rejected(_Config) ->
     NonAtomKey = [{"depends_on_creator", true}, {1, true}],
     UnknownKey = [unknown_opt, {unknown_opt, true}],
     % A bare atom stands for `{Atom, true}`, which only a boolean opt accepts
-    BareNonBoolean = [cells_per_batch, ask_credits, ask_max_tries, batch_pool],
+    BareNonBoolean = [
+        cells_per_batch,
+        max_queue_len,
+        min_left_balance,
+        max_right_balance,
+        ask_credits,
+        ask_max_tries,
+        batch_pool
+    ],
     BadValue = [
         {depends_on_creator, sometimes},
         {depends_on_creator, 1},
@@ -398,6 +430,23 @@ invalid_opts_are_rejected(_Config) ->
         {cells_per_batch, -1},
         {cells_per_batch, 4.0},
         {cells_per_batch, 1 bsl 64},
+        % A limit of 0 would let nothing wait, and so nothing match
+        {max_queue_len, 0},
+        {max_queue_len, -1},
+        {max_queue_len, 1 bsl 63},
+        {max_queue_len, 1 bsl 64},
+        {max_queue_len, 1.0},
+        {max_queue_len, infinity},
+        {min_left_balance, 0},
+        {min_left_balance, 1},
+        {min_left_balance, -(1 bsl 63) - 1},
+        {min_left_balance, -1.0},
+        {min_left_balance, infinity},
+        {max_right_balance, 0},
+        {max_right_balance, -1},
+        {max_right_balance, 1 bsl 63},
+        {max_right_balance, 1.0},
+        {max_right_balance, infinity},
         {ask_credits, 0},
         {ask_credits, -1},
         {ask_credits, many},
@@ -437,6 +486,173 @@ invalid_opts_are_rejected(_Config) ->
 
     ?assertError({badopts, not_a_list}, cbroker:new(not_a_list)),
     ?assertError({badopts, improper}, cbroker:new([depends_on_creator | improper])).
+
+%%
+
+% `max_queue_len` sets both bounds at once; whichever opt comes last wins
+queue_limit_opts_are_reported(_Config) ->
+    PtrdiffMax = (1 bsl 63) - 1,
+
+    lists:foreach(
+        fun({Opts, Expected}) ->
+            Broker = cbroker:new(Opts),
+            Reported = {opt(min_left_balance, Broker), opt(max_right_balance, Broker)},
+            ?assertEqual({Opts, Expected}, {Opts, Reported})
+        end,
+        [
+            {[{max_queue_len, 1}], {-1, 1}},
+            {[{max_queue_len, 3}], {-3, 3}},
+            {[{max_queue_len, PtrdiffMax}], {-PtrdiffMax, PtrdiffMax}},
+            {[{max_queue_len, unlimited}], {unlimited, unlimited}},
+            {[{min_left_balance, -2}], {-2, unlimited}},
+            {[{max_right_balance, 5}], {unlimited, 5}},
+            {[{min_left_balance, -(1 bsl 63)}], {-(1 bsl 63), unlimited}},
+            {[{max_right_balance, PtrdiffMax}], {unlimited, PtrdiffMax}},
+            {[{max_queue_len, 3}, {min_left_balance, -1}], {-1, 3}},
+            {[{min_left_balance, -1}, {max_queue_len, 3}], {-3, 3}},
+            {[{max_queue_len, 3}, {max_right_balance, unlimited}], {-3, unlimited}},
+            {[{max_queue_len, 3}, {max_queue_len, unlimited}], {unlimited, unlimited}},
+            {[{min_left_balance, -2}, {min_left_balance, unlimited}], {unlimited, unlimited}}
+        ]
+    ).
+
+% Parked `left` asks count -1 each, parked `right` ones +1, and whatever takes
+% a waiter out of its cell takes its weight back
+queue_balance_follows_waiters(_Config) ->
+    Broker = cbroker:new(),
+    ?assertEqual(0, queue_balance(Broker)),
+
+    [T1, T2, T3] = park(Broker, left, 3),
+    ?assertEqual(-3, queue_balance(Broker)),
+
+    {match, _, _, _} = cbroker:nb_ask(Broker, right, offer_r),
+    ?assertMatch({match, _, _, _}, await(T1)),
+    ?assertEqual(-2, queue_balance(Broker)),
+
+    {cancelled, _} = cbroker:cancel(T2),
+    ?assertEqual(-1, queue_balance(Broker)),
+
+    {match, _, _, _} = cbroker:ask(Broker, right, offer_r),
+    ?assertMatch({match, _, _, _}, await(T3)),
+    ?assertEqual(0, queue_balance(Broker)),
+
+    Parker = park_in_process(Broker, right),
+    ?assertEqual(1, queue_balance(Broker)),
+    exit(Parker, kill),
+    wait_until(fun() -> queue_balance(Broker) =:= 0 end).
+
+% Asks that end without parking leave nothing behind
+queue_balance_settles_after_every_outcome(_Config) ->
+    NoMatch = cbroker:new(),
+    ?assertMatch({drop, match_unavailable, _}, cbroker:nb_ask(NoMatch, left, offer_l)),
+    ?assertEqual(0, queue_balance(NoMatch)),
+
+    % Out of tries on the cancelled cell ahead. Being async, it's told by message
+    Overloaded = cbroker:new([{ask_credits, 1}, {ask_max_tries, 1}]),
+    [Cancelled] = park(Overloaded, left, 1),
+    {cancelled, _} = cbroker:cancel(Cancelled),
+    {await, Ticket} = cbroker:async_ask(Overloaded, right, offer_r),
+    ?assertMatch({drop, broker_overloaded, _}, await(Ticket)),
+    ?assertEqual(0, queue_balance(Overloaded)),
+
+    {Closed, Creator} = broker_with_creator([depends_on_creator]),
+    [Parked] = park(Closed, right, 1),
+    stop_creator(Creator),
+    ?assertMatch({drop, broker_closed, _}, await(Parked)),
+    ?assertEqual(0, queue_balance(Closed)).
+
+% Once a lane has as many waiters as allowed, one more is refused however it
+% asks, and nothing about the waiters changes. `nb_ask` wouldn't wait anyway
+full_lane_refuses_every_flavour(_Config) ->
+    lists:foreach(
+        fun(Lane) ->
+            Broker = cbroker:new([{max_queue_len, 2}]),
+            Parked = park(Broker, Lane, 2),
+            Balance = queue_balance(Broker),
+
+            ?assertMatch(
+                {drop, broker_full, SojournTime} when SojournTime >= 0,
+                cbroker:ask(Broker, Lane, offer, 5_000)
+            ),
+            ?assertMatch({drop, broker_full, _}, cbroker:dynamic_ask(Broker, Lane, offer)),
+
+            {await, Ticket} = cbroker:async_ask(Broker, Lane, offer),
+            ?assertMatch({drop, broker_full, _}, await(Ticket)),
+
+            ReplyRef = make_ref(),
+            ?assertEqual({await, ReplyRef}, cbroker:async_ask(Broker, Lane, offer, ReplyRef)),
+            ?assertMatch({drop, broker_full, _}, await(ReplyRef)),
+
+            ?assertMatch({drop, match_unavailable, _}, cbroker:nb_ask(Broker, Lane, offer)),
+
+            ?assertEqual(Balance, queue_balance(Broker)),
+            drain(Broker, other_lane(Lane), Parked)
+        end,
+        [left, right]
+    ).
+
+% An ask that takes a waiter only brings the balance closer to zero, so a full
+% lane never stops the other one from matching
+full_lane_still_matches_the_other(_Config) ->
+    lists:foreach(
+        fun(Lane) ->
+            Other = other_lane(Lane),
+            Broker = cbroker:new([{max_queue_len, 4}]),
+            Parked = park(Broker, Lane, 4),
+
+            ?assertMatch({match, _, _, _}, cbroker:ask(Broker, Other, offer, 5_000)),
+            ?assertMatch({match, _, _, _}, cbroker:dynamic_ask(Broker, Other, offer)),
+            {await, Ticket} = cbroker:async_ask(Broker, Other, offer),
+            ?assertMatch({match, _, _, _}, await(Ticket)),
+            ?assertMatch({match, _, _, _}, cbroker:nb_ask(Broker, Other, offer)),
+
+            lists:foreach(fun(T) -> ?assertMatch({match, _, offer, _}, await(T)) end, Parked),
+            ?assertEqual(0, queue_balance(Broker))
+        end,
+        [left, right]
+    ).
+
+% With room for a single waiter, each way of leaving frees it for the next
+room_comes_back_once_a_waiter_leaves(_Config) ->
+    Broker = cbroker:new([{max_queue_len, 1}]),
+    AssertFull = fun() ->
+        ?assertMatch({drop, broker_full, _}, cbroker:dynamic_ask(Broker, left, offer))
+    end,
+
+    [Matched] = park(Broker, left, 1),
+    AssertFull(),
+    drain(Broker, right, [Matched]),
+
+    [Cancelled] = park(Broker, left, 1),
+    AssertFull(),
+    {cancelled, _} = cbroker:cancel(Cancelled),
+
+    Parker = park_in_process(Broker, left),
+    AssertFull(),
+    exit(Parker, kill),
+    wait_until(fun() -> queue_balance(Broker) =:= 0 end),
+
+    drain(Broker, right, park(Broker, left, 1)).
+
+% A bound on one side only: that lane holds a single waiter, the other as many
+% as it likes, and each can still drain the other
+one_sided_limits_leave_the_other_lane_alone(_Config) ->
+    lists:foreach(
+        fun({Opts, Limited}) ->
+            Unlimited = other_lane(Limited),
+            Broker = cbroker:new(Opts),
+
+            Parked = park(Broker, Limited, 1),
+            ?assertMatch({drop, broker_full, _}, cbroker:dynamic_ask(Broker, Limited, offer)),
+            drain(Broker, Unlimited, Parked),
+
+            drain(Broker, Limited, park(Broker, Unlimited, 50))
+        end,
+        [
+            {[{max_right_balance, 1}], right},
+            {[{min_left_balance, -1}], left}
+        ]
+    ).
 
 %% ------------------------------------------------------------------
 %% Internal Function Definitions
@@ -492,6 +708,65 @@ debug_value(Key, Broker) ->
 opt(Key, Broker) ->
     {Key, Value} = lists:keyfind(Key, 1, debug_value(opts, Broker)),
     Value.
+
+% Parked `right` asks minus parked `left` ones, plus any asks in flight
+queue_balance(Broker) ->
+    {queue_balance, Balance} = lists:keyfind(queue_balance, 1, debug_value(stats, Broker)),
+    Balance.
+
+% Parks Amount asks on Lane, asserting each one did park rather than drop
+park(Broker, Lane, Amount) ->
+    Before = queue_balance(Broker),
+    Tickets = [
+        Ticket
+     || N <- lists:seq(1, Amount), {await, Ticket} <- [cbroker:async_ask(Broker, Lane, {Lane, N})]
+    ],
+    ?assertEqual(Before + Amount * lane_weight(Lane), queue_balance(Broker)),
+    Tickets.
+
+% Parks an ask from a process of its own, which can then be killed
+park_in_process(Broker, Lane) ->
+    Parent = self(),
+    Pid = spawn(fun() ->
+        {await, _} = cbroker:async_ask(Broker, Lane, parked),
+        Parent ! {self(), parked},
+        receive
+            never -> ok
+        end
+    end),
+    receive
+        {Pid, parked} -> Pid
+    after 5_000 ->
+        ct:fail({not_parked, Pid})
+    end.
+
+% Matches every parked ticket from Lane, which must leave the broker balanced
+drain(Broker, Lane, Tickets) ->
+    lists:foreach(fun(_) -> {match, _, _, _} = cbroker:nb_ask(Broker, Lane, drain) end, Tickets),
+    lists:foreach(fun(T) -> ?assertMatch({match, _, drain, _}, await(T)) end, Tickets),
+    ?assertEqual(0, queue_balance(Broker)).
+
+lane_weight(left) -> -1;
+lane_weight(right) -> +1.
+
+other_lane(left) -> right;
+other_lane(right) -> left.
+
+% For what happens asynchronously, such as the DOWN of a killed waiter
+wait_until(Fun) ->
+    wait_until(Fun, 500).
+
+wait_until(_Fun, 0) ->
+    ct:fail(condition_never_met);
+wait_until(Fun, TriesLeft) ->
+    case Fun() of
+        true ->
+            ok;
+        %
+        false ->
+            timer:sleep(10),
+            wait_until(Fun, TriesLeft - 1)
+    end.
 
 % One count per scheduler; which one is which depends on which asked first
 local_pool_counts(Pool, Broker) ->
