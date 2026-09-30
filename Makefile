@@ -23,15 +23,11 @@ check: check-fast check-slow
 .NOTPARALLEL: check
 .PHONY: check
 
-# FIXME
-#check-fast: check-formatted xref hank-dead-code-cleaner elvis-linter
-check-fast:
+check-fast: check-formatted xref hank-dead-code-cleaner elvis-linter
 .NOTPARALLEL: check-fast
 .PHONY: check-fast
 
-# FIXME
-#check-slow: dialyzer
-check-slow:
+check-slow: dialyzer
 .NOTPARALLEL: check-slow
 .PHONY: check-slow
 

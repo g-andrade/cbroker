@@ -242,7 +242,7 @@ brokers_leave_nothing_allocated(_Config) ->
 assert_nothing_stays_allocated(Baseline) ->
     lists:foreach(
         fun(_) ->
-            {Pid, MonRef} = spawn_monitor(fun() -> churn_through_batches() end),
+            {Pid, MonRef} = spawn_monitor(fun churn_through_batches/0),
             receive
                 {'DOWN', MonRef, process, Pid, normal} -> ok
             after ?ASK_TIMEOUT_MS -> ct:fail({churn_timed_out, Pid})

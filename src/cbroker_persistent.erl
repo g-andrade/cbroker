@@ -16,12 +16,18 @@
     get/1
 ]).
 
+-ignore_xref([
+    start_link/2
+]).
+
 %% ------------------------------------------------------------------
 %% gen_server Function Exports
 %% ------------------------------------------------------------------
 
 -export([
     init/1,
+    handle_call/3,
+    handle_cast/2,
     terminate/2,
     code_change/3
 ]).
@@ -46,17 +52,28 @@
 -type state() :: #state{}.
 
 %% ------------------------------------------------------------------
+%% Static Check Tweaks
+%% ------------------------------------------------------------------
+
+% The `persitent_term` key is an improper list because it the smallest
+% tagged value we can allocate.
+-dialyzer([no_improper_lists]).
+
+%% ------------------------------------------------------------------
 %% API Function Definitions
 %% ------------------------------------------------------------------
 
 -spec child_spec(Name, Opts) -> supervisor:child_spec() when
     Name :: reg_name(),
     Opts :: [cbroker:broker_opt()].
+
 child_spec(Name, Opts) ->
-    #{
-        id => {?MODULE, Name},
-        start => {?MODULE, start_link, [Name, Opts]}
-    }.
+    cbroker_utils:dialyzer_opaque_term(
+        #{
+            id => {?MODULE, Name},
+            start => {?MODULE, start_link, [Name, Opts]}
+        }
+    ).
 
 -spec start_link(Name, Opts) -> {ok, pid()} | {error, term()} when
     Name :: reg_name(),
@@ -93,6 +110,16 @@ init([Name, Opts]) ->
     Broker = cbroker:new(MergedOpts),
     persistent_term:put(Key, Broker),
     {ok, #state{key = Key}}.
+
+-spec handle_call(term(), gen_server:from(), state()) -> {noreply, state()}.
+handle_call(Request, From, State) ->
+    logger:info("Ignoring unknown request from ~p: ~p", [From, Request]),
+    {noreply, State}.
+
+-spec handle_cast(term(), state()) -> {noreply, state()}.
+handle_cast(Request, State) ->
+    logger:info("Ignoring unknown request: ~p", [Request]),
+    {noreply, State}.
 
 -spec terminate(term(), state()) -> ok.
 terminate(Reason, State) ->

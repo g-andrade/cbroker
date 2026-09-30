@@ -9,6 +9,7 @@
 %% ------------------------------------------------------------------
 
 -export([
+    dialyzer_opaque_term/1,
     is_termination_reason_healthy/1
 ]).
 
@@ -37,6 +38,10 @@
 %     add(A, B) ->
 %         A + B.
 
+-spec dialyzer_opaque_term(term()) -> term().
+dialyzer_opaque_term(Value) -> Value.
+
+-spec is_termination_reason_healthy(term()) -> boolean().
 is_termination_reason_healthy(normal) -> true;
 is_termination_reason_healthy(shutdown) -> true;
 is_termination_reason_healthy({shutdown, _}) -> true;

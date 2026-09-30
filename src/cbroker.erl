@@ -37,6 +37,39 @@
     resumable_ask/4
 ]).
 
+-ignore_xref([
+    ask/2,
+    ask/3,
+    ask/4,
+    %
+    async_ask/2,
+    async_ask/3,
+    async_ask/4,
+    %
+    cancel/1,
+    %
+    child_spec/1,
+    child_spec/2,
+    %
+    debug_info/1,
+    %
+    dynamic_ask/2,
+    dynamic_ask/3,
+    dynamic_ask/4,
+    %
+    nb_ask/2,
+    nb_ask/3,
+    %
+    new/0,
+    new/1,
+    %
+    resolve_name/1,
+    %
+    resumable_ask/2,
+    resumable_ask/3,
+    resumable_ask/4
+]).
+
 %% ------------------------------------------------------------------
 %% Macro Definitions
 %% ------------------------------------------------------------------
@@ -340,6 +373,9 @@ nb_ask(Broker, Lane, Offer) ->
     do_ask(BrokerRef, Lane, Offer, ticket, non_blocking).
 
 %%
+
+-spec new() -> Broker when
+    Broker :: broker_ref().
 
 new() ->
     new([]).
