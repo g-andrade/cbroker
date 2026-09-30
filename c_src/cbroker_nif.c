@@ -20,14 +20,11 @@
 #define BATCH_POOL_SIZE 4
 #define BATCH_POOL_INITIAL_COUNT 1
 
-#define MATCH_POOLS_SIZE 8
-#define MATCH_POOLS_INITIAL_COUNT 8
-
-#define ENV_POOLS_SIZE 8
-#define ENV_POOLS_INITIAL_COUNT 8
+#define REQUEST_POOLS_SIZE 8
+#define REQUEST_POOLS_INITIAL_COUNT 0
 
 #define TAG_POOLS_SIZE 8
-#define TAG_POOLS_INITIAL_COUNT TAG_POOLS_SIZE
+#define TAG_POOLS_INITIAL_COUNT 0
 
 //
 
@@ -2501,7 +2498,7 @@ static void request_pool_init(mempool_t* pool)
     pool->alloc_cb = request_pool_cb_alloc;
     pool->clear_cb = request_pool_cb_clear;
     pool->free_cb = request_pool_cb_free;
-    mempool_init(pool, MATCH_POOLS_INITIAL_COUNT, MATCH_POOLS_SIZE, NULL);
+    mempool_init(pool, REQUEST_POOLS_INITIAL_COUNT, REQUEST_POOLS_SIZE, NULL);
 }
 
 static void* request_pool_cb_alloc(void* ctx)
