@@ -453,9 +453,14 @@ batches(Broker) ->
     Batches.
 
 nr_of_cells_per_batch(Broker) ->
-    {nr_of_cells_per_batch, CellsPerBatch} = lists:keyfind(
-        nr_of_cells_per_batch, 1, cbroker:debug_info(Broker)
+    {opts, Opts} = lists:keyfind(
+        opts, 1, cbroker:debug_info(Broker)
     ),
+
+    {cells_per_batch, CellsPerBatch} = lists:keyfind(
+        cells_per_batch, 1, Opts
+    ),
+
     CellsPerBatch.
 
 flush_mailbox() ->

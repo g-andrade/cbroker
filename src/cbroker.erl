@@ -57,11 +57,20 @@
 -export_type([broker_ref/0]).
 
 -type broker_opt() ::
-    (boolean_opt(depends_on_creator)).
+    (depends_on_creator
+    | {depends_on_creator, boolean()}
+    | {cells_per_batch, pos_integer()}
+    | {ask_credits, pos_integer()}
+    | {ask_max_tries, pos_integer()}
+    | {batch_pool, [broker_pool_opt()]}
+    | {request_pool, [broker_pool_opt()]}
+    | {ticket_pool, [broker_pool_opt()]}).
 -export_type([broker_opt/0]).
 
--type boolean_opt(Name) :: Name | {Name, boolean()}.
--export_type([boolean_opt/1]).
+-type broker_pool_opt() ::
+    ({size, non_neg_integer()}
+    | {initial_count, non_neg_integer()}).
+-export_type([broker_pool_opt/0]).
 
 -type lane() :: left | right.
 -export_type([lane/0]).

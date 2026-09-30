@@ -20,15 +20,16 @@
 #define BATCH_POOL_SIZE 4
 #define BATCH_POOL_INITIAL_COUNT 1
 
-#define REQUEST_POOLS_SIZE 8
-#define REQUEST_POOLS_INITIAL_COUNT 0
+#define REQUEST_POOL_DEFAULT_SIZE 8
+#define REQUEST_POOL_DEFAULT_INITIAL_COUNT 0
 
-#define TAG_POOLS_SIZE 8
-#define TAG_POOLS_INITIAL_COUNT 0
+#define TICKET_POOL_DEFAULT_SIZE 8
+#define TICKET_POOL_DEFAULT_INITIAL_COUNT 0
 
 //
 
-#define MAX_ASK_RETRIES 10 // FIXME
+#define ASK_DEFAULT_CREDITS 400
+#define ASK_DEFAULT_MAX_TRIES 10
 
 //
 
@@ -36,6 +37,8 @@
 /* clang-format off */
 #define ATOM_LIST \
     X(_approx_avg,            "approx_avg") \
+    X(_ask_credits,           "ask_credits") \
+    X(_ask_max_tries,         "ask_max_tries") \
     X(_async,                 "async") \
     X(_avg,                   "avg") \
     X(_await,                 "await") \
@@ -52,6 +55,7 @@
     X(_brokers,               "brokers") \
     X(_cancelled,             "cancelled") \
     X(_cells,                 "cells") \
+    X(_cells_per_batch,       "cells_per_batch") \
     X(_compute_from_nif,      "compute_from_nif") \
     X(_consumed_count,        "consumed_count") \
     X(_count,                 "count") \
@@ -66,6 +70,7 @@
     X(_false,                 "false") \
     X(_global_state,          "global_state") \
     X(_id,                    "id") \
+    X(_initial_count,         "initial_count") \
     X(_left,                  "left")  \
     X(_left_tail,             "left_tail")  \
     X(_local_states,          "local_states")  \
@@ -74,14 +79,16 @@
     X(_matched,               "matched") \
     X(_non_blocking,          "non_blocking") \
     X(_none,                  "none") \
-    X(_nr_of_cells_per_batch, "nr_of_cells_per_batch") \
-    X(_nr_of_schedulers,      "nr_of_schedulers") \
+    X(_ok,                    "ok") \
+    X(_opts,                  "opts") \
     X(_ref_count,             "ref_count") \
     X(_request_pool,          "request_pool") \
     X(_retries,               "retries") \
     X(_retry,                 "retry") \
     X(_right,                 "right") \
     X(_right_tail,            "right_tail") \
+    X(_schedulers,            "schedulers") \
+    X(_size,                  "size") \
     X(_stats,                 "stats") \
     X(_stopped,               "stopped") \
     X(_sum,                   "sum") \
@@ -211,7 +218,20 @@ typedef struct {
 //
 
 typedef struct {
+    size_t size;
+    size_t initial_count;
+} pool_opts_t;
+
+//
+
+typedef struct {
     bool depends_on_creator;
+    size_t cells_per_batch;
+    int ask_credits;
+    size_t ask_max_tries;
+    pool_opts_t batch_pool;
+    pool_opts_t request_pool;
+    pool_opts_t ticket_pool;
 } broker_opts_t;
 
 //
@@ -235,12 +255,10 @@ typedef struct {
     ErlNifPid creator_pid;
     ErlNifMonitor creator_mon;
     //
-    size_t nr_of_schedulers;
-    size_t nr_of_cells_per_batch;
-    //
     global_state_t global_state;
     stats_t stats;
     //
+    size_t schedulers;
     local_state_t local_states[];
 } broker_t;
 
@@ -360,26 +378,26 @@ static ERL_NIF_TERM nif_alloc_perfcounters(ErlNifEnv* env, int argc, const ERL_N
 
 //
 
-static size_t new_broker_size(const size_t nr_of_schedulers);
-static batch_t* global_state_init(global_state_t* global_state, const size_t nr_of_cells_per_batch);
+static size_t new_broker_size(const size_t schedulers);
+static batch_t* global_state_init(global_state_t* global_state, const broker_opts_t* opts);
 static void global_state_close(global_state_t* global_state);
 static ERL_NIF_TERM global_state_to_term(ErlNifEnv* env, global_state_t* global_state);
 
 //
 
-static void local_states_init(local_state_t local_states[], const size_t nr_of_schedulers,
-                              batch_t* first_batch);
+static void local_states_init(local_state_t local_states[], const size_t schedulers,
+                              const broker_opts_t* opts, batch_t* first_batch);
 
-static void local_states_dirty_close(local_state_t local_states[], const size_t nr_of_schedulers);
+static void local_states_dirty_close(local_state_t local_states[], const size_t schedulers);
 
 static local_state_t* broker_local_state(broker_t* broker);
 
 static batch_t* local_state_get_batch(local_state_t* local_state, const batch_id_t batch_id);
 
 static ERL_NIF_TERM local_states_to_term(ErlNifEnv* env, local_state_t local_states[],
-                                         const size_t nr_of_schedulers);
+                                         const size_t schedulers);
 
-static thread_id_t get_or_assign_thread_id(const size_t nr_of_schedulers);
+static thread_id_t get_or_assign_thread_id(const size_t schedulers);
 
 //
 
@@ -474,27 +492,25 @@ static ERL_NIF_TERM batch_to_term(ErlNifEnv* env, const batch_t* batch);
 
 //
 
-static void ensure_one_entry_in_pool(mempool_t* pool, void* alloc_ctx);
-
-static void batch_pool_init(mempool_t* pool, size_t nr_of_cells);
-static batch_t* batch_pool_get(mempool_t* pool, size_t nr_of_cells);
+static void batch_pool_init(mempool_t* pool, const pool_opts_t* opts, const size_t nr_of_cells);
+static batch_t* batch_pool_get(mempool_t* pool, const size_t nr_of_cells);
 static void* batch_pool_cb_alloc(void*);
 static void batch_pool_cb_clear(void* obj);
 static void batch_pool_cb_free(void* obj);
 
-static void request_pool_init(mempool_t* pool);
+static void request_pool_init(mempool_t* pool, const pool_opts_t*);
 static void* request_pool_cb_alloc(void*);
 static void request_pool_cb_clear(void* obj);
 static void request_pool_cb_free(void* obj);
 
-static void ticket_pool_init(mempool_t* pool);
+static void ticket_pool_init(mempool_t* pool, const pool_opts_t*);
 static void* ticket_pool_cb_alloc(void*);
 static void ticket_pool_cb_clear(void* obj);
 static void ticket_pool_cb_free(void* obj);
 
 //
 
-static void mempool_init(mempool_t* pool, size_t initial_count, size_t size, void* alloc_ctx);
+static void mempool_init(mempool_t* pool, const pool_opts_t*, void* alloc_ctx);
 static void* mempool_get(mempool_t* pool, void* alloc_ctx);
 static void mempool_return(mempool_t* pool, void* obj);
 static void mempool_destroy(mempool_t* pool);
@@ -511,31 +527,32 @@ static ERL_NIF_TERM rolling_avg_to_term(ErlNifEnv* env, rolling_avg_t* rolling_a
 
 static int get_boolean(ERL_NIF_TERM term, bool* out);
 static int get_broker(ErlNifEnv* env, ERL_NIF_TERM term, broker_t** out_broker);
-static int get_broker_opts(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM* out_bad_opt,
-                           broker_opts_t* out_opts);
+
+static int get_broker_opt(ErlNifEnv* env, ERL_NIF_TERM key, ERL_NIF_TERM value,
+                          broker_opts_t* out_opts);
+
+static ERL_NIF_TERM get_broker_opts(ErlNifEnv* env, ERL_NIF_TERM term, broker_opts_t* out_opts);
 
 static int get_offer_size(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM offer,
                           ptrdiff_t* out_size);
+
+static int get_pool_opts(ErlNifEnv* env, ERL_NIF_TERM term, pool_opts_t* out_opts);
+
 static int get_retry(ErlNifEnv* env, ERL_NIF_TERM term, retry_t** out_retry);
 
-#if USES_FLAT_SIZE
 static int get_size_t(ErlNifEnv* env, ERL_NIF_TERM term, size_t* out);
-#endif
 
 static int get_ticket(ErlNifEnv* env, ERL_NIF_TERM term, ticket_t** out_ticket);
 
 //
 
+static ERL_NIF_TERM make_await(ErlNifEnv* env, ERL_NIF_TERM ticket);
 static ERL_NIF_TERM make_badarg(ErlNifEnv* env, ERL_NIF_TERM term);
 static ERL_NIF_TERM make_badopts(ErlNifEnv* env, ERL_NIF_TERM term);
 static ERL_NIF_TERM make_badopt(ErlNifEnv* env, ERL_NIF_TERM term);
-static ERL_NIF_TERM make_await(ErlNifEnv* env, ERL_NIF_TERM ticket);
+static ERL_NIF_TERM make_boolean(int value);
+static ERL_NIF_TERM make_broker_opts(ErlNifEnv* env, const broker_opts_t* opts);
 static ERL_NIF_TERM make_cancelled(ErlNifEnv* env, const int64_t sojourn_time);
-
-#ifdef CBROKER_COUNT_ALLOCS
-static ERL_NIF_TERM make_perfcounter(ErlNifEnv* env, ERL_NIF_TERM key, _Atomic(int64_t)* counter);
-#endif
-
 static ERL_NIF_TERM make_drop(ErlNifEnv* env, const drop_reason_t reason,
                               const int64_t sojourn_time);
 
@@ -544,6 +561,12 @@ static ERL_NIF_TERM make_error(ErlNifEnv* env, ERL_NIF_TERM reason);
 
 static ERL_NIF_TERM make_match(ErlNifEnv* env, ERL_NIF_TERM match_ref, ERL_NIF_TERM offer,
                                int64_t sojourn_time);
+
+#ifdef CBROKER_COUNT_ALLOCS
+static ERL_NIF_TERM make_perfcounter(ErlNifEnv* env, ERL_NIF_TERM key, _Atomic(int64_t)* counter);
+#endif
+
+static ERL_NIF_TERM make_pool_opts(ErlNifEnv* env, const pool_opts_t* opts);
 
 static ERL_NIF_TERM make_reply(ErlNifEnv* env, ERL_NIF_TERM tag, ERL_NIF_TERM reply);
 
@@ -715,28 +738,35 @@ static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         return enif_make_badarg(env);
     }
 
-    ERL_NIF_TERM bad_opt;
+    ErlNifSysInfo sys_info;
+    enif_system_info(&sys_info, sizeof(sys_info));
+    const size_t schedulers = (size_t)sys_info.scheduler_threads;
+    assert(schedulers > 0);
+
     broker_opts_t opts;
     memset(&opts, 0, sizeof(broker_opts_t));
 
-    if (argc > 0) {
-        int opts_res = get_broker_opts(env, argv[0], &bad_opt, &opts);
+    opts.cells_per_batch = 32 * schedulers;
+    opts.ask_credits = ASK_DEFAULT_CREDITS;
+    opts.ask_max_tries = ASK_DEFAULT_MAX_TRIES;
 
-        if (opts_res == -2) {
-            return make_badopts(env, argv[0]);
+    opts.batch_pool.size = BATCH_POOL_SIZE;
+    opts.batch_pool.initial_count = BATCH_POOL_INITIAL_COUNT;
+
+    opts.request_pool.size = REQUEST_POOL_DEFAULT_SIZE;
+    opts.request_pool.initial_count = REQUEST_POOL_DEFAULT_INITIAL_COUNT;
+
+    opts.ticket_pool.size = TICKET_POOL_DEFAULT_SIZE;
+    opts.ticket_pool.initial_count = TICKET_POOL_DEFAULT_INITIAL_COUNT;
+
+    if (argc > 0) {
+        ERL_NIF_TERM opts_res = get_broker_opts(env, argv[0], &opts);
+        if (opts_res != Atoms._ok) {
+            return opts_res;
         }
-        else if (opts_res == -1) {
-            return make_badopt(env, bad_opt);
-        }
-        assert(opts_res == 0);
     }
 
-    ErlNifSysInfo sys_info;
-    enif_system_info(&sys_info, sizeof(sys_info));
-    const size_t nr_of_schedulers = (size_t)sys_info.scheduler_threads;
-    assert(nr_of_schedulers > 0);
-
-    const size_t broker_size = new_broker_size(nr_of_schedulers);
+    const size_t broker_size = new_broker_size(schedulers);
     broker_t* broker =
         cbroker_alloc_resource(&nr_of_live_brokers, ResourceTypes.broker, broker_size);
     assert(broker != NULL);
@@ -747,11 +777,10 @@ static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     int mon_res = enif_monitor_process(env, broker, &broker->creator_pid, &broker->creator_mon);
     assert(mon_res == 0);
 
-    broker->nr_of_schedulers = nr_of_schedulers;
-    broker->nr_of_cells_per_batch = 32 * nr_of_schedulers;
+    batch_t* first_batch = global_state_init(&broker->global_state, &broker->opts);
 
-    batch_t* first_batch = global_state_init(&broker->global_state, broker->nr_of_cells_per_batch);
-    local_states_init(broker->local_states, nr_of_schedulers, first_batch);
+    broker->schedulers = schedulers;
+    local_states_init(broker->local_states, schedulers, &broker->opts, first_batch);
 
     ERL_NIF_TERM broker_term = enif_make_resource(env, broker);
     enif_release_resource(broker);
@@ -854,10 +883,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         ctx.opposite_tail_id_ptr = &ctx.local_state->left_tail_id;
     }
 
-    ensure_one_entry_in_pool(&ctx.local_state->request_pool, NULL);
-    ensure_one_entry_in_pool(&ctx.local_state->ticket_pool, NULL);
-
-    ctx.credits = 400;
+    ctx.credits = ctx.broker->opts.ask_credits;
     ctx.term_res = Atoms._none;
 
     ask_result_t ask_res = ask_loop(&ctx);
@@ -1048,7 +1074,7 @@ static ERL_NIF_TERM nif_debug_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM 
     ERL_NIF_TERM global_state_term = global_state_to_term(env, &broker->global_state);
 
     ERL_NIF_TERM local_state_terms_list =
-        local_states_to_term(env, broker->local_states, broker->nr_of_schedulers);
+        local_states_to_term(env, broker->local_states, broker->schedulers);
 
     ERL_NIF_TERM stats_term = stats_to_term(env, &broker->stats);
 
@@ -1057,13 +1083,11 @@ static ERL_NIF_TERM nif_debug_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM 
         //
         enif_make_tuple2(env, Atoms._creator, enif_make_pid(env, &broker->creator_pid)),
         //
-        enif_make_tuple2(env, Atoms._nr_of_schedulers,
-                         enif_make_uint64(env, broker->nr_of_schedulers)),
-        //
-        enif_make_tuple2(env, Atoms._nr_of_cells_per_batch,
-                         enif_make_uint64(env, broker->nr_of_cells_per_batch)),
+        enif_make_tuple2(env, Atoms._opts, make_broker_opts(env, &broker->opts)),
         //
         enif_make_tuple2(env, Atoms._global_state, global_state_term),
+        //
+        enif_make_tuple2(env, Atoms._schedulers, enif_make_uint64(env, broker->schedulers)),
         //
         enif_make_tuple2(env, Atoms._local_states, local_state_terms_list),
         //
@@ -1091,12 +1115,12 @@ static ERL_NIF_TERM nif_alloc_perfcounters(ErlNifEnv* env, int argc, const ERL_N
 
 /*********************************************************************/
 
-static size_t new_broker_size(const size_t nr_of_schedulers)
+static size_t new_broker_size(const size_t schedulers)
 {
-    return sizeof(broker_t) + (nr_of_schedulers * sizeof(local_state_t));
+    return sizeof(broker_t) + (schedulers * sizeof(local_state_t));
 }
 
-static batch_t* global_state_init(global_state_t* global_state, const size_t nr_of_cells_per_batch)
+static batch_t* global_state_init(global_state_t* global_state, const broker_opts_t* opts)
 {
     cbroker_omap_result_t map_res = CBROKER_OMAP_NOMEM;
 
@@ -1105,12 +1129,12 @@ static batch_t* global_state_init(global_state_t* global_state, const size_t nr_
     global_state->batches = cbroker_omap_new();
 
     const batch_id_t first_batch_id = 1;
-    batch_t* first_batch = batch_new(first_batch_id, nr_of_cells_per_batch);
+    batch_t* first_batch = batch_new(first_batch_id, opts->cells_per_batch);
 
     map_res = cbroker_omap_insert(global_state->batches, first_batch->id, first_batch);
     assert(map_res == CBROKER_OMAP_OK);
 
-    batch_pool_init(&global_state->batch_pool, nr_of_cells_per_batch);
+    batch_pool_init(&global_state->batch_pool, &opts->batch_pool, opts->cells_per_batch);
 
     return first_batch;
 }
@@ -1130,13 +1154,13 @@ static ERL_NIF_TERM global_state_to_term(ErlNifEnv* env, global_state_t* global_
 }
 /*********************************************************************/
 
-static void local_states_init(local_state_t local_states[], const size_t nr_of_schedulers,
-                              batch_t* first_batch)
+static void local_states_init(local_state_t local_states[], const size_t schedulers,
+                              const broker_opts_t* opts, batch_t* first_batch)
 {
     cbroker_omap_result_t map_res = CBROKER_OMAP_NOMEM;
     assert(first_batch != NULL);
 
-    for (size_t thread_id = 0; thread_id < nr_of_schedulers; thread_id++) {
+    for (size_t thread_id = 0; thread_id < schedulers; thread_id++) {
         local_state_t* local_state = &local_states[thread_id];
         local_state->is_closed = false;
         local_state->batches = cbroker_omap_new();
@@ -1149,14 +1173,14 @@ static void local_states_init(local_state_t local_states[], const size_t nr_of_s
         local_state->left_tail_id = first_batch->id;
         local_state->right_tail_id = first_batch->id;
 
-        request_pool_init(&local_state->request_pool);
-        ticket_pool_init(&local_state->ticket_pool);
+        request_pool_init(&local_state->request_pool, &opts->request_pool);
+        ticket_pool_init(&local_state->ticket_pool, &opts->ticket_pool);
     }
 }
 
-static void local_states_dirty_close(local_state_t local_states[], const size_t nr_of_schedulers)
+static void local_states_dirty_close(local_state_t local_states[], const size_t schedulers)
 {
-    for (size_t thread_id = 0; thread_id < nr_of_schedulers; thread_id++) {
+    for (size_t thread_id = 0; thread_id < schedulers; thread_id++) {
         local_state_t* local_state = &local_states[thread_id];
         local_state->is_closed = true; // dirty write
     }
@@ -1164,13 +1188,13 @@ static void local_states_dirty_close(local_state_t local_states[], const size_t 
 
 static local_state_t* broker_local_state(broker_t* broker)
 {
-    const thread_id_t thread_id = get_or_assign_thread_id(broker->nr_of_schedulers);
+    const thread_id_t thread_id = get_or_assign_thread_id(broker->schedulers);
 
     if (thread_id < 0) {
         return NULL;
     }
 
-    assert((size_t)thread_id < broker->nr_of_schedulers);
+    assert((size_t)thread_id < broker->schedulers);
     return &broker->local_states[thread_id];
 }
 
@@ -1183,11 +1207,11 @@ static batch_t* local_state_get_batch(local_state_t* local_state, const batch_id
 }
 
 static ERL_NIF_TERM local_states_to_term(ErlNifEnv* env, local_state_t local_states[],
-                                         const size_t nr_of_schedulers)
+                                         const size_t schedulers)
 {
-    ERL_NIF_TERM* local_state_terms = cbroker_alloc(nr_of_schedulers * sizeof(ERL_NIF_TERM));
+    ERL_NIF_TERM* local_state_terms = cbroker_alloc(schedulers * sizeof(ERL_NIF_TERM));
 
-    for (size_t thread_id = 0; thread_id < nr_of_schedulers; thread_id++) {
+    for (size_t thread_id = 0; thread_id < schedulers; thread_id++) {
         local_state_t* local_state = &local_states[thread_id];
 
         ERL_NIF_TERM local_state_term =
@@ -1202,13 +1226,12 @@ static ERL_NIF_TERM local_states_to_term(ErlNifEnv* env, local_state_t local_sta
         local_state_terms[thread_id] = local_state_term;
     }
 
-    ERL_NIF_TERM list =
-        enif_make_list_from_array(env, local_state_terms, (unsigned)nr_of_schedulers);
+    ERL_NIF_TERM list = enif_make_list_from_array(env, local_state_terms, (unsigned)schedulers);
     cbroker_free(local_state_terms);
     return list;
 }
 
-static thread_id_t get_or_assign_thread_id(const size_t nr_of_schedulers)
+static thread_id_t get_or_assign_thread_id(const size_t schedulers)
 {
     if (my_thread_id == -1) {
         if (enif_thread_type() == ERL_NIF_THR_NORMAL_SCHEDULER) {
@@ -1423,7 +1446,7 @@ static void ask_loop_tail_skip(ask_ctx_t* ctx, const batch_id_t batch_id)
             batch_id_t tail_id =
                 (all_next_count == 0 ? batch_id + 1 : all_next[all_next_count - 1]->id + 1);
 
-            next_batch = batch_pool_get(&global_state->batch_pool, broker->nr_of_cells_per_batch);
+            next_batch = batch_pool_get(&global_state->batch_pool, broker->opts.cells_per_batch);
             batch_init(next_batch, tail_id);
             map_res = cbroker_omap_insert(global_state->batches, tail_id, next_batch);
             assert(map_res == CBROKER_OMAP_OK);
@@ -1728,7 +1751,7 @@ static bool ask_retry_can(ask_ctx_t* ctx)
     retry_t* retry = ctx->retry;
     int retry_nr = (retry == NULL ? 1 : retry->nr + 1);
 
-    if (retry_nr > MAX_ASK_RETRIES) {
+    if (retry_nr >= (int)ctx->broker->opts.ask_max_tries) {
         return false;
     }
     return true;
@@ -2117,7 +2140,7 @@ static void broker_dtor(ErlNifEnv* caller_env, void* obj)
 
     //
 
-    for (size_t thread_id = 0; thread_id < broker->nr_of_schedulers; thread_id++) {
+    for (size_t thread_id = 0; thread_id < broker->schedulers; thread_id++) {
         local_state_t* local_state = &broker->local_states[thread_id];
         void* destroy_ctx = global_state;
         cbroker_omap_destroy(local_state->batches, broker_dtor_cb_local_batch, destroy_ctx);
@@ -2171,7 +2194,7 @@ static void broker_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNif
     }
 
     global_state_close(&broker->global_state);
-    local_states_dirty_close(broker->local_states, broker->nr_of_schedulers);
+    local_states_dirty_close(broker->local_states, broker->schedulers);
 
     local_state_t* local_state = broker_local_state(broker);
     lease_t* leases = NULL;
@@ -2436,17 +2459,7 @@ static ERL_NIF_TERM batch_to_term(ErlNifEnv* env, const batch_t* batch)
 
 /*********************************************************************/
 
-static void ensure_one_entry_in_pool(mempool_t* pool, void* alloc_ctx)
-{
-    if (pool->count == 0) {
-        assert(pool->size > 0);
-        pool->array[pool->count++] = pool->alloc_cb(alloc_ctx);
-    }
-}
-
-//
-
-static void batch_pool_init(mempool_t* pool, size_t nr_of_cells)
+static void batch_pool_init(mempool_t* pool, const pool_opts_t* opts, const size_t nr_of_cells)
 {
     memset(pool, 0, sizeof(mempool_t));
     pool->alloc_cb = batch_pool_cb_alloc;
@@ -2457,10 +2470,10 @@ static void batch_pool_init(mempool_t* pool, size_t nr_of_cells)
     memset(&alloc_ctx, 0, sizeof(batch_pool_alloc_ctx_t));
     alloc_ctx.nr_of_cells = nr_of_cells;
 
-    mempool_init(pool, BATCH_POOL_INITIAL_COUNT, BATCH_POOL_SIZE, &nr_of_cells);
+    mempool_init(pool, opts, &alloc_ctx);
 }
 
-static batch_t* batch_pool_get(mempool_t* pool, size_t nr_of_cells)
+static batch_t* batch_pool_get(mempool_t* pool, const size_t nr_of_cells)
 {
     batch_pool_alloc_ctx_t alloc_ctx;
     memset(&alloc_ctx, 0, sizeof(batch_pool_alloc_ctx_t));
@@ -2492,13 +2505,13 @@ static void batch_pool_cb_free(void* obj) { cbroker_free(obj); }
 
 //
 
-static void request_pool_init(mempool_t* pool)
+static void request_pool_init(mempool_t* pool, const pool_opts_t* opts)
 {
     memset(pool, 0, sizeof(mempool_t));
     pool->alloc_cb = request_pool_cb_alloc;
     pool->clear_cb = request_pool_cb_clear;
     pool->free_cb = request_pool_cb_free;
-    mempool_init(pool, REQUEST_POOLS_INITIAL_COUNT, REQUEST_POOLS_SIZE, NULL);
+    mempool_init(pool, opts, NULL);
 }
 
 static void* request_pool_cb_alloc(void* ctx)
@@ -2533,13 +2546,13 @@ static void request_pool_cb_free(void* obj)
 
 //
 
-static void ticket_pool_init(mempool_t* pool)
+static void ticket_pool_init(mempool_t* pool, const pool_opts_t* opts)
 {
     memset(pool, 0, sizeof(mempool_t));
     pool->alloc_cb = ticket_pool_cb_alloc;
     pool->clear_cb = ticket_pool_cb_clear;
     pool->free_cb = ticket_pool_cb_free;
-    mempool_init(pool, TAG_POOLS_INITIAL_COUNT, TAG_POOLS_SIZE, NULL);
+    mempool_init(pool, opts, NULL);
 }
 
 static void* ticket_pool_cb_alloc(void* ctx)
@@ -2563,12 +2576,11 @@ static void ticket_pool_cb_free(void* obj) { enif_release_resource(obj); }
 
 /*********************************************************************/
 
-static void mempool_init(mempool_t* pool, size_t initial_count, size_t size, void* alloc_ctx)
+static void mempool_init(mempool_t* pool, const pool_opts_t* opts, void* alloc_ctx)
 {
-    assert(initial_count <= size);
-    assert(size > 0);
-    pool->count = initial_count;
-    pool->size = size;
+    assert(opts->initial_count <= opts->size);
+    pool->count = opts->initial_count;
+    pool->size = opts->size;
     pool->array = cbroker_alloc(pool->size * sizeof(void*));
 
     for (size_t i = 0; i < pool->count; i++) {
@@ -2685,8 +2697,37 @@ static int get_broker(ErlNifEnv* env, ERL_NIF_TERM term, broker_t** out_broker)
     return enif_get_resource(env, term, ResourceTypes.broker, (void**)out_broker);
 }
 
-static int get_broker_opts(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM* out_bad_opt,
-                           broker_opts_t* out_opts)
+static int get_broker_opt(ErlNifEnv* env, ERL_NIF_TERM key, ERL_NIF_TERM value,
+                          broker_opts_t* out_opts)
+{
+    if (key == Atoms._depends_on_creator) {
+        return get_boolean(value, &out_opts->depends_on_creator);
+    }
+    else if (key == Atoms._cells_per_batch) {
+        return (get_size_t(env, value, &out_opts->cells_per_batch) &&
+                out_opts->cells_per_batch > 0);
+    }
+    else if (key == Atoms._ask_credits) {
+        return (enif_get_int(env, value, &out_opts->ask_credits) && out_opts->ask_credits > 0);
+    }
+    else if (key == Atoms._ask_max_tries) {
+        return get_size_t(env, value, &out_opts->ask_max_tries) && out_opts->ask_max_tries > 0;
+    }
+    else if (key == Atoms._batch_pool) {
+        return get_pool_opts(env, value, &out_opts->batch_pool);
+    }
+    else if (key == Atoms._request_pool) {
+        return get_pool_opts(env, value, &out_opts->request_pool);
+    }
+    else if (key == Atoms._ticket_pool) {
+        return get_pool_opts(env, value, &out_opts->ticket_pool);
+    }
+    else {
+        return 0;
+    }
+}
+
+static ERL_NIF_TERM get_broker_opts(ErlNifEnv* env, ERL_NIF_TERM term, broker_opts_t* out_opts)
 {
     ERL_NIF_TERM head, tail, key, value;
     int arity = 0;
@@ -2705,33 +2746,26 @@ static int get_broker_opts(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM* out_
             value = elements[1];
         }
         else {
-            *out_bad_opt = head;
-            return -1;
+            return make_badopt(env, head);
         }
 
         //
 
-        if (key == Atoms._depends_on_creator && get_boolean(value, &out_opts->depends_on_creator)) {
+        if (get_broker_opt(env, key, value, out_opts)) {
             continue;
         }
         else {
-            *out_bad_opt = head;
-            return -1;
+            return make_badopt(env, head);
         }
     }
 
     //
 
     if (enif_is_empty_list(env, term)) {
-        return 0;
+        return Atoms._ok;
     }
 
-    return -2;
-}
-
-static int get_retry(ErlNifEnv* env, ERL_NIF_TERM term, retry_t** out_retry)
-{
-    return enif_get_resource(env, term, ResourceTypes.retry, (void**)out_retry);
+    return make_badopts(env, term);
 }
 
 //
@@ -2759,7 +2793,77 @@ static int get_offer_size(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM offer,
 
 //
 
-#if USES_FLAT_SIZE
+static int get_pool_opts(ErlNifEnv* env, ERL_NIF_TERM term, pool_opts_t* out_opts)
+{
+    ERL_NIF_TERM head, tail, key, value;
+    int arity = 0;
+    const ERL_NIF_TERM* elements;
+
+    size_t size = 0;
+    bool size_set = false;
+
+    size_t initial_count = 0;
+    bool initial_count_set = false;
+
+    //
+
+    while (enif_get_list_cell(env, term, &head, &tail)) {
+        term = tail;
+
+        if (!(enif_get_tuple(env, head, &arity, &elements) && arity == 2 &&
+              enif_is_atom(env, elements[0]))) {
+            return 0;
+        }
+        key = elements[0];
+        value = elements[1];
+
+        if (key == Atoms._size) {
+            if (!get_size_t(env, value, &size)) {
+                return 0;
+            }
+            size_set = true;
+        }
+        else if (key == Atoms._initial_count) {
+            if (!get_size_t(env, value, &initial_count)) {
+                return 0;
+            }
+            initial_count_set = true;
+        }
+        else {
+            return 0;
+        }
+    }
+
+    //
+
+    if (size_set) {
+        out_opts->size = size;
+        out_opts->initial_count =
+            (initial_count_set ? initial_count : MIN(out_opts->initial_count, size));
+    }
+    else if (initial_count_set) {
+        out_opts->initial_count = initial_count;
+        out_opts->size = MAX(out_opts->size, initial_count);
+    }
+
+    //
+
+    if (out_opts->initial_count > out_opts->size) {
+        return 0;
+    }
+
+    return enif_is_empty_list(env, term);
+}
+
+//
+
+static int get_retry(ErlNifEnv* env, ERL_NIF_TERM term, retry_t** out_retry)
+{
+    return enif_get_resource(env, term, ResourceTypes.retry, (void**)out_retry);
+}
+
+//
+
 static int get_size_t(ErlNifEnv* env, ERL_NIF_TERM term, size_t* out)
 {
     ErlNifUInt64 value;
@@ -2775,7 +2879,6 @@ static int get_size_t(ErlNifEnv* env, ERL_NIF_TERM term, size_t* out)
     *out = (size_t)value;
     return 1;
 }
-#endif
 
 //
 
@@ -2806,18 +2909,32 @@ static ERL_NIF_TERM make_badopt(ErlNifEnv* env, ERL_NIF_TERM term)
     return raise_tuple2(env, Atoms._badopt, term);
 }
 
+static ERL_NIF_TERM make_boolean(int value) { return (value ? Atoms._true : Atoms._false); }
+
+static ERL_NIF_TERM make_broker_opts(ErlNifEnv* env, const broker_opts_t* opts)
+{
+    return enif_make_list7(
+        env,
+        //
+        enif_make_tuple2(env, Atoms._depends_on_creator, make_boolean(opts->depends_on_creator)),
+        //
+        enif_make_tuple2(env, Atoms._cells_per_batch, enif_make_uint64(env, opts->cells_per_batch)),
+        //
+        enif_make_tuple2(env, Atoms._ask_credits, enif_make_int(env, opts->ask_credits)),
+        //
+        enif_make_tuple2(env, Atoms._ask_max_tries, enif_make_uint64(env, opts->ask_max_tries)),
+        //
+        enif_make_tuple2(env, Atoms._batch_pool, make_pool_opts(env, &opts->batch_pool)),
+        //
+        enif_make_tuple2(env, Atoms._request_pool, make_pool_opts(env, &opts->request_pool)),
+        //
+        enif_make_tuple2(env, Atoms._ticket_pool, make_pool_opts(env, &opts->ticket_pool)));
+}
+
 static ERL_NIF_TERM make_cancelled(ErlNifEnv* env, const int64_t sojourn_time)
 {
     return enif_make_tuple2(env, Atoms._cancelled, enif_make_int64(env, sojourn_time));
 }
-
-#ifdef CBROKER_COUNT_ALLOCS
-static ERL_NIF_TERM make_perfcounter(ErlNifEnv* env, ERL_NIF_TERM key, _Atomic(int64_t)* counter)
-{
-    int64_t value = atomic_load_explicit(counter, memory_order_relaxed);
-    return enif_make_tuple2(env, key, enif_make_int64(env, value));
-}
-#endif
 
 static ERL_NIF_TERM make_drop(ErlNifEnv* env, const drop_reason_t reason, int64_t sojourn_time)
 {
@@ -2858,6 +2975,24 @@ static ERL_NIF_TERM make_match(ErlNifEnv* env, ERL_NIF_TERM match_ref, ERL_NIF_T
 
     return enif_make_tuple4(env, Atoms._match, match_ref, offer,
                             enif_make_int64(env, sojourn_time));
+}
+
+#ifdef CBROKER_COUNT_ALLOCS
+static ERL_NIF_TERM make_perfcounter(ErlNifEnv* env, ERL_NIF_TERM key, _Atomic(int64_t)* counter)
+{
+    int64_t value = atomic_load_explicit(counter, memory_order_relaxed);
+    return enif_make_tuple2(env, key, enif_make_int64(env, value));
+}
+#endif
+
+static ERL_NIF_TERM make_pool_opts(ErlNifEnv* env, const pool_opts_t* opts)
+{
+    return enif_make_list2(
+        env,
+        //
+        enif_make_tuple2(env, Atoms._size, enif_make_uint64(env, opts->size)),
+        //
+        enif_make_tuple2(env, Atoms._initial_count, enif_make_uint64(env, opts->initial_count)));
 }
 
 static ERL_NIF_TERM make_reply(ErlNifEnv* env, ERL_NIF_TERM tag, ERL_NIF_TERM reply)
