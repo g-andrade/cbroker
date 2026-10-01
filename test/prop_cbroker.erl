@@ -84,7 +84,7 @@ prop_nb_ask_on_an_idle_broker_drops() ->
         begin
             {drop, Reason, Sojourn} = cbroker:nb_ask(broker(), Lane, Offer),
 
-            Reason =:= match_unavailable andalso is_plausible_sojourn(Sojourn)
+            Reason =:= match_not_found andalso is_plausible_sojourn(Sojourn)
         end
     ).
 

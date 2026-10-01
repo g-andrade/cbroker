@@ -142,7 +142,7 @@ precondition(_State, _Call) ->
 postcondition(State, {call, _, nb_ask, [Lane, _Offer]}, Result) ->
     case parked(State, opposite(Lane)) of
         none ->
-            matches_drop(Result, match_unavailable);
+            matches_drop(Result, match_not_found);
         %
         {_, CounterOffer} ->
             matches_match(Result, CounterOffer)
