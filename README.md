@@ -14,13 +14,13 @@ This is useful for worker pools and other producer-consumer setups.
 There is no broker process: matching is done concurrently through a NIF that
 uses every online ERTS scheduler.
 
-API semantics were inspired by [sbroker](https://hex.pm/packages/sbroker).
-
-## Objectives
+## Goals
 
 - **No bottleneck process**: `cbroker` contends only on a few atomic counters
   and an infrequent global lock.
 - **Offers are copied concurrently**, by the processes that match them.
+
+API semantics were inspired by [sbroker](https://hex.pm/packages/sbroker).
 
 TODO: one benchmark figure against `cbroker_simple`.
 
