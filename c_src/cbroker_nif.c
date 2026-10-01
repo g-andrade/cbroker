@@ -59,17 +59,13 @@
 /* The columns below are aligned on purpose. */
 /* clang-format off */
 #define ATOM_LIST \
-    X(_approx_avg,            "approx_avg") \
     X(_ask_credits,           "ask_credits") \
     X(_ask_max_tries,         "ask_max_tries") \
     X(_async,                 "async") \
-    X(_avg,                   "avg") \
     X(_await,                 "await") \
     X(_badarg,                "badarg") \
     X(_badopt,                "badopt") \
     X(_badopts,               "badopts") \
-    X(_batch_consumed,        "batch_consumed") \
-    X(_batch_full,            "batch_full")  \
     X(_batch_pool,            "batch_pool")  \
     X(_batches,               "batches") \
     X(_blocks,                "blocks") \
@@ -80,9 +76,7 @@
     X(_closed,                "closed") \
     X(_compute_from_nif,      "compute_from_nif") \
     X(_consumed_count,        "consumed_count") \
-    X(_count,                 "count") \
     X(_creator,               "creator") \
-    X(_credits_left,          "credits_left") \
     X(_depends_on_creator,    "depends_on_creator") \
     X(_drop,                  "drop") \
     X(_dynamic,               "dynamic") \
@@ -111,14 +105,11 @@
     X(_ref_count,             "ref_count") \
     X(_request_pool,          "request_pool") \
     X(_retries,               "retries") \
-    X(_retry,                 "retry") \
     X(_right,                 "right") \
     X(_right_tail,            "right_tail") \
     X(_schedulers,            "schedulers") \
     X(_size,                  "size") \
     X(_stats,                 "stats") \
-    X(_stopped,               "stopped") \
-    X(_sum,                   "sum") \
     X(_ticket,                "ticket") \
     X(_ticket_pool,           "ticket_pool") \
     X(_tickets,               "tickets") \
@@ -127,8 +118,7 @@
     X(_true,                  "true") \
     X(_unavailable,           "unavailable") \
     X(_unlimited,             "unlimited") \
-    X(_waiting,               "waiting") \
-    X(_zzzzzz,                "zzzzzzz")
+    X(_waiting,               "waiting")
 /* clang-format on */
 
 #define MAX(a, b) ((a) >= (b) ? (a) : (b))
