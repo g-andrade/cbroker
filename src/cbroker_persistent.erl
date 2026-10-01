@@ -74,7 +74,7 @@
 -if(?OTP_RELEASE >= 25).
 -type request_from() :: gen_server:from().
 -else.
--type request() :: {pid(), reference()}.
+-type request_from() :: {pid(), reference()}.
 -endif.
 
 %% ------------------------------------------------------------------
