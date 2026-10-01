@@ -218,7 +218,7 @@ If `cancel/1` is called by a process other than the asker, the asker also gets
 stateDiagram-v2
     [*] --> pooled: allocated
     pooled --> live: checked out as the new highest batch ID
-    live --> live: local states check it out / drop it
+    note right of live: local states check it out / drop it
     live --> spent: every cell consumed
     spent --> recycled: ref_count back to 1
     recycled --> live: it was the highest ID, reused as ID + 1
