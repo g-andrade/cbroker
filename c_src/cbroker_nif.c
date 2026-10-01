@@ -1,3 +1,26 @@
+/* Copyright (c) 2026 Guilherme Andrade
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ */
+
+/* The algorithm is explained in INTERNALS.md. */
+
 #include "erl_nif.h"
 
 #include <assert.h>
@@ -1463,6 +1486,8 @@ static void ask_loop_tail_skip(ask_ctx_t* ctx, const batch_id_t batch_id)
     broker_t* broker = ctx->broker;
     local_state_t* local_state = ctx->local_state;
 
+    /* No batch in the lease means this local state already dropped the tail's
+     * batch, upon consuming its last cell, with the tail still pointing at it. */
     assert(lease->batch == NULL || lease->batch->id == batch_id);
 
     batch_t* next_batch = NULL;
@@ -2381,7 +2406,7 @@ static bool lease_consume_slot(lease_t* lease)
     batch_t* batch = lease->batch;
 
     /* acq_rel: the incrementer that reaches nr_of_cells triggers teardown, so
-     * this behaves as a reference release. See `batch_lower_ref_count`. */
+     * this behaves as a reference release. See `lease_ref_count_dec`. */
     size_t consumed_count =
         1 + atomic_fetch_add_explicit(&batch->consumed_count, 1, memory_order_acq_rel);
 
