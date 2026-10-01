@@ -51,6 +51,7 @@
     %
     reply_is_tagged_with_the_ticket/1,
     reply_is_tagged_with_the_given_ref/1,
+    async_match_messages_the_right_lane_first/1,
     %
     defaults_are_reported/1,
     depends_on_creator_closes_the_broker/1,
@@ -127,7 +128,8 @@ groups() ->
             [parallel],
             [
                 reply_is_tagged_with_the_ticket,
-                reply_is_tagged_with_the_given_ref
+                reply_is_tagged_with_the_given_ref,
+                async_match_messages_the_right_lane_first
             ]
         },
         {
@@ -308,6 +310,50 @@ reply_is_tagged_with_the_given_ref(Config) ->
     after 5_000 ->
         ct:fail(no_reply)
     end.
+
+% When the matcher is an `async_ask`, both sides are told by message. Being
+% both sides ourselves, we get to see the order: `right` always comes first,
+% whichever lane waited and whatever each side is tagged with
+async_match_messages_the_right_lane_first(Config) ->
+    Broker = broker(Config),
+    TagKinds = [ticket, reply_ref],
+
+    lists:foreach(
+        fun({WaiterLane, WaiterTagKind, MatcherTagKind} = Combo) ->
+            MatcherLane = other_lane(WaiterLane),
+            WaiterReplyRef = reply_ref_arg(WaiterTagKind),
+            MatcherReplyRef = reply_ref_arg(MatcherTagKind),
+
+            {await, WaiterTicket} = cbroker:async_ask(
+                Broker, WaiterLane, {offer, WaiterLane}, WaiterReplyRef
+            ),
+            {await, MatcherTicket} = cbroker:async_ask(
+                Broker, MatcherLane, {offer, MatcherLane}, MatcherReplyRef
+            ),
+            Tags = #{
+                WaiterLane => expected_tag(WaiterReplyRef, WaiterTicket),
+                MatcherLane => expected_tag(MatcherReplyRef, MatcherTicket)
+            },
+
+            {FirstTag, {match, MatchRef, FirstCounterOffer, _}} = next_message(),
+            {SecondTag, {match, MatchRef, SecondCounterOffer, _}} = next_message(),
+
+            ?assertEqual(
+                {Combo, maps:get(right, Tags), {offer, left}},
+                {Combo, FirstTag, FirstCounterOffer}
+            ),
+            ?assertEqual(
+                {Combo, maps:get(left, Tags), {offer, right}},
+                {Combo, SecondTag, SecondCounterOffer}
+            )
+        end,
+        [
+            {WaiterLane, WaiterTagKind, MatcherTagKind}
+         || WaiterLane <- [left, right],
+            WaiterTagKind <- TagKinds,
+            MatcherTagKind <- TagKinds
+        ]
+    ).
 
 %%
 
@@ -985,6 +1031,21 @@ lane_weight(right) -> +1.
 
 other_lane(left) -> right;
 other_lane(right) -> left.
+
+reply_ref_arg(ticket) -> ticket;
+reply_ref_arg(reply_ref) -> make_ref().
+
+% What a reply is tagged with: the ticket, unless a reference was given
+expected_tag(ticket, Ticket) -> Ticket;
+expected_tag(ReplyRef, _Ticket) -> ReplyRef.
+
+% The oldest message in the mailbox, whatever it is
+next_message() ->
+    receive
+        Msg -> Msg
+    after 5_000 ->
+        ct:fail(no_message)
+    end.
 
 % For what happens asynchronously, such as the DOWN of a killed waiter
 wait_until(Fun) ->

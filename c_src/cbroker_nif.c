@@ -455,7 +455,8 @@ static void ask_loop_request_new(ask_ctx_t* ctx);
 
 static void ask_reply_await(ask_ctx_t* ctx);
 static void ask_reply_match(ask_ctx_t* ctx);
-static void ask_reply_match_notify_other(ask_ctx_t* ctx, ERL_NIF_TERM match_ref);
+static void ask_reply_match_notify_other(ask_ctx_t* ctx, ERL_NIF_TERM match_ref,
+                                         ERL_NIF_TERM counter_ref_copy);
 static ERL_NIF_TERM ask_reply_match_self(ask_ctx_t* ctx, ERL_NIF_TERM match_ref);
 static void ask_reply_nomatch(ask_ctx_t* ctx);
 static void ask_reply_closed(ask_ctx_t* ctx);
@@ -513,7 +514,7 @@ static bool lease_consume_slot(lease_t* lease);
 
 //
 
-static ERL_NIF_TERM reply_tag(ErlNifEnv* env, request_t* request);
+static ERL_NIF_TERM reply_tag(ErlNifEnv* env, request_t* request, ERL_NIF_TERM reply_ref_copy);
 
 static void notify_of_cancellation(ErlNifEnv* env, request_t* request, const drop_reason_t reason);
 
@@ -1729,23 +1730,18 @@ static void ask_reply_match(ask_ctx_t* ctx)
     ERL_NIF_TERM match_ref = enif_make_ref(ctx->env);
 
     if (we_go_first) {
-        /* FIXME: being async, `ask_reply_match_self` sends the counter request's
-         * env away as the message, which invalidates its terms. Notifying the
-         * other then reads `counter_request->reply_ref` out of that env, through
-         * `reply_tag`, when the waiter gave a ReplyRef of its own. It only works
-         * because the message went to ourselves, and so can't be received or
-         * collected while we're in this NIF. Build the other's tag before
-         * sending to ourselves. */
+        ERL_NIF_TERM counter_reply_ref = enif_make_copy(ctx->env, counter_request->reply_ref);
         ctx->nif_res = ask_reply_match_self(ctx, match_ref);
-        ask_reply_match_notify_other(ctx, match_ref);
+        ask_reply_match_notify_other(ctx, match_ref, counter_reply_ref);
     }
     else {
-        ask_reply_match_notify_other(ctx, match_ref);
+        ask_reply_match_notify_other(ctx, match_ref, Atoms._none);
         ctx->nif_res = ask_reply_match_self(ctx, match_ref);
     }
 }
 
-static void ask_reply_match_notify_other(ask_ctx_t* ctx, ERL_NIF_TERM match_ref)
+static void ask_reply_match_notify_other(ask_ctx_t* ctx, ERL_NIF_TERM match_ref,
+                                         ERL_NIF_TERM counter_ref_copy)
 {
     request_t* request = ctx->request;
     request_t* counter_request = ctx->counter_request;
@@ -1756,14 +1752,14 @@ static void ask_reply_match_notify_other(ask_ctx_t* ctx, ERL_NIF_TERM match_ref)
     if (request != NULL) {
         // We reuse our own request's env, which already contains our offer
         ErlNifEnv* msg_env = request->env;
-        ERL_NIF_TERM tag = reply_tag(msg_env, counter_request);
+        ERL_NIF_TERM tag = reply_tag(msg_env, counter_request, counter_ref_copy);
         ERL_NIF_TERM ref = enif_make_copy(msg_env, match_ref);
         ERL_NIF_TERM match = make_match(msg_env, ref, request->offer, sojourn_time);
         ERL_NIF_TERM msg = make_reply(msg_env, tag, match);
         either_notify_or_assert_not_alive(ctx->env, &counter_request->pid, msg_env, msg);
     }
     else {
-        ERL_NIF_TERM tag = reply_tag(ctx->env, counter_request);
+        ERL_NIF_TERM tag = reply_tag(ctx->env, counter_request, counter_ref_copy);
         ERL_NIF_TERM match = make_match(ctx->env, match_ref, ctx->offer, sojourn_time);
         ERL_NIF_TERM msg = make_reply(ctx->env, tag, match);
         either_notify_or_assert_not_alive(ctx->env, &counter_request->pid, NULL, msg);
@@ -2423,15 +2419,19 @@ static bool lease_consume_slot(lease_t* lease)
 
 /*********************************************************************/
 
-static ERL_NIF_TERM reply_tag(ErlNifEnv* env, request_t* request)
+static ERL_NIF_TERM reply_tag(ErlNifEnv* env, request_t* request, ERL_NIF_TERM reply_ref_copy)
 {
     ERL_NIF_TERM reply_ref = request->reply_ref;
 
-    if (reply_ref != Atoms._ticket) {
-        return enif_make_copy(env, reply_ref);
+    if (reply_ref == Atoms._ticket) {
+        return enif_make_resource(env, request->ticket);
+    }
+    else if (reply_ref_copy != Atoms._none) {
+        // Copied before its env was invalidated
+        return enif_make_copy(env, reply_ref_copy);
     }
     else {
-        return enif_make_resource(env, request->ticket);
+        return enif_make_copy(env, reply_ref);
     }
 }
 
@@ -2439,7 +2439,7 @@ static void notify_of_cancellation(ErlNifEnv* env, request_t* request, const dro
 {
     assert(request->ticket != NULL);
 
-    ERL_NIF_TERM tag = reply_tag(env, request);
+    ERL_NIF_TERM tag = reply_tag(env, request, Atoms._none);
     int64_t sojourn_time = monotonic_ts() - request->enqueue_ts;
     ERL_NIF_TERM cancelled = make_drop(env, reason, sojourn_time);
     ERL_NIF_TERM msg = make_reply(env, tag, cancelled);
