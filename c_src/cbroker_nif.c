@@ -50,13 +50,11 @@
     X(_batch_pool,            "batch_pool")  \
     X(_batches,               "batches") \
     X(_blocks,                "blocks") \
-    X(_broker_closed,         "broker_closed") \
-    X(_broker_full,           "broker_full") \
-    X(_broker_overloaded,     "broker_overloaded") \
     X(_brokers,               "brokers") \
     X(_cancelled,             "cancelled") \
     X(_cells,                 "cells") \
     X(_cells_per_batch,       "cells_per_batch") \
+    X(_closed,                "closed") \
     X(_compute_from_nif,      "compute_from_nif") \
     X(_consumed_count,        "consumed_count") \
     X(_count,                 "count") \
@@ -69,6 +67,7 @@
     X(_envs,                  "envs") \
     X(_error,                 "error") \
     X(_false,                 "false") \
+    X(_full_lane,             "full_lane") \
     X(_global_state,          "global_state") \
     X(_id,                    "id") \
     X(_initial_count,         "initial_count") \
@@ -76,7 +75,7 @@
     X(_left_tail,             "left_tail")  \
     X(_local_states,          "local_states")  \
     X(_match,                 "match") \
-    X(_match_unavailable,     "match_unavailable") \
+    X(_match_not_found,       "match_not_found") \
     X(_matched,               "matched") \
     X(_max_queue_len,         "max_queue_len") \
     X(_max_right_balance,     "max_right_balance") \
@@ -101,6 +100,7 @@
     X(_ticket_pool,           "ticket_pool") \
     X(_tickets,               "tickets") \
     X(_too_late,              "too_late") \
+    X(_too_many_tries,        "too_many_tries") \
     X(_true,                  "true") \
     X(_unavailable,           "unavailable") \
     X(_unlimited,             "unlimited") \
@@ -302,7 +302,7 @@ typedef enum {
     DROP_REASON_CANCELLED,
     DROP_REASON_NON_BLOCKING,
     DROP_REASON_TOO_MANY_RETRIES,
-    DROP_REASON_FULL,
+    DROP_REASON_LANE_FULL,
     DROP_REASON_CLOSED
 } drop_reason_t;
 
@@ -903,7 +903,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     assert(ctx.local_state != NULL);
 
     if (ctx.local_state->is_closed) {
-        return make_error(env, Atoms._broker_closed);
+        return make_error(env, Atoms._closed);
     }
 
     if (ctx.is_left) {
@@ -954,7 +954,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
         if (ask_res == ASK_RESULT_FULL) {
             const drop_reason_t drop_reason =
-                (ctx.is_non_blocking ? DROP_REASON_NON_BLOCKING : DROP_REASON_FULL);
+                (ctx.is_non_blocking ? DROP_REASON_NON_BLOCKING : DROP_REASON_LANE_FULL);
             ask_drop(&ctx, drop_reason);
         }
     }
@@ -1714,6 +1714,13 @@ static void ask_reply_match(ask_ctx_t* ctx)
     ERL_NIF_TERM match_ref = enif_make_ref(ctx->env);
 
     if (we_go_first) {
+        /* FIXME: being async, `ask_reply_match_self` sends the counter request's
+         * env away as the message, which invalidates its terms. Notifying the
+         * other then reads `counter_request->reply_ref` out of that env, through
+         * `reply_tag`, when the waiter gave a ReplyRef of its own. It only works
+         * because the message went to ourselves, and so can't be received or
+         * collected while we're in this NIF. Build the other's tag before
+         * sending to ourselves. */
         ctx->nif_res = ask_reply_match_self(ctx, match_ref);
         ask_reply_match_notify_other(ctx, match_ref);
     }
@@ -1806,10 +1813,7 @@ static void ask_reply_nomatch(ask_ctx_t* ctx)
     ctx->nif_res = make_drop(ctx->env, DROP_REASON_NON_BLOCKING, sojourn_time);
 }
 
-static void ask_reply_closed(ask_ctx_t* ctx)
-{
-    ctx->nif_res = make_error(ctx->env, Atoms._broker_closed);
-}
+static void ask_reply_closed(ask_ctx_t* ctx) { ctx->nif_res = make_error(ctx->env, Atoms._closed); }
 
 //
 
@@ -3115,17 +3119,17 @@ static ERL_NIF_TERM make_drop_reason(ErlNifEnv* env, const drop_reason_t reason)
         return Atoms._cancelled;
 
     case DROP_REASON_NON_BLOCKING:
-        return Atoms._match_unavailable;
+        return Atoms._match_not_found;
 
     case DROP_REASON_TOO_MANY_RETRIES:
-        return Atoms._broker_overloaded;
+        return Atoms._too_many_tries;
 
-    case DROP_REASON_FULL:
-        return Atoms._broker_full;
+    case DROP_REASON_LANE_FULL:
+        return Atoms._full_lane;
 
     default:
         assert(reason == DROP_REASON_CLOSED);
-        return Atoms._broker_closed;
+        return Atoms._closed;
     }
 }
 

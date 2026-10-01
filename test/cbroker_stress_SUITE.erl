@@ -155,7 +155,7 @@ killed_waiters_are_reclaimed(Config) ->
     ok = wait_until(fun() -> pending_cells(Broker) =:= [] end),
 
     % Nothing parked any more, so there is nothing left to match against
-    ?assertMatch({drop, match_unavailable, _}, cbroker:nb_ask(Broker, right, late_offer)).
+    ?assertMatch({drop, match_not_found, _}, cbroker:nb_ask(Broker, right, late_offer)).
 
 % One scheduler only ever asks on `left`, another only on `right`, so each
 % one's tail for the other lane never moves by itself. The `right` side trails
@@ -245,10 +245,10 @@ queue_limit_keeps_its_accounting(_Config) ->
      || {_, _, Reply} = Sample <- Samples,
         not is_match(Reply),
         Reply =/= drop_of_reason(Reply, timeout),
-        Reply =/= drop_of_reason(Reply, broker_full)
+        Reply =/= drop_of_reason(Reply, full_lane)
     ],
     ct:log("Refused for being full: ~b of ~b", [
-        length([R || {_, _, R} <- Samples, R =:= drop_of_reason(R, broker_full)]),
+        length([R || {_, _, R} <- Samples, R =:= drop_of_reason(R, full_lane)]),
         length(Samples)
     ]),
 

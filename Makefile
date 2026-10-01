@@ -37,7 +37,9 @@ test: eunit ct proper
 
 C_SOURCES := $(wildcard c_src/*.c c_src/*.h test/c/*.c test/c/*.h)
 
-format: format-erl format-c
+MD_SOURCES := README.md INTERNALS.md AGENTS.md CHANGELOG.md
+
+format: format-erl format-c format-md
 .NOTPARALLEL: format
 .PHONY: format
 
@@ -52,6 +54,14 @@ format-c:
 		echo >&2 "WARN: skipping clang-format"; \
 	fi
 .PHONY: format-c
+
+format-md:
+	@if command -v prettier >/dev/null 2>&1; then \
+		prettier --write $(MD_SOURCES); \
+	else \
+		echo >&2 "WARN: skipping prettier"; \
+	fi
+.PHONY: format-md
 
 ## Tests
 
@@ -118,7 +128,7 @@ test-sanitized:
 
 ## Checks
 
-check-formatted: check-formatted-erl check-formatted-c
+check-formatted: check-formatted-erl check-formatted-c check-formatted-md
 .NOTPARALLEL: check-formatted
 .PHONY: check-formatted
 
@@ -137,6 +147,14 @@ check-formatted-c:
 		echo >&2 "WARN: skipping clang-format check"; \
 	fi
 .PHONY: check-formatted-c
+
+check-formatted-md:
+	@if command -v prettier >/dev/null 2>&1; then \
+		prettier --check $(MD_SOURCES); \
+	else \
+		echo >&2 "WARN: skipping prettier check"; \
+	fi
+.PHONY: check-formatted-md
 
 xref:
 	@rebar3 xref
@@ -204,7 +222,7 @@ doc-watch: doc
 	done
 .PHONY: doc-watch
 
-tmp/ex_doc: EX_DOC_VER=0.40.2
+tmp/ex_doc: EX_DOC_VER=0.40.4
 tmp/ex_doc: OTP_VER := $(shell erl -noshell -eval 'io:fwrite("~s", [erlang:system_info(otp_release)]), init:stop().')
 tmp/ex_doc: | tmp
 tmp/ex_doc:

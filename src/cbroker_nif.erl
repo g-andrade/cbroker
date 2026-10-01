@@ -62,7 +62,7 @@ alloc_perfcounters() ->
     {await, Ticket}
     | {match, MatchRef, CounterOffer, SojournTime}
     | {drop, DropReason, SojournTime}
-    | {error, broker_closed}
+    | {error, closed}
 when
     BrokerRef :: reference(),
     Lane :: left | right,

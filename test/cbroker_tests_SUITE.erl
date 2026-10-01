@@ -68,7 +68,8 @@
     full_lane_refuses_every_flavour/1,
     full_lane_still_matches_the_other/1,
     room_comes_back_once_a_waiter_leaves/1,
-    one_sided_limits_leave_the_other_lane_alone/1
+    one_sided_limits_leave_the_other_lane_alone/1,
+    asymmetric_limits_bound_each_lane_apart/1
 ]).
 
 %% ------------------------------------------------------------------
@@ -141,7 +142,8 @@ groups() ->
                 full_lane_refuses_every_flavour,
                 full_lane_still_matches_the_other,
                 room_comes_back_once_a_waiter_leaves,
-                one_sided_limits_leave_the_other_lane_alone
+                one_sided_limits_leave_the_other_lane_alone,
+                asymmetric_limits_bound_each_lane_apart
             ]
         }
     ].
@@ -223,7 +225,7 @@ match_between_processes(Config) ->
 nb_ask_without_counterpart_drops(Config) ->
     Broker = broker(Config),
 
-    ?assertMatch({drop, match_unavailable, _}, cbroker:nb_ask(Broker, left, offer_l)).
+    ?assertMatch({drop, match_not_found, _}, cbroker:nb_ask(Broker, left, offer_l)).
 
 nb_ask_matches_a_waiting_request(Config) ->
     Broker = broker(Config),
@@ -299,8 +301,8 @@ depends_on_creator_closes_the_broker(_Config) ->
     {await, Ticket} = cbroker:async_ask(Broker, left, offer_l),
     stop_creator(Creator),
 
-    ?assertMatch({drop, broker_closed, _}, await(Ticket)),
-    ?assertError(broker_closed, cbroker:nb_ask(Broker, right, offer_r)).
+    ?assertMatch({drop, closed, _}, await(Ticket)),
+    ?assertError(closed, cbroker:nb_ask(Broker, right, offer_r)).
 
 broker_outlives_its_creator_by_default(_Config) ->
     {Broker, Creator} = broker_with_creator([]),
@@ -342,9 +344,9 @@ ask_credits_and_max_tries_bound_an_ask(_Config) ->
             )
         end,
         [
-            {[{ask_credits, 1}, {ask_max_tries, 1}], broker_overloaded},
-            {[{ask_credits, 1}, {ask_max_tries, 2}], match_unavailable},
-            {[{ask_credits, 2}, {ask_max_tries, 1}], match_unavailable}
+            {[{ask_credits, 1}, {ask_max_tries, 1}], too_many_tries},
+            {[{ask_credits, 1}, {ask_max_tries, 2}], match_not_found},
+            {[{ask_credits, 2}, {ask_max_tries, 1}], match_not_found}
         ]
     ).
 
@@ -506,6 +508,7 @@ queue_limit_opts_are_reported(_Config) ->
             {[{max_queue_len, unlimited}], {unlimited, unlimited}},
             {[{min_left_balance, -2}], {-2, unlimited}},
             {[{max_right_balance, 5}], {unlimited, 5}},
+            {[{min_left_balance, -2}, {max_right_balance, 5}], {-2, 5}},
             {[{min_left_balance, -(1 bsl 63)}], {-(1 bsl 63), unlimited}},
             {[{max_right_balance, PtrdiffMax}], {unlimited, PtrdiffMax}},
             {[{max_queue_len, 3}, {min_left_balance, -1}], {-1, 3}},
@@ -544,7 +547,7 @@ queue_balance_follows_waiters(_Config) ->
 % Asks that end without parking leave nothing behind
 queue_balance_settles_after_every_outcome(_Config) ->
     NoMatch = cbroker:new(),
-    ?assertMatch({drop, match_unavailable, _}, cbroker:nb_ask(NoMatch, left, offer_l)),
+    ?assertMatch({drop, match_not_found, _}, cbroker:nb_ask(NoMatch, left, offer_l)),
     ?assertEqual(0, queue_balance(NoMatch)),
 
     % Out of tries on the cancelled cell ahead. Being async, it's told by message
@@ -552,13 +555,13 @@ queue_balance_settles_after_every_outcome(_Config) ->
     [Cancelled] = park(Overloaded, left, 1),
     {cancelled, _} = cbroker:cancel(Cancelled),
     {await, Ticket} = cbroker:async_ask(Overloaded, right, offer_r),
-    ?assertMatch({drop, broker_overloaded, _}, await(Ticket)),
+    ?assertMatch({drop, too_many_tries, _}, await(Ticket)),
     ?assertEqual(0, queue_balance(Overloaded)),
 
     {Closed, Creator} = broker_with_creator([depends_on_creator]),
     [Parked] = park(Closed, right, 1),
     stop_creator(Creator),
-    ?assertMatch({drop, broker_closed, _}, await(Parked)),
+    ?assertMatch({drop, closed, _}, await(Parked)),
     ?assertEqual(0, queue_balance(Closed)).
 
 % Once a lane has as many waiters as allowed, one more is refused however it
@@ -571,19 +574,19 @@ full_lane_refuses_every_flavour(_Config) ->
             Balance = queue_balance(Broker),
 
             ?assertMatch(
-                {drop, broker_full, SojournTime} when SojournTime >= 0,
+                {drop, full_lane, SojournTime} when SojournTime >= 0,
                 cbroker:ask(Broker, Lane, offer, 5_000)
             ),
-            ?assertMatch({drop, broker_full, _}, cbroker:dynamic_ask(Broker, Lane, offer)),
+            ?assertMatch({drop, full_lane, _}, cbroker:dynamic_ask(Broker, Lane, offer)),
 
             {await, Ticket} = cbroker:async_ask(Broker, Lane, offer),
-            ?assertMatch({drop, broker_full, _}, await(Ticket)),
+            ?assertMatch({drop, full_lane, _}, await(Ticket)),
 
             ReplyRef = make_ref(),
             ?assertEqual({await, ReplyRef}, cbroker:async_ask(Broker, Lane, offer, ReplyRef)),
-            ?assertMatch({drop, broker_full, _}, await(ReplyRef)),
+            ?assertMatch({drop, full_lane, _}, await(ReplyRef)),
 
-            ?assertMatch({drop, match_unavailable, _}, cbroker:nb_ask(Broker, Lane, offer)),
+            ?assertMatch({drop, match_not_found, _}, cbroker:nb_ask(Broker, Lane, offer)),
 
             ?assertEqual(Balance, queue_balance(Broker)),
             drain(Broker, other_lane(Lane), Parked)
@@ -616,7 +619,7 @@ full_lane_still_matches_the_other(_Config) ->
 room_comes_back_once_a_waiter_leaves(_Config) ->
     Broker = cbroker:new([{max_queue_len, 1}]),
     AssertFull = fun() ->
-        ?assertMatch({drop, broker_full, _}, cbroker:dynamic_ask(Broker, left, offer))
+        ?assertMatch({drop, full_lane, _}, cbroker:dynamic_ask(Broker, left, offer))
     end,
 
     [Matched] = park(Broker, left, 1),
@@ -643,7 +646,7 @@ one_sided_limits_leave_the_other_lane_alone(_Config) ->
             Broker = cbroker:new(Opts),
 
             Parked = park(Broker, Limited, 1),
-            ?assertMatch({drop, broker_full, _}, cbroker:dynamic_ask(Broker, Limited, offer)),
+            ?assertMatch({drop, full_lane, _}, cbroker:dynamic_ask(Broker, Limited, offer)),
             drain(Broker, Unlimited, Parked),
 
             drain(Broker, Limited, park(Broker, Unlimited, 50))
@@ -652,6 +655,20 @@ one_sided_limits_leave_the_other_lane_alone(_Config) ->
             {[{max_right_balance, 1}], right},
             {[{min_left_balance, -1}], left}
         ]
+    ).
+
+% Each bound applies to its own lane only: `left` holds three waiters and
+% `right` two, and one more on either is refused
+asymmetric_limits_bound_each_lane_apart(_Config) ->
+    Broker = cbroker:new([{min_left_balance, -3}, {max_right_balance, 2}]),
+
+    lists:foreach(
+        fun({Lane, Room}) ->
+            Parked = park(Broker, Lane, Room),
+            ?assertMatch({drop, full_lane, _}, cbroker:dynamic_ask(Broker, Lane, offer)),
+            drain(Broker, other_lane(Lane), Parked)
+        end,
+        [{left, 3}, {right, 2}]
     ).
 
 %% ------------------------------------------------------------------

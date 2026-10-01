@@ -141,10 +141,9 @@
 
 -type known_drop_reason() ::
     (cancelled
-    | match_unavailable
-    | broker_overloaded
-    | broker_full
-    | broker_closed).
+    | closed
+    | full_lane
+    | too_many_tries).
 -export_type([known_drop_reason/0]).
 
 -type sojourn_time() :: non_neg_integer().
@@ -354,7 +353,7 @@ when
     Lane :: lane(),
     MatchRef :: match_ref(),
     CounterOffer :: term(),
-    DropReason :: drop_reason(),
+    DropReason :: match_not_found | drop_reason(),
     SojournTime :: sojourn_time().
 
 nb_ask(Broker, Lane) ->
@@ -369,7 +368,7 @@ when
     Offer :: term(),
     MatchRef :: match_ref(),
     CounterOffer :: term(),
-    DropReason :: drop_reason(),
+    DropReason :: match_not_found | drop_reason(),
     SojournTime :: sojourn_time().
 
 nb_ask(Broker, Lane, Offer) ->

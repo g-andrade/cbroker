@@ -387,15 +387,15 @@ cbroker_iteration_recur(BrokerRef, Lane, Offer, AskCounter, StartTs, Acc, Overlo
                     [{instant, StartTs, FinalTs} | Acc]
             end;
         %
-        {drop, broker_overloaded, _} ->
+        {drop, too_many_tries, _} ->
             cbroker_iteration_recur(
                 BrokerRef, Lane, Offer, AskCounter, StartTs, Acc, OverloadCount + 1
             );
         %
-        {drop, broker_closed, _} ->
+        {drop, closed, _} ->
             throw(finished_asking)
     catch
-        error:broker_closed ->
+        error:closed ->
             throw(finished_asking)
     end.
 
@@ -435,15 +435,15 @@ blocking_cbroker_iteration_recur(BrokerRef, Lane, Offer, AskCounter, StartTs, Ac
                     [{blocking, StartTs, FinalTs} | Acc]
             end;
         %
-        {drop, broker_overloaded, _} ->
+        {drop, too_many_tries, _} ->
             cbroker_iteration_recur(
                 BrokerRef, Lane, Offer, AskCounter, StartTs, Acc, OverloadCount + 1
             );
         %
-        {drop, broker_closed, _} ->
+        {drop, closed, _} ->
             throw(finished_asking)
     catch
-        error:broker_closed ->
+        error:closed ->
             throw(finished_asking)
     end.
 

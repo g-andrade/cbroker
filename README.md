@@ -1,15 +1,18 @@
+<!-- vim: set spell spelllang=en_us: -->
+
 # cbroker
 
 [![](https://img.shields.io/hexpm/v/cbroker.svg?style=flat)](https://hex.pm/packages/cbroker)
 [![](https://github.com/g-andrade/cbroker/actions/workflows/ci.yml/badge.svg)](https://github.com/g-andrade/cbroker/actions/workflows/ci.yml)
 [![Erlang Versions](https://img.shields.io/badge/Supported%20Erlang%2FOTP-24%20to%2029-blue)](https://www.erlang.org)
 
-`cbroker` provides brokers for Erlang/OTP. Processes enqueue on either of two
-lanes of a broker, meeting and swapping offers. This is useful for worker pools
-and other producer-consumer setups.
+`cbroker` provides brokers for Erlang/OTP.
 
-There is no broker process: matching is done concurrently through a NIF, making
-use of every online ERTS scheduler.
+Processes enqueue on either of two lanes of a broker, meet, and swap offers.
+This is useful for worker pools and other producer-consumer setups.
+
+There is no broker process: matching is done concurrently through a NIF that
+uses every online ERTS scheduler.
 
 ## What it strives for
 
@@ -70,42 +73,66 @@ sequenceDiagram
 
 ## Asking
 
-Every offer goes on a lane (`left` or `right`) and matches the
-roughly-oldest[*] offer on the other lane. The variants differ in what happens
-when there is none yet.
+Every offer goes on a lane (`left` or `right`) and matches one of the oldest[*]
+offers on the other lane. The asking variants differ in what happens when there
+isn't one yet.
 
-| Function        | If no match yet                                         |
-|-----------------|---------------------------------------------------------|
-| `ask`           | waits up to a timeout, then `{drop, timeout, _}`        |
-| `nb_ask`        | returns `{drop, match_unavailable, _}` at once          |
-| `dynamic_ask`   | returns `{await, Ticket}`; the reply arrives as a message |
-| `async_ask`     | always returns `{await, Ticket}`, even if a match is available |
-| `resumable_ask` | waits up to a timeout, then `{timeout, ReplyRef, Ticket}` and stays enqueued |
+- `ask`: if no match, waits up to a timeout, then cancels and returns
+  `{drop, timeout, _}`.
+- `async_ask`: always returns `{await, Ticket}`; the reply arrives as a message.
+- `dynamic_ask`: if no match, returns `{await, Ticket}`.
+- `nb_ask`: if no match, returns `{drop, match_not_found, _}`.
+- `resumable_ask`: similar to `ask` but doesn't cancel upon reaching timeout,
+  instead returning `{timeout, ReplyRef, Ticket}`.
 
 Asynchronous replies arrive as `{Tag, Reply}`, where `Tag` is either the
-`Ticket` or a `ReplyRef` you pass in. `cancel(Ticket)` withdraws an enqueued
-offer.
+`Ticket`, or a `ReplyRef` you passed in. The latter can be of benefit to
+[optimize message reception](https://www.erlang.org/doc/system/eff_guide_processes.html#fetching-received-messages).
 
-[*]: As requests are matched concurrently, the exact order is not
-deterministic.
+[*]: Requests are matched concurrently, so the exact order is not deterministic.
 
 ### Replies
 
 - `{match, MatchRef, CounterOffer, SojournTime}`
-- `{drop, Reason, SojournTime}`, with `Reason` one of:
-  - `timeout`: `ask` gave up
-  - `match_unavailable`: `nb_ask` found no match
-  - `broker_overloaded`: skipped too many cancelled offers
-  - `broker_closed`: the broker closed while you waited
-  - `cancelled`: a concurrent process cancelled the request
+- `{drop, Reason, SojournTime}`
+
+General drop reasons are:
+
+- `cancelled`: a concurrent process cancelled the request
+- `closed`: the broker closed while you waited
+- `full_lane`: the lane already has as many waiters as the
+  [queue limits](#queue-limits) allow
+- `too_many_tries`: too many retries were made internally
+
+Specific drop reasons:
+
+- `match_not_found`: specific to `nb_ask` - it found no match
+- `timeout`: specific to `ask` - it gave up
 
 `SojournTime` is the time spent enqueued, in nanoseconds.
 
+### Cancelling
+
+`cancel(Ticket)` withdraws an enqueued offer:
+
+```erlang
+case cbroker:cancel(my_pool, Ticket) of
+    {cancelled, _SojournTime} ->
+        ok;
+
+    too_late ->
+        todo
+end.
+```
+
+Additionally, the process who enqueued a request will also be monitored, and the
+request cancelled if it dies before getting a match (unless these two events
+happen at roughly the same time).
+
 ## Named brokers
 
-`cbroker:new/0,1` returns a reference; the broker lives as long as it is
-referenced. If you use the option `depends_on_creator`, the broker closes when
-its creator dies.
+`cbroker:new/0,1` returns a reference; the broker then lives for as long as it
+is referenced.
 
 To give it a name and a place in your supervision tree:
 
@@ -116,9 +143,22 @@ cbroker:ask(my_pool, left, Job).
 ```
 
 Names take the same forms as OTP process names:
-* `{local, atom()}`,
-* `{global, term()}`,
-* or `{via, module(), term()}`.
+
+- `{local, atom()}`,
+- `{global, term()}`,
+- or `{via, module(), term()}`.
+
+## Queue limits
+
+An optional limit, `max_queue_len`, may be set when you create a broker. For
+each lane, it will restrict how many more pending requests it may have than the
+other lane.
+
+Every waiting `left` ask increments the queue balance by -1, and every waiting
+`right` increments it by +1.
+
+Alternatively, asymmetrical limits may be configured through the
+`min_left_balance` (negative value) and `max_right_balance` options.
 
 ## How it works
 
@@ -126,9 +166,9 @@ Each ask claims a cell in a shared array by atomically incrementing its lane's
 tail, then comparing-and-swapping its offer in, or taking the offer already
 there.
 
-Arrays are handed out in order from a mutex-guarded pool, and each scheduler
-caches the ones it is using, so the lock is taken once per array rather than
-once per ask.
+Arrays are handed out in order from a mutex-guarded pool. Since each scheduler
+caches the ones it is using, the lock is taken once per array rather than once
+per ask.
 
 TODO: structure diagram (broker → schedulers → batches → cells).
 
