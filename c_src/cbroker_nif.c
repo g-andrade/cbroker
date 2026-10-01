@@ -137,10 +137,11 @@
 
 _Static_assert(ATOMIC_POINTER_LOCK_FREE == 2, "cbroker needs lock-free pointer atomics");
 
-typedef size_t offset_t;
+_Static_assert(sizeof(size_t) <= sizeof(void*) && sizeof(ptrdiff_t) <= sizeof(void*),
+               "cbroker needs its atomic integers to be no wider than a pointer");
 
 typedef uint_fast64_t batch_id_t;
-
+typedef size_t offset_t;
 typedef ptrdiff_t ref_count_t;
 
 //

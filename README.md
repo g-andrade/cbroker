@@ -34,6 +34,9 @@ TODO: one benchmark figure against `cbroker_simple`.
 
 Building needs a C compiler: `cc`/`gcc` on Unix, and MSVC on Windows.
 
+Compilation will fail on platforms in which pointer-sized atomics are not
+lock-free.
+
 ## Quick start
 
 We have a worker pool. Clients offer jobs on the `left`; workers offer
