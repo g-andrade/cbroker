@@ -69,7 +69,20 @@
     full_lane_still_matches_the_other/1,
     room_comes_back_once_a_waiter_leaves/1,
     one_sided_limits_leave_the_other_lane_alone/1,
-    asymmetric_limits_bound_each_lane_apart/1
+    asymmetric_limits_bound_each_lane_apart/1,
+    %
+    default_offer_is_the_asker/1,
+    resumable_ask_returns_a_ready_match/1,
+    resumable_ask_waits_for_a_match/1,
+    resumable_ask_stays_enqueued_on_timeout/1,
+    %
+    child_spec_defaults_to_no_opts/1,
+    named_broker_is_asked_by_name/1,
+    named_broker_takes_opts/1,
+    stopping_closes_and_forgets_the_name/1,
+    crashing_keeps_the_name_until_restarted/1,
+    unknown_and_invalid_names_are_rejected/1,
+    named_server_survives_what_it_does_not_handle/1
 ]).
 
 %% ------------------------------------------------------------------
@@ -144,6 +157,29 @@ groups() ->
                 room_comes_back_once_a_waiter_leaves,
                 one_sided_limits_leave_the_other_lane_alone,
                 asymmetric_limits_bound_each_lane_apart
+            ]
+        },
+        {
+            defaults_and_resuming,
+            [parallel],
+            [
+                default_offer_is_the_asker,
+                resumable_ask_returns_a_ready_match,
+                resumable_ask_waits_for_a_match,
+                resumable_ask_stays_enqueued_on_timeout
+            ]
+        },
+        {
+            named,
+            [parallel],
+            [
+                child_spec_defaults_to_no_opts,
+                named_broker_is_asked_by_name,
+                named_broker_takes_opts,
+                stopping_closes_and_forgets_the_name,
+                crashing_keeps_the_name_until_restarted,
+                unknown_and_invalid_names_are_rejected,
+                named_server_survives_what_it_does_not_handle
             ]
         }
     ].
@@ -671,6 +707,187 @@ asymmetric_limits_bound_each_lane_apart(_Config) ->
         [{left, 3}, {right, 2}]
     ).
 
+%%
+
+% Without an offer, an ask offers its own pid. The counterpart is parked
+% beforehand, so the default timeouts never come into play
+default_offer_is_the_asker(Config) ->
+    Broker = broker(Config),
+    Self = self(),
+
+    lists:foreach(
+        fun(AskFun) ->
+            {await, Ticket} = cbroker:async_ask(Broker, left),
+            ?assertMatch({match, _, Self, _}, AskFun()),
+            ?assertMatch({match, _, Self, _}, await(Ticket))
+        end,
+        [
+            fun() -> cbroker:ask(Broker, right) end,
+            fun() -> cbroker:ask(Broker, right, Self) end,
+            fun() -> cbroker:nb_ask(Broker, right) end,
+            fun() -> cbroker:dynamic_ask(Broker, right) end,
+            fun() -> cbroker:resumable_ask(Broker, right) end,
+            fun() -> cbroker:resumable_ask(Broker, right, Self) end
+        ]
+    ).
+
+resumable_ask_returns_a_ready_match(Config) ->
+    Broker = broker(Config),
+
+    {await, Ticket} = cbroker:async_ask(Broker, left, offer_l),
+    ?assertMatch({match, _, offer_l, _}, cbroker:resumable_ask(Broker, right, offer_r, 5_000)),
+    ?assertMatch({match, _, offer_r, _}, await(Ticket)).
+
+resumable_ask_waits_for_a_match(Config) ->
+    Broker = broker(Config),
+
+    % Only asks once we're parked, so that we do have to wait
+    _ = spawn_link(fun() ->
+        wait_until(fun() -> pending_cells(Broker) =/= [] end),
+        {match, _, offer_l, _} = cbroker:nb_ask(Broker, right, offer_r)
+    end),
+
+    ?assertMatch({match, _, offer_r, _}, cbroker:resumable_ask(Broker, left, offer_l, 5_000)).
+
+% On timeout the ask is still there: it can be matched later, or cancelled
+resumable_ask_stays_enqueued_on_timeout(Config) ->
+    Broker = broker(Config),
+
+    {timeout, ReplyRef, _Ticket} = cbroker:resumable_ask(Broker, left, offer_l, 0),
+    ?assertMatch({match, _, offer_l, _}, cbroker:nb_ask(Broker, right, offer_r)),
+    ?assertMatch({match, _, offer_r, _}, await(ReplyRef)),
+
+    {timeout, _, Ticket} = cbroker:resumable_ask(Broker, left, offer_l, 0),
+    ?assertMatch({cancelled, _}, cbroker:cancel(Ticket)).
+
+%%
+
+child_spec_defaults_to_no_opts(_Config) ->
+    RegName = {local, cbroker_spec_test},
+    ?assertEqual(cbroker:child_spec(RegName, []), cbroker:child_spec(RegName)).
+
+% Whatever takes a broker takes its name, in any of its forms, and reaches
+% the very same broker as the reference the name resolves to
+named_broker_is_asked_by_name(_Config) ->
+    lists:foreach(
+        fun({RegName, Name}) ->
+            Server = start_named(RegName, []),
+            Broker = cbroker:resolve_name(Name),
+            ?assertEqual(Broker, cbroker:resolve_name(RegName)),
+            ?assertEqual(cbroker:debug_info(Broker), cbroker:debug_info(Name)),
+
+            % Parked through the reference, matched through the name
+            lists:foreach(
+                fun(AskByName) ->
+                    {await, Ticket} = cbroker:async_ask(Broker, left, offer_l),
+                    ?assertMatch({match, _, offer_l, _}, AskByName()),
+                    ?assertMatch({match, _, offer_r, _}, await(Ticket))
+                end,
+                [
+                    fun() -> cbroker:ask(Name, right, offer_r, 5_000) end,
+                    fun() -> cbroker:nb_ask(Name, right, offer_r) end,
+                    fun() -> cbroker:dynamic_ask(Name, right, offer_r, ticket) end,
+                    fun() -> cbroker:resumable_ask(Name, right, offer_r, 5_000) end
+                ]
+            ),
+
+            % And the other way around
+            {await, ByName} = cbroker:async_ask(Name, left, offer_l, ticket),
+            ?assertMatch({match, _, offer_l, _}, cbroker:nb_ask(Broker, right, offer_r)),
+            ?assertMatch({match, _, offer_r, _}, await(ByName)),
+
+            ok = gen_server:stop(Server)
+        end,
+        [
+            {{local, cbroker_named_test}, cbroker_named_test},
+            {{global, {?MODULE, global}}, {global, {?MODULE, global}}},
+            {{via, global, {?MODULE, via}}, {via, global, {?MODULE, via}}}
+        ]
+    ).
+
+% Options reach the broker, except that it always depends on its server
+named_broker_takes_opts(_Config) ->
+    Name = cbroker_opts_test,
+    Server = start_named({local, Name}, [{depends_on_creator, false}, {max_queue_len, 3}]),
+
+    ?assertEqual(true, opt(depends_on_creator, Name)),
+    ?assertEqual({-3, 3}, {opt(min_left_balance, Name), opt(max_right_balance, Name)}),
+
+    ok = gen_server:stop(Server).
+
+% A server that stops for a healthy reason closes its broker and gives up
+% the name
+stopping_closes_and_forgets_the_name(_Config) ->
+    Name = cbroker_stopping_test,
+
+    lists:foreach(
+        fun(Reason) ->
+            Server = start_named({local, Name}, []),
+            {await, Ticket} = cbroker:async_ask(Name, left, offer_l),
+
+            ok = gen_server:stop(Server, Reason, 5_000),
+
+            ?assertMatch({drop, closed, _}, await(Ticket)),
+            ?assertError({broker_not_found, Name}, cbroker:resolve_name(Name)),
+            ?assertError({broker_not_found, Name}, cbroker:nb_ask(Name, right, offer_r))
+        end,
+        [normal, shutdown, {shutdown, restarting}]
+    ).
+
+% After a crash the name still points at the closed broker, so that asks fail
+% as `closed` until a restarted server replaces it
+crashing_keeps_the_name_until_restarted(_Config) ->
+    Name = cbroker_crashing_test,
+    Server = start_named({local, Name}, []),
+    Broker = cbroker:resolve_name(Name),
+    {await, Ticket} = cbroker:async_ask(Name, left, offer_l),
+
+    ok = gen_server:stop(Server, crashed, 5_000),
+
+    ?assertMatch({drop, closed, _}, await(Ticket)),
+    ?assertEqual(Broker, cbroker:resolve_name(Name)),
+    ?assertError(closed, cbroker:nb_ask(Name, right, offer_r)),
+
+    Restarted = start_named({local, Name}, []),
+    ?assertNotEqual(Broker, cbroker:resolve_name(Name)),
+    ?assertMatch({drop, match_not_found, _}, cbroker:nb_ask(Name, right, offer_r)),
+
+    ok = gen_server:stop(Restarted).
+
+unknown_and_invalid_names_are_rejected(_Config) ->
+    Unknown = cbroker_unknown_test,
+    ?assertError({broker_not_found, Unknown}, cbroker:resolve_name(Unknown)),
+    ?assertError({broker_not_found, Unknown}, cbroker:nb_ask(Unknown, left, offer_l)),
+    ?assertError({broker_not_found, Unknown}, cbroker:debug_info(Unknown)),
+
+    lists:foreach(
+        fun(Name) -> ?assertError({invalid_name, Name}, cbroker:resolve_name(Name)) end,
+        ["name", {local, "name"}, {via, "module", name}, {elsewhere, name}]
+    ).
+
+% Unknown calls and casts are ignored, and a code change keeps the state as
+% long as it recognizes it
+named_server_survives_what_it_does_not_handle(_Config) ->
+    Name = cbroker_unhandled_test,
+    Server = start_named({local, Name}, []),
+
+    ?assertExit({timeout, _}, gen_server:call(Server, unknown_call, 100)),
+    ok = gen_server:cast(Server, unknown_cast),
+
+    ok = sys:suspend(Server),
+    ?assertEqual(ok, sys:change_code(Server, cbroker_persistent, undefined, [])),
+    Unknown = sys:replace_state(Server, fun(Known) -> {unknown, Known} end),
+    % `sys` wraps whatever isn't `{ok, _}` in an error of its own
+    ?assertEqual(
+        {error, {error, {cannot_convert_state, Unknown}}},
+        sys:change_code(Server, cbroker_persistent, undefined, [])
+    ),
+    _ = sys:replace_state(Server, fun({unknown, Known}) -> Known end),
+    ok = sys:resume(Server),
+
+    ?assertMatch({drop, match_not_found, _}, cbroker:nb_ask(Name, left, offer_l)),
+    ok = gen_server:stop(Server).
+
 %% ------------------------------------------------------------------
 %% Internal Function Definitions
 %% ------------------------------------------------------------------
@@ -791,6 +1008,14 @@ local_pool_counts(Pool, Broker) ->
         Count
      || LocalState <- debug_value(local_states, Broker), {P, Count} <- LocalState, P =:= Pool
     ].
+
+% Starts a named broker's server from its child spec, as a supervisor would.
+% Unlinked, so that stopping it for any reason doesn't take the test case along
+start_named(RegName, Opts) ->
+    #{start := {Module, Function, Args}} = cbroker:child_spec(RegName, Opts),
+    {ok, Server} = apply(Module, Function, Args),
+    true = unlink(Server),
+    Server.
 
 % A broker created by a process of its own, which lives until `stop_creator/1`
 broker_with_creator(Opts) ->
