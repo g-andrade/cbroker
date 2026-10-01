@@ -131,7 +131,9 @@ to an allocation.
 ```mermaid
 flowchart TD
     A[load cell] --> E{empty?}
-    E -- yes, nb_ask --> NB[undo the counter increment,<br/>or else CAS cell to cancelled] --> U[drop: match_not_found]
+    E -- yes, nb_ask --> NB[undo the counter increment,<br/>or else CAS cell to cancelled]
+    NB -- either worked --> U[drop: match_not_found]
+    NB -- both lost --> X
     E -- yes --> Q[CAS empty to our request]
     Q -- won --> W["{await, Ticket}"]
     Q -- lost --> X
