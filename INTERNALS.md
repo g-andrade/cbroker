@@ -132,16 +132,16 @@ to an allocation.
 flowchart TD
     A[load cell] --> E{empty?}
     E -- yes, nb_ask --> NB[undo the counter increment,<br/>or else CAS cell to cancelled]
+    E -- no --> X{cancelled?}
+    E -- yes --> Q[CAS empty to our request]
     NB -- either worked --> U[drop: match_not_found]
     NB -- both lost --> X
-    E -- yes --> Q[CAS empty to our request]
-    Q -- won --> W["{await, Ticket}"]
     Q -- lost --> X
-    E -- no --> X{cancelled?}
+    Q -- won --> W["{await, Ticket}"]
     X -- yes --> N[next cell]
     X -- no, waiting --> M[CAS request to matched]
-    M -- won --> D[demonitor its ticket, deliver the match]
     M -- lost: cancelled meanwhile --> N
+    M -- won --> D[demonitor its ticket, deliver the match]
 
     classDef final stroke-width:4px
     classDef retry stroke-width:2px
