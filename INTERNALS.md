@@ -120,7 +120,7 @@ to an allocation.
 ### Asking
 
 1. Add either -1 or +1 to the queue balance, depending on the lane. If that
-   crosses a limit, revert the increment and drop with `full_lane` (see
+   crosses a limit, revert the increment and drop with reason `full_lane` (see
    [Queue limits](README.md#queue-limits)).
 2. Pick the caller's local state and its tail batch for the lane.
 3. `fetch_add` the lane's counter in the batch to claim an offset. If the
