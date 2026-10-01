@@ -92,7 +92,7 @@ STRESS_ITERATIONS ?= 20000
 stress: export CBROKER_STRESS_PROCS_PER_LANE = $(STRESS_PROCS_PER_LANE)
 stress: export CBROKER_STRESS_ITERATIONS = $(STRESS_ITERATIONS)
 stress:
-	@rebar3 ct --suite=test/cbroker_stress_SUITE
+	@rebar3 ct --suite=test/cbroker_stress_SUITE --cover_export_name=stress
 .PHONY: stress
 
 # Runs the CT suites against an instrumented NIF: ASan+UBSan plus the allocation
