@@ -186,6 +186,16 @@ per ask.
 
 Details: [INTERNALS.md](INTERNALS.md).
 
+## AI disclaimer
+
+An LLM was used in this project:
+
+- to make it build on Windows;
+- to help write tests;
+- to pre-fill parts of the documentation, which were then heavily edited by me;
+- as a rubber duck for some of the API semantics;
+- to debug some errors.
+
 ## License
 
 [MIT](LICENSE)
