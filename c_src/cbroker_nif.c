@@ -2098,7 +2098,7 @@ static void broker_cancel_all_batch_cells(ErlNifEnv* env, broker_t* broker,
                                           ERL_NIF_TERM broker_term, local_state_t* local_state,
                                           batch_t* batch, bool did_broker_close)
 {
-    atomic_size_t consumed_count = atomic_load(&batch->consumed_count);
+    size_t consumed_count = atomic_load(&batch->consumed_count);
     if (consumed_count >= batch->nr_of_cells) {
         return;
     }
