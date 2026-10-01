@@ -1,14 +1,26 @@
 # cbroker
 
-FIXME: one-paragraph description of what `cbroker` is and does.
+`cbroker` provides brokers for Erlang/OTP: processes enqueue on either of two
+lanes (`left` or `right`), meet, and swap offers, as in worker pools and other
+producer-consumer setups. There is no broker process; matching is done
+concurrently by a NIF, on whichever scheduler the asking process runs. See
+`README.md` for the API and `INTERNALS.md` for the algorithm.
 
 ## Architecture
 
-`cbroker` is an OTP application. `cbroker_app` is the `application` callback
-module (started via the `mod` entry in `cbroker.app.src`); it starts
-`cbroker_sup`, the top-level `one_for_one` supervisor. Add child specs in
-`cbroker_sup:child_specs/0`. Both modules are internal (`-moduledoc false`);
-`cbroker` is the public API module.
+`cbroker` is a library application: it has no `application` callback module and
+no supervision tree of its own.
+
+- `cbroker` is the public API module. A broker is a NIF resource, returned by
+  `new/0,1` as a reference.
+- `cbroker_nif` holds the NIF stubs and loads `priv/cbroker`. The algorithm
+  lives in `c_src/cbroker_nif.c`; `c_src/cbroker_omap.c` is the ordered map it
+  keeps batches in.
+- `cbroker_persistent` is the `gen_server` behind named brokers
+  (`cbroker:child_spec/1,2`). It creates the broker, keeps it in
+  `persistent_term`, and is the process users place in their own supervision
+  tree.
+- `cbroker_utils` holds small helpers.
 
 ## Build, test, check
 

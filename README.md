@@ -14,13 +14,13 @@ This is useful for worker pools and other producer-consumer setups.
 There is no broker process: matching is done concurrently through a NIF that
 uses every online ERTS scheduler.
 
-## What it strives for
+API semantics were inspired by [sbroker](https://hex.pm/packages/sbroker).
+
+## Objectives
 
 - **No bottleneck process**: `cbroker` contends only on a few atomic counters
-  and an infrequent global lock;
+  and an infrequent global lock.
 - **Offers are copied concurrently**, by the processes that match them.
-- **Familiar model.** Offers (asks and bids), matches and drops follow
-  [`sbroker`](https://hex.pm/packages/sbroker), which inspired it.
 
 TODO: one benchmark figure against `cbroker_simple`.
 
@@ -102,7 +102,8 @@ General drop reasons are:
 - `closed`: the broker closed while you waited
 - `full_lane`: the lane already has as many waiters as the
   [queue limits](#queue-limits) allow
-- `too_many_tries`: too many retries were made internally
+- `too_many_tries`: too many cells were attempted without managing to match or
+  enqueue
 
 Specific drop reasons:
 
@@ -116,17 +117,17 @@ Specific drop reasons:
 `cancel(Ticket)` withdraws an enqueued offer:
 
 ```erlang
-case cbroker:cancel(my_pool, Ticket) of
+case cbroker:cancel(Ticket) of
     {cancelled, _SojournTime} ->
         ok;
 
     too_late ->
-        todo
+        reply_in_process_inbox
 end.
 ```
 
-Additionally, the process who enqueued a request will also be monitored, and the
-request cancelled if it dies before getting a match (unless these two events
+Additionally, the process that enqueued a request will also be monitored, and
+the request cancelled if it dies before getting a match (unless these two events
 happen at roughly the same time).
 
 ## Named brokers
@@ -152,13 +153,14 @@ Names take the same forms as OTP process names:
 
 An optional limit, `max_queue_len`, may be set when you create a broker. For
 each lane, it will restrict how many more pending requests it may have than the
-other lane.
+other lane. See [Broker options](INTERNALS.md#broker-options).
 
-Every waiting `left` ask increments the queue balance by -1, and every waiting
-`right` increments it by +1.
+Every waiting `left` ask adds -1 to the queue balance, and every waiting `right`
+ask adds +1. A request that would take the balance past the limit returns
+`{drop, full_lane, _}` instead.
 
-Alternatively, asymmetrical limits may be configured through the
-`min_left_balance` (negative value) and `max_right_balance` options.
+Alternatively, the limit may be asymmetrical by using the `min_left_balance`
+(negative value) and `max_right_balance` options.
 
 ## How it works
 
@@ -166,11 +168,18 @@ Each ask claims a cell in a shared array by atomically incrementing its lane's
 tail, then comparing-and-swapping its offer in, or taking the offer already
 there.
 
+Each lane claims cells in order, and wherever both lanes have reached a cell,
+the two asks match. For example, after three `left` asks and two `right` ones:
+
+| Cell    | 0       | 1       | 2       | 3     |
+| ------- | ------- | ------- | ------- | ----- |
+| `left`  | 1st ask | 2nd ask | 3rd ask |       |
+| `right` | 1st ask | 2nd ask |         |       |
+| State   | matched | matched | waiting | empty |
+
 Arrays are handed out in order from a mutex-guarded pool. Since each scheduler
 caches the ones it is using, the lock is taken once per array rather than once
 per ask.
-
-TODO: structure diagram (broker → schedulers → batches → cells).
 
 Details: [INTERNALS.md](INTERNALS.md).
 
