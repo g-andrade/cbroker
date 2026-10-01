@@ -148,7 +148,19 @@
 
 //
 
+#if defined(_MSC_VER) && !defined(__clang__)
+/* MSVC's ATOMIC_POINTER_LOCK_FREE isn't 2, although its atomics are lock-free
+ * for "objects with sizes <= 8 and exactly equal to a power of two". That is
+ * only documented for x86 and x64:
+ * https://devblogs.microsoft.com/cppblog/c11-atomics-in-visual-studio-2022-version-17-5-preview-2/
+ */
+#if !defined(_M_IX86) && (!defined(_M_X64) || defined(_M_ARM64EC))
+#error "cbroker hasn't confirmed lock-free atomics for MSVC on this architecture"
+#endif
+_Static_assert(sizeof(void*) <= 8, "cbroker needs lock-free pointer atomics");
+#else
 _Static_assert(ATOMIC_POINTER_LOCK_FREE == 2, "cbroker needs lock-free pointer atomics");
+#endif
 
 _Static_assert(sizeof(size_t) <= sizeof(void*) && sizeof(ptrdiff_t) <= sizeof(void*),
                "cbroker needs its atomic integers to be no wider than a pointer");
