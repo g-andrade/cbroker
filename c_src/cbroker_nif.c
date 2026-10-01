@@ -135,11 +135,11 @@
 
 //
 
-typedef uint_fast64_t offset_t;
+_Static_assert(ATOMIC_POINTER_LOCK_FREE == 2, "cbroker needs lock-free pointer atomics");
 
-typedef offset_t batch_id_t;
+typedef size_t offset_t;
 
-//
+typedef uint_fast64_t batch_id_t;
 
 typedef ptrdiff_t ref_count_t;
 
@@ -254,17 +254,8 @@ typedef struct {
 
 //
 
-#define ROLLING_AVG_SIZE 128
-
-typedef struct {
-    atomic_size_t count;
-    _Atomic(int64_t) sum;
-    _Atomic(int64_t) samples[ROLLING_AVG_SIZE];
-} rolling_avg_t;
-
 typedef struct {
     _Atomic(queue_balance_t) queue_balance;
-    rolling_avg_t credits_left;
 } stats_t;
 
 //
@@ -543,10 +534,7 @@ static ERL_NIF_TERM mempool_to_term(ErlNifEnv* env, mempool_t* pool);
 static queue_balance_t stats_queue_balance_add(stats_t* stats, queue_balance_t weight);
 static void stats_queue_balance_sub(stats_t* stats, queue_balance_t weight);
 
-static void stats_push_after_ask(stats_t* stats, int credits_left);
 static ERL_NIF_TERM stats_to_term(ErlNifEnv* env, stats_t* stats);
-static void rolling_avg_push(rolling_avg_t* rolling_avg, int64_t sample);
-static ERL_NIF_TERM rolling_avg_to_term(ErlNifEnv* env, rolling_avg_t* rolling_avg);
 
 //
 
@@ -919,7 +907,6 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     ctx.nif_res = Atoms._none;
 
     ask_result_t ask_res = ask_loop(&ctx);
-    stats_push_after_ask(&ctx.broker->stats, ctx.credits);
 
     //
 
@@ -2735,47 +2722,15 @@ static void stats_queue_balance_sub(stats_t* stats, queue_balance_t weight)
     atomic_fetch_sub_explicit(&stats->queue_balance, weight, memory_order_relaxed);
 }
 
-static void stats_push_after_ask(stats_t* stats, int credits_left)
-{
-    rolling_avg_push(&stats->credits_left, credits_left);
-}
-
 static ERL_NIF_TERM stats_to_term(ErlNifEnv* env, stats_t* stats)
 {
     queue_balance_t queue_balance =
         atomic_load_explicit(&stats->queue_balance, memory_order_relaxed);
 
-    return enif_make_list2(
+    return enif_make_list1(
         env,
         //
-        enif_make_tuple2(env, Atoms._queue_balance, enif_make_int64(env, queue_balance)),
-        //
-        enif_make_tuple2(env, Atoms._credits_left, rolling_avg_to_term(env, &stats->credits_left)));
-}
-
-static void rolling_avg_push(rolling_avg_t* rolling_avg, int64_t sample)
-{
-    size_t prev_count = atomic_fetch_add_explicit(&rolling_avg->count, 1, memory_order_relaxed);
-    size_t idx = prev_count % ROLLING_AVG_SIZE;
-    int64_t prev_sample = atomic_exchange(&rolling_avg->samples[idx], sample);
-    atomic_fetch_add_explicit(&rolling_avg->sum, prev_sample, memory_order_relaxed);
-}
-
-static ERL_NIF_TERM rolling_avg_to_term(ErlNifEnv* env, rolling_avg_t* rolling_avg)
-{
-    size_t count = atomic_load_explicit(&rolling_avg->count, memory_order_relaxed);
-    int64_t sum = atomic_load_explicit(&rolling_avg->sum, memory_order_relaxed);
-
-    ERL_NIF_TERM avg_key = (count > ROLLING_AVG_SIZE + 20) ? Atoms._avg : Atoms._approx_avg;
-    double avg = (count == 0 ? 0.0 : (double)sum / (double)count);
-
-    return enif_make_list3(env,
-                           //
-                           enif_make_tuple2(env, Atoms._count, enif_make_uint64(env, count)),
-                           //
-                           enif_make_tuple2(env, Atoms._sum, enif_make_int64(env, sum)),
-                           //
-                           enif_make_tuple2(env, avg_key, enif_make_double(env, avg)));
+        enif_make_tuple2(env, Atoms._queue_balance, enif_make_int64(env, queue_balance)));
 }
 
 /*********************************************************************/
