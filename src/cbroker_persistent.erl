@@ -71,6 +71,12 @@
 -record(state, {key :: term()}).
 -type state() :: #state{}.
 
+-if(?OTP_RELEASE >= 25).
+-type request_from() :: gen_server:from().
+-else.
+-type request() :: {pid(), reference()}.
+-endif.
+
 %% ------------------------------------------------------------------
 %% Static Check Tweaks
 %% ------------------------------------------------------------------
@@ -131,7 +137,7 @@ init([Name, Opts]) ->
     persistent_term:put(Key, Broker),
     {ok, #state{key = Key}}.
 
--spec handle_call(term(), gen_server:from(), state()) -> {noreply, state()}.
+-spec handle_call(term(), request_from(), state()) -> {noreply, state()}.
 handle_call(Request, From, State) ->
     logger:info("Ignoring unknown request from ~p: ~p", [From, Request]),
     {noreply, State}.
