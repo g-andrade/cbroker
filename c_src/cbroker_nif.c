@@ -43,8 +43,6 @@
 #define ASK_DEFAULT_CREDITS 400
 #define ASK_DEFAULT_MAX_TRIES 10
 
-//
-
 #define BATCH_POOL_SIZE 4
 #define BATCH_POOL_INITIAL_COUNT 1
 
@@ -53,6 +51,9 @@
 
 #define TICKET_POOL_DEFAULT_SIZE 8
 #define TICKET_POOL_DEFAULT_INITIAL_COUNT 0
+
+// in bytes
+#define SHARED_ENV_DEFAULT_BUDGET (16 * 1024)
 
 //
 
@@ -108,6 +109,7 @@
     X(_right,                 "right") \
     X(_right_tail,            "right_tail") \
     X(_schedulers,            "schedulers") \
+    X(_shared_env_budget,     "shared_env_budget") \
     X(_size,                  "size") \
     X(_stats,                 "stats") \
     X(_ticket,                "ticket") \
@@ -180,8 +182,25 @@ typedef ptrdiff_t queue_balance_t;
 
 //
 
+typedef ptrdiff_t budget_counter_t;
+#define BUDGET_COUNTER_MAX PTRDIFF_MAX
+
+//
+
+/* An env shared by the requests a scheduler enqueues. Only that scheduler
+ * writes to it; others read their request's terms. Referenced by the local
+ * state, while it has budget left, and by each of its requests. */
 typedef struct {
     ErlNifEnv* env;
+    _Atomic(ref_count_t) ref_count;
+    budget_counter_t bytes_left; // updated by local scheduler only
+    ErlNifTime last_checkout;    // updated by local scheduler only
+} shenv_t;
+
+//
+
+typedef struct {
+    shenv_t* shenv;
     //
     ErlNifTime enqueue_ts;
     ErlNifPid pid;
@@ -190,7 +209,7 @@ typedef struct {
     queue_balance_t weight;
     ERL_NIF_TERM reply_ref;
     //
-    ERL_NIF_TERM broker_term;
+    void* broker;
     batch_id_t batch_id;
     offset_t offset;
     void* ticket;
@@ -255,6 +274,7 @@ typedef struct {
     //
     mempool_t request_pool;
     mempool_t ticket_pool;
+    shenv_t* shenv;
 } local_state_t;
 
 //
@@ -267,14 +287,15 @@ typedef struct {
 //
 
 typedef struct {
-    bool depends_on_creator;
-    size_t cells_per_batch;
-    queue_balance_t min_left_balance;  // negative, or +1 to signal unlimited
-    queue_balance_t max_right_balance; // positive, or -1 to signal unlimited
     int ask_credits;
     size_t ask_max_tries;
     pool_opts_t batch_pool;
+    size_t cells_per_batch;
+    bool depends_on_creator;
+    queue_balance_t max_right_balance; // positive, or -1 to signal unlimited
+    queue_balance_t min_left_balance;  // negative, or +1 to signal unlimited
     pool_opts_t request_pool;
+    size_t shared_env_budget;
     pool_opts_t ticket_pool;
 } broker_opts_t;
 
@@ -354,7 +375,6 @@ typedef struct {
     ErlNifPid self;
     ERL_NIF_TERM self_term;
     //
-    ERL_NIF_TERM broker_term;
     ERL_NIF_TERM lane;
     ERL_NIF_TERM offer;
     ptrdiff_t offer_size; // negative when it hasn't been computed yet
@@ -417,6 +437,7 @@ static ERL_NIF_TERM nif_alloc_perfcounters(ErlNifEnv* env, int argc, const ERL_N
 
 //
 
+static void broker_opts_init(broker_opts_t* opts, const size_t schedulers);
 static size_t new_broker_size(const size_t schedulers);
 static batch_t* global_state_init(global_state_t* global_state, const broker_opts_t* opts);
 static void global_state_close(global_state_t* global_state);
@@ -452,13 +473,13 @@ static void ask_loop_tail_skip_consumed_opposite(ask_ctx_t* ctx, batch_id_t next
 static request_t* ask_loop_request_prepare(ask_ctx_t* ctx, const batch_id_t batch_id,
                                            const offset_t offset);
 static void ask_loop_request_new(ask_ctx_t* ctx);
+static size_t ask_loop_request_ensure_offer_size(ask_ctx_t* ctx);
 
 static void ask_reply_await(ask_ctx_t* ctx);
 static void ask_reply_match(ask_ctx_t* ctx);
 static void ask_reply_match_notify_other(ask_ctx_t* ctx, ERL_NIF_TERM match_ref,
                                          ERL_NIF_TERM counter_ref_copy);
 static ERL_NIF_TERM ask_reply_match_self(ask_ctx_t* ctx, ERL_NIF_TERM match_ref);
-static void ask_reply_nomatch(ask_ctx_t* ctx);
 static void ask_reply_closed(ask_ctx_t* ctx);
 
 static bool ask_retry_can(ask_ctx_t* ctx);
@@ -470,9 +491,12 @@ static void ask_drop(ask_ctx_t* ctx, drop_reason_t reason);
 //
 
 static bool request_demonitor(ErlNifEnv* caller_env, request_t* request);
-static void request_reclaim(request_t* request, bool ticket_used, local_state_t* opt_local_state);
+static void request_reclaim(request_t* request, bool ticket_used, local_state_t* opt_local_state,
+                            bool release_broker);
+
 static bool request_demonitor_and_reclaim(ErlNifEnv* caller_env, request_t* request,
-                                          bool ticket_used, local_state_t* local_state);
+                                          bool ticket_used, local_state_t* local_state,
+                                          bool release_broker);
 
 //
 
@@ -555,6 +579,14 @@ static void* mempool_get(mempool_t* pool, void* alloc_ctx);
 static void mempool_return(mempool_t* pool, void* obj);
 static void mempool_destroy(mempool_t* pool);
 static ERL_NIF_TERM mempool_to_term(ErlNifEnv* env, mempool_t* pool);
+
+//
+
+static shenv_t* shenv_checkout(shenv_t** shenv_ptr, const broker_opts_t* broker_opts);
+static void shenv_inform(shenv_t** shenv_ptr, const size_t copied_bytes);
+static void shenv_checkin(shenv_t** shenv_ptr);
+static void shenv_gc(shenv_t** shenv_ptr, const broker_opts_t* broker_opts);
+static void shenv_destroy(shenv_t** shenv_ptr);
 
 //
 
@@ -785,22 +817,7 @@ static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     assert(schedulers > 0);
 
     broker_opts_t opts;
-    memset(&opts, 0, sizeof(broker_opts_t));
-
-    opts.cells_per_batch = 32 * schedulers;
-    opts.min_left_balance = QUEUE_BALANCE_UNLIMITED_LEFT;
-    opts.max_right_balance = QUEUE_BALANCE_UNLIMITED_RIGHT;
-    opts.ask_credits = ASK_DEFAULT_CREDITS;
-    opts.ask_max_tries = ASK_DEFAULT_MAX_TRIES;
-
-    opts.batch_pool.size = BATCH_POOL_SIZE;
-    opts.batch_pool.initial_count = BATCH_POOL_INITIAL_COUNT;
-
-    opts.request_pool.size = REQUEST_POOL_DEFAULT_SIZE;
-    opts.request_pool.initial_count = REQUEST_POOL_DEFAULT_INITIAL_COUNT;
-
-    opts.ticket_pool.size = TICKET_POOL_DEFAULT_SIZE;
-    opts.ticket_pool.initial_count = TICKET_POOL_DEFAULT_INITIAL_COUNT;
+    broker_opts_init(&opts, schedulers);
 
     if (argc > 0) {
         ERL_NIF_TERM opts_res = get_broker_opts(env, argv[0], &opts);
@@ -850,7 +867,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     assert(argc == 6);
 
-    ctx.broker_term = argv[0];
+    ERL_NIF_TERM broker_term = argv[0];
     ERL_NIF_TERM lane = argv[1];
     ctx.offer = argv[2];
 
@@ -864,8 +881,8 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     //
 
-    if (!get_broker(env, ctx.broker_term, &ctx.broker)) {
-        return make_badarg(env, ctx.broker_term);
+    if (!get_broker(env, broker_term, &ctx.broker)) {
+        return make_badarg(env, broker_term);
     }
 
     if (lane == Atoms._left) {
@@ -947,7 +964,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             enif_release_resource(ctx.counter_request->ticket);
         }
         else {
-            request_reclaim(ctx.counter_request, true, ctx.local_state);
+            request_reclaim(ctx.counter_request, true, ctx.local_state, true);
         }
         ctx.counter_request = NULL;
     }
@@ -977,7 +994,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     if (ctx.request != NULL) {
         bool demonitor_res =
-            request_demonitor_and_reclaim(env, ctx.request, false, ctx.local_state);
+            request_demonitor_and_reclaim(env, ctx.request, false, ctx.local_state, true);
         assert(demonitor_res);
         ctx.request = NULL;
         ctx.ticket_term = Atoms._none;
@@ -1024,9 +1041,11 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
     LOG("[cancel] Request batch id: %llu", request->batch_id);
     LOG("[cancel] Request offset: %llu", request->offset);
 
-    broker_t* broker = NULL;
-    int get_broker_res = get_broker(request->env, request->broker_term, &broker);
-    assert(get_broker_res);
+    shenv_t* shenv = request->shenv;
+    assert(shenv != NULL);
+
+    broker_t* broker = (broker_t*)request->broker;
+    assert(broker != NULL);
 
     local_state_t* local_state = broker_local_state(broker);
     assert(local_state != NULL);
@@ -1082,7 +1101,7 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
         }
 
         LOG("[cancel] Reclaiming request %p", request);
-        request_reclaim(request, true, local_state);
+        request_reclaim(request, true, local_state, true);
         request = NULL;
     }
 
@@ -1170,6 +1189,28 @@ static ERL_NIF_TERM nif_alloc_perfcounters(ErlNifEnv* env, int argc, const ERL_N
 
 /*********************************************************************/
 
+static void broker_opts_init(broker_opts_t* opts, const size_t schedulers)
+{
+    memset(opts, 0, sizeof(broker_opts_t));
+
+    opts->cells_per_batch = 32 * schedulers;
+    opts->min_left_balance = QUEUE_BALANCE_UNLIMITED_LEFT;
+    opts->max_right_balance = QUEUE_BALANCE_UNLIMITED_RIGHT;
+    opts->ask_credits = ASK_DEFAULT_CREDITS;
+    opts->ask_max_tries = ASK_DEFAULT_MAX_TRIES;
+
+    opts->batch_pool.size = BATCH_POOL_SIZE;
+    opts->batch_pool.initial_count = BATCH_POOL_INITIAL_COUNT;
+
+    opts->request_pool.size = REQUEST_POOL_DEFAULT_SIZE;
+    opts->request_pool.initial_count = REQUEST_POOL_DEFAULT_INITIAL_COUNT;
+
+    opts->ticket_pool.size = TICKET_POOL_DEFAULT_SIZE;
+    opts->ticket_pool.initial_count = TICKET_POOL_DEFAULT_INITIAL_COUNT;
+
+    opts->shared_env_budget = SHARED_ENV_DEFAULT_BUDGET;
+}
+
 static size_t new_broker_size(const size_t schedulers)
 {
     return sizeof(broker_t) + (schedulers * sizeof(local_state_t));
@@ -1250,7 +1291,11 @@ static local_state_t* broker_local_state(broker_t* broker)
     }
 
     assert((size_t)thread_id < broker->schedulers);
-    return &broker->local_states[thread_id];
+    local_state_t* local_state = &broker->local_states[thread_id];
+
+    shenv_gc(&local_state->shenv, &broker->opts);
+
+    return local_state;
 }
 
 static batch_t* local_state_get_batch(local_state_t* local_state, const batch_id_t batch_id)
@@ -1352,7 +1397,9 @@ static ask_result_t ask_loop(ask_ctx_t* ctx)
         //
         case ASK_RESULT_NO_MATCH_AVAILABLE:
             stats_queue_balance_sub(stats, ctx->request_weight);
-            ask_reply_nomatch(ctx);
+            assert(ctx->is_non_blocking);
+            assert(!ctx->is_async);
+            ask_drop(ctx, DROP_REASON_NON_BLOCKING);
             break;
         //
         case ASK_RESULT_CLOSED:
@@ -1654,35 +1701,36 @@ static void ask_loop_request_new(ask_ctx_t* ctx)
 
     request->enqueue_ts = ctx->enqueue_ts;
     request->pid = ctx->self;
+    request->offer_size = ask_loop_request_ensure_offer_size(ctx);
 
-    if (ctx->offer_size >= 0) {
-        request->offer_size = (size_t)ctx->offer_size;
-    }
-    else {
-        assert(!USES_FLAT_SIZE);
-        request->offer_size = (size_t)term_size(ctx->env, ctx->offer);
-        ctx->offer_size = (ptrdiff_t)request->offer_size;
-    }
+    request->shenv = shenv_checkout(&ctx->local_state->shenv, &ctx->broker->opts);
+    ErlNifEnv* req_env = request->shenv->env;
+    size_t copied_bytes = 0;
 
-    request->broker_term = enif_make_copy(request->env, ctx->broker_term);
-    ctx->copied_bytes += term_size(request->env, request->broker_term);
+    //
+
+    request->broker = (void*)ctx->broker;
+    enif_keep_resource(request->broker);
 
     if (ctx->offer_size == 0) {
         // immediate term
         request->offer = ctx->offer;
     }
     else {
-        request->offer = enif_make_copy(request->env, ctx->offer);
-        ctx->copied_bytes += request->offer_size;
+        request->offer = enif_make_copy(req_env, ctx->offer);
+        copied_bytes += request->offer_size;
     }
 
     if (ctx->reply_ref == Atoms._ticket) {
         request->reply_ref = Atoms._ticket;
     }
     else {
-        request->reply_ref = enif_make_copy(request->env, ctx->reply_ref);
-        ctx->copied_bytes += term_size(request->env, request->reply_ref);
+        request->reply_ref = enif_make_copy(req_env, ctx->reply_ref);
+        copied_bytes += term_size(req_env, request->reply_ref);
     }
+
+    shenv_inform(&local_state->shenv, copied_bytes);
+    ctx->copied_bytes += copied_bytes;
 
     //
 
@@ -1702,6 +1750,17 @@ static void ask_loop_request_new(ask_ctx_t* ctx)
 
     ctx->request = request;
     ctx->ticket_term = enif_make_resource(ctx->env, ticket);
+}
+
+static size_t ask_loop_request_ensure_offer_size(ask_ctx_t* ctx)
+{
+    if (ctx->offer_size < 0) {
+        assert(!USES_FLAT_SIZE);
+        size_t offer_size = term_size(ctx->env, ctx->offer);
+        ctx->offer_size = (ptrdiff_t)offer_size;
+        return offer_size;
+    }
+    return (size_t)ctx->offer_size;
 }
 
 //
@@ -1743,27 +1802,17 @@ static void ask_reply_match(ask_ctx_t* ctx)
 static void ask_reply_match_notify_other(ask_ctx_t* ctx, ERL_NIF_TERM match_ref,
                                          ERL_NIF_TERM counter_ref_copy)
 {
-    request_t* request = ctx->request;
     request_t* counter_request = ctx->counter_request;
     assert(counter_request != NULL);
 
     const int64_t sojourn_time = monotonic_ts() - counter_request->enqueue_ts;
 
-    if (request != NULL) {
-        // We reuse our own request's env, which already contains our offer
-        ErlNifEnv* msg_env = request->env;
-        ERL_NIF_TERM tag = reply_tag(msg_env, counter_request, counter_ref_copy);
-        ERL_NIF_TERM ref = enif_make_copy(msg_env, match_ref);
-        ERL_NIF_TERM match = make_match(msg_env, ref, request->offer, sojourn_time);
-        ERL_NIF_TERM msg = make_reply(msg_env, tag, match);
-        either_notify_or_assert_not_alive(ctx->env, &counter_request->pid, msg_env, msg);
-    }
-    else {
-        ERL_NIF_TERM tag = reply_tag(ctx->env, counter_request, counter_ref_copy);
-        ERL_NIF_TERM match = make_match(ctx->env, match_ref, ctx->offer, sojourn_time);
-        ERL_NIF_TERM msg = make_reply(ctx->env, tag, match);
-        either_notify_or_assert_not_alive(ctx->env, &counter_request->pid, NULL, msg);
-    }
+    ERL_NIF_TERM tag = reply_tag(ctx->env, counter_request, counter_ref_copy);
+    ERL_NIF_TERM match = make_match(ctx->env, match_ref, ctx->offer, sojourn_time);
+    ERL_NIF_TERM msg = make_reply(ctx->env, tag, match);
+    either_notify_or_assert_not_alive(ctx->env, &counter_request->pid, NULL, msg);
+
+    ctx->copied_bytes += ask_loop_request_ensure_offer_size(ctx);
 }
 
 static ERL_NIF_TERM ask_reply_match_self(ask_ctx_t* ctx, ERL_NIF_TERM match_ref)
@@ -1771,57 +1820,41 @@ static ERL_NIF_TERM ask_reply_match_self(ask_ctx_t* ctx, ERL_NIF_TERM match_ref)
     request_t* counter_request = ctx->counter_request;
     assert(counter_request != NULL);
 
+    ERL_NIF_TERM counter_offer;
+
+    if (counter_request->offer_size == 0) {
+        // immediate term
+        counter_offer = counter_request->offer;
+    }
+    else {
+        counter_offer = enif_make_copy(ctx->env, counter_request->offer);
+        ctx->copied_bytes += counter_request->offer_size;
+    }
+
     const int64_t sojourn_time = monotonic_ts() - ctx->enqueue_ts;
 
     if (ctx->is_async) {
-        // We reuse the counter request's env, which already contains their offer
-        ErlNifEnv* msg_env = counter_request->env;
-        ERL_NIF_TERM msg;
-        ERL_NIF_TERM faux_ticket;
-        ERL_NIF_TERM msg_ref = enif_make_copy(msg_env, match_ref);
         ERL_NIF_TERM msg_tag;
 
         if (ctx->reply_ref == Atoms._ticket) {
-            ERL_NIF_TERM faux_ticket_term = enif_make_ref(ctx->env);
-            msg_tag = enif_make_copy(msg_env, faux_ticket_term);
-            faux_ticket = faux_ticket_term;
+            msg_tag = enif_make_ref(ctx->env);
         }
         else {
             // Reuse custom reply
-            msg_tag = enif_make_copy(msg_env, ctx->reply_ref);
-            faux_ticket = ctx->reply_ref;
+            msg_tag = ctx->reply_ref;
         }
 
-        ERL_NIF_TERM msg_match = make_match(msg_env, msg_ref, counter_request->offer, sojourn_time);
-        msg = make_reply(msg_env, msg_tag, msg_match);
-        either_notify_or_assert_not_alive(ctx->env, &ctx->self, msg_env, msg);
+        ERL_NIF_TERM msg_match = make_match(ctx->env, match_ref, counter_offer, sojourn_time);
+        ERL_NIF_TERM msg = make_reply(ctx->env, msg_tag, msg_match);
+        either_notify_or_assert_not_alive(ctx->env, &ctx->self, NULL, msg);
 
-        return make_await(ctx->env, faux_ticket);
+        return make_await(ctx->env, msg_tag);
     }
     else {
-        ERL_NIF_TERM counter_offer;
-
-        if (counter_request->offer_size == 0) {
-            // immediate term
-            counter_offer = counter_request->offer;
-        }
-        else {
-            counter_offer = enif_make_copy(ctx->env, counter_request->offer);
-            ctx->copied_bytes += counter_request->offer_size;
-        }
-
         return make_match(ctx->env, match_ref, counter_offer, sojourn_time);
     }
-}
 
-static void ask_reply_nomatch(ask_ctx_t* ctx)
-{
-    assert(ctx->request == NULL);
-    assert(ctx->ticket_term == Atoms._none);
-    assert(ctx->counter_request == NULL);
-
-    int64_t sojourn_time = monotonic_ts() - ctx->enqueue_ts;
-    ctx->nif_res = make_drop(ctx->env, DROP_REASON_NON_BLOCKING, sojourn_time);
+    //}
 }
 
 static void ask_reply_closed(ask_ctx_t* ctx) { ctx->nif_res = make_error(ctx->env, Atoms._closed); }
@@ -1909,7 +1942,7 @@ static void ask_retry_clear(ask_ctx_t* ctx)
         assert(retry->ticket_term != Atoms._none);
 
         bool demonitor_res =
-            request_demonitor_and_reclaim(ctx->env, request, false, ctx->local_state);
+            request_demonitor_and_reclaim(ctx->env, request, false, ctx->local_state, true);
         assert(demonitor_res);
         retry->request = NULL;
         retry->ticket_term = Atoms._none;
@@ -1953,7 +1986,8 @@ static bool request_demonitor(ErlNifEnv* caller_env, request_t* request)
     }
 }
 
-static void request_reclaim(request_t* request, bool ticket_used, local_state_t* opt_local_state)
+static void request_reclaim(request_t* request, bool ticket_used, local_state_t* opt_local_state,
+                            bool release_broker)
 {
     assert(request != NULL);
 
@@ -1962,6 +1996,13 @@ static void request_reclaim(request_t* request, bool ticket_used, local_state_t*
     assert(ticket->request == request);
     ticket->request = NULL;
     request->ticket = NULL;
+
+    broker_t* broker = (broker_t*)request->broker;
+    assert(broker != NULL);
+    request->broker = NULL;
+
+    shenv_checkin(&request->shenv);
+    assert(request->shenv == NULL);
 
     if (opt_local_state != NULL) {
         mempool_return(&opt_local_state->request_pool, request);
@@ -1974,17 +2015,23 @@ static void request_reclaim(request_t* request, bool ticket_used, local_state_t*
         }
     }
     else {
-        cbroker_free_env(request->env);
         cbroker_free(request);
         enif_release_resource(ticket);
+    }
+
+    //
+
+    if (release_broker) {
+        enif_release_resource(broker);
     }
 }
 
 static bool request_demonitor_and_reclaim(ErlNifEnv* caller_env, request_t* request,
-                                          bool ticket_used, local_state_t* local_state)
+                                          bool ticket_used, local_state_t* local_state,
+                                          bool release_broker)
 {
     if (request_demonitor(caller_env, request)) {
-        request_reclaim(request, ticket_used, local_state);
+        request_reclaim(request, ticket_used, local_state, release_broker);
         return true;
     }
     return false;
@@ -1999,10 +2046,15 @@ static void ticket_dtor(ErlNifEnv* caller_env, void* obj)
     request_t* request = ticket->request;
 
     if (request != NULL) {
-        ErlNifEnv* env = request->env;
-        assert(env != NULL);
+        shenv_checkin(&request->shenv);
+        assert(request->shenv == NULL);
 
-        cbroker_free_env(env);
+        broker_t* broker = (broker_t*)request->broker;
+        if (broker != NULL) {
+            enif_release_resource(broker);
+            request->broker = NULL;
+        }
+
         cbroker_free(request);
         ticket->request = NULL;
     }
@@ -2024,9 +2076,11 @@ static void ticket_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNif
 
     LOG("[request DOWN %T] batch %llu, offset %llu", pid_term, request->batch_id, request->offset);
 
-    broker_t* broker = NULL;
-    int res = get_broker(request->env, request->broker_term, &broker);
-    assert(res);
+    shenv_t* shenv = request->shenv;
+    assert(shenv != NULL);
+
+    broker_t* broker = (broker_t*)request->broker;
+    assert(broker != NULL);
 
     const batch_id_t batch_id = request->batch_id;
     const offset_t offset = request->offset;
@@ -2034,6 +2088,8 @@ static void ticket_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNif
     local_state_t* opt_local_state = broker_local_state(broker);
     lease_t lease;
     memset(&lease, 0, sizeof(lease_t));
+
+    bool was_reclaimed = false;
 
     if (broker_checkout_batch(broker, opt_local_state, batch_id, &lease)) {
         LOG("[request DOWN %T] batch found", pid_term, request->batch_id);
@@ -2046,7 +2102,8 @@ static void ticket_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNif
             LOG("[request DOWN %T] request cancelled", pid_term, request->batch_id);
             stats_queue_balance_sub(&broker->stats, request->weight);
             lease_consume_slot(&lease);
-            request_reclaim(request, true, opt_local_state);
+            request_reclaim(request, true, opt_local_state, false);
+            was_reclaimed = true;
         }
         else {
             LOG("[request DOWN %T] Too late to cancel request", pid_term);
@@ -2056,6 +2113,10 @@ static void ticket_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNif
 
         if (lease.batch != NULL && !lease.found_locally) {
             lease_ref_count_dec(&lease);
+        }
+
+        if (was_reclaimed) {
+            enif_release_resource(broker);
         }
     }
 }
@@ -2150,7 +2211,8 @@ static void broker_cancel_all_batch_cells(ErlNifEnv* env, broker_t* broker,
                     notify_of_cancellation(env, request, DROP_REASON_CLOSED);
                     ticket->request = NULL;
 
-                    cbroker_free_env(request->env);
+                    shenv_checkin(&request->shenv);
+                    assert(request->shenv == NULL);
                     cbroker_free(request);
                 }
                 enif_release_resource(ticket);
@@ -2242,6 +2304,7 @@ static void broker_dtor(ErlNifEnv* caller_env, void* obj)
 
         mempool_destroy(&local_state->request_pool);
         mempool_destroy(&local_state->ticket_pool);
+        shenv_destroy(&local_state->shenv);
     }
 
     //
@@ -2617,28 +2680,22 @@ static void* request_pool_cb_alloc(void* ctx)
     assert(ctx == NULL);
     request_t* request = cbroker_alloc(sizeof(request_t));
     memset(request, 0, sizeof(request_t));
-    request->env = cbroker_alloc_env();
     return request;
 }
 
 static void request_pool_cb_clear(void* obj)
 {
     request_t* request = (request_t*)obj;
-    ErlNifEnv* env = request->env;
-    assert(env != NULL);
-
+    assert(request->shenv == NULL);
+    assert(request->broker == NULL);
     memset(request, 0, sizeof(request_t));
-    enif_clear_env(env);
-    request->env = env;
 }
 
 static void request_pool_cb_free(void* obj)
 {
     request_t* request = (request_t*)obj;
-    ErlNifEnv* env = request->env;
-    assert(env != NULL);
-
-    cbroker_free_env(request->env);
+    assert(request->shenv == NULL);
+    assert(request->broker == NULL);
     cbroker_free(obj);
 }
 
@@ -2737,6 +2794,103 @@ static ERL_NIF_TERM mempool_to_term(ErlNifEnv* env, mempool_t* pool)
 
 /*********************************************************************/
 
+static shenv_t* shenv_checkout(shenv_t** shenv_ptr, const broker_opts_t* broker_opts)
+{
+    shenv_t* shenv = *shenv_ptr;
+
+    if (shenv == NULL) {
+        *shenv_ptr = shenv = cbroker_alloc(sizeof(shenv_t));
+        shenv->env = cbroker_alloc_env();
+        atomic_store(&shenv->ref_count, 2);
+        shenv->bytes_left = (budget_counter_t)broker_opts->shared_env_budget;
+    }
+    else {
+        const ref_count_t ref_count =
+            (1 + atomic_fetch_add_explicit(&shenv->ref_count, 1, memory_order_relaxed));
+        assert(ref_count >= 2);
+        assert(shenv->bytes_left > 0);
+    }
+
+    shenv->last_checkout = monotonic_ts();
+    return shenv;
+}
+
+static void shenv_inform(shenv_t** shenv_ptr, const size_t copied_bytes)
+{
+    shenv_t* shenv = *shenv_ptr;
+    assert(atomic_load(&shenv->ref_count) >= 2);
+    assert(shenv->bytes_left > 0);
+
+    shenv->bytes_left -= (budget_counter_t)copied_bytes;
+
+    if (shenv->bytes_left < 1) {
+        shenv_checkin(shenv_ptr);
+        assert(*shenv_ptr == NULL);
+    }
+}
+
+static void shenv_checkin(shenv_t** shenv_ptr)
+{
+    shenv_t* shenv = *shenv_ptr;
+    assert(shenv != NULL);
+
+    const ref_count_t ref_count =
+        (atomic_fetch_sub_explicit(&shenv->ref_count, 1, memory_order_acq_rel) - 1);
+    assert(ref_count >= 0);
+
+    if (ref_count == 0) {
+        cbroker_free_env(shenv->env);
+        cbroker_free(shenv);
+    }
+    *shenv_ptr = NULL;
+}
+
+static void shenv_gc(shenv_t** shenv_ptr, const broker_opts_t* broker_opts)
+{
+    shenv_t* shenv = *shenv_ptr;
+
+    if (shenv == NULL) {
+        return;
+    }
+
+    if (shenv->last_checkout == INT64_MAX) {
+        return;
+    }
+
+    int64_t nanosaconds_elapsed = monotonic_ts() - shenv->last_checkout;
+    assert(nanosaconds_elapsed >= 0);
+    const int64_t min_milliseconds = 1000;
+
+    if (nanosaconds_elapsed < (min_milliseconds * 1000 * 1000)) {
+        return;
+    }
+
+    ref_count_t ref_count = atomic_load(&shenv->ref_count);
+    assert(ref_count >= 1);
+
+    if (ref_count > 1) {
+        return;
+    }
+
+    //
+
+    enif_clear_env(shenv->env);
+    shenv->bytes_left = (budget_counter_t)broker_opts->shared_env_budget;
+    shenv->last_checkout = INT64_MAX;
+}
+
+static void shenv_destroy(shenv_t** shenv_ptr)
+{
+    shenv_t* shenv = *shenv_ptr;
+    if (shenv != NULL) {
+        cbroker_free_env(shenv->env);
+        cbroker_free(shenv);
+        *shenv_ptr = NULL;
+    }
+}
+
+/*********************************************************************/
+
 static queue_balance_t stats_queue_balance_add(stats_t* stats, queue_balance_t weight)
 {
     queue_balance_t balance =
@@ -2784,12 +2938,21 @@ static int get_broker(ErlNifEnv* env, ERL_NIF_TERM term, broker_t** out_broker)
 static int get_broker_opt(ErlNifEnv* env, ERL_NIF_TERM key, ERL_NIF_TERM value,
                           broker_opts_t* out_opts)
 {
-    if (key == Atoms._depends_on_creator) {
-        return get_boolean(value, &out_opts->depends_on_creator);
+    if (key == Atoms._ask_credits) {
+        return (enif_get_int(env, value, &out_opts->ask_credits) && out_opts->ask_credits > 0);
+    }
+    else if (key == Atoms._ask_max_tries) {
+        return get_size_t(env, value, &out_opts->ask_max_tries) && out_opts->ask_max_tries > 0;
+    }
+    else if (key == Atoms._batch_pool) {
+        return get_pool_opts(env, value, &out_opts->batch_pool);
     }
     else if (key == Atoms._cells_per_batch) {
         return (get_size_t(env, value, &out_opts->cells_per_batch) &&
                 out_opts->cells_per_batch > 0);
+    }
+    else if (key == Atoms._depends_on_creator) {
+        return get_boolean(value, &out_opts->depends_on_creator);
     }
     else if (key == Atoms._max_queue_len) {
         // shorthand for setting both min and max balance at the same time
@@ -2810,16 +2973,6 @@ static int get_broker_opt(ErlNifEnv* env, ERL_NIF_TERM key, ERL_NIF_TERM value,
             return 0;
         }
     }
-    else if (key == Atoms._min_left_balance) {
-        if (value == Atoms._unlimited) {
-            out_opts->min_left_balance = QUEUE_BALANCE_UNLIMITED_LEFT;
-            return 1;
-        }
-        else {
-            return (get_ptrdiff_t(env, value, &out_opts->min_left_balance) &&
-                    out_opts->min_left_balance < 0);
-        }
-    }
     else if (key == Atoms._max_right_balance) {
         if (value == Atoms._unlimited) {
             out_opts->max_right_balance = QUEUE_BALANCE_UNLIMITED_RIGHT;
@@ -2830,17 +2983,23 @@ static int get_broker_opt(ErlNifEnv* env, ERL_NIF_TERM key, ERL_NIF_TERM value,
                     out_opts->max_right_balance > 0);
         }
     }
-    else if (key == Atoms._ask_credits) {
-        return (enif_get_int(env, value, &out_opts->ask_credits) && out_opts->ask_credits > 0);
-    }
-    else if (key == Atoms._ask_max_tries) {
-        return get_size_t(env, value, &out_opts->ask_max_tries) && out_opts->ask_max_tries > 0;
-    }
-    else if (key == Atoms._batch_pool) {
-        return get_pool_opts(env, value, &out_opts->batch_pool);
+    else if (key == Atoms._min_left_balance) {
+        if (value == Atoms._unlimited) {
+            out_opts->min_left_balance = QUEUE_BALANCE_UNLIMITED_LEFT;
+            return 1;
+        }
+        else {
+            return (get_ptrdiff_t(env, value, &out_opts->min_left_balance) &&
+                    out_opts->min_left_balance < 0);
+        }
     }
     else if (key == Atoms._request_pool) {
         return get_pool_opts(env, value, &out_opts->request_pool);
+    }
+    else if (key == Atoms._shared_env_budget) {
+        return (get_size_t(env, value, &out_opts->shared_env_budget) &&
+                out_opts->shared_env_budget > 0 &&
+                out_opts->shared_env_budget <= (size_t)BUDGET_COUNTER_MAX);
     }
     else if (key == Atoms._ticket_pool) {
         return get_pool_opts(env, value, &out_opts->ticket_pool);

@@ -143,33 +143,36 @@ The ask functions differ in what they do when there is no match yet:
 
 -ifdef(E48).
 -doc """
+- `ask_credits`: how many cells an ask may try before yielding. Defaults to 400.
+- `ask_max_tries`: how many times an ask may run out of credits before it is
+  dropped with `too_many_tries`. Defaults to 10.
+- `batch_pool`, `request_pool`, `ticket_pool`: how many spare allocations of
+  each kind are kept for reuse.
+- `cells_per_batch`: how many cells each batch has. Defaults to 32 per
+  scheduler.
 - `depends_on_creator`: close the broker when the process that created it dies.
   Defaults to `false`.
 - `max_queue_len`: how many more asks one lane may have waiting than the other.
   Defaults to `unlimited`.
 - `min_left_balance`, `max_right_balance`: the same limit, set for each lane
   apart. The first is a negative number.
-- `cells_per_batch`: how many cells each batch has. Defaults to 32 per
-  scheduler.
-- `ask_credits`: how many cells an ask may try before yielding. Defaults to 400.
-- `ask_max_tries`: how many times an ask may run out of credits before it is
-  dropped with `too_many_tries`. Defaults to 10.
-- `batch_pool`, `request_pool`, `ticket_pool`: how many spare allocations of
-  each kind are kept for reuse.
+- `shared_env_budget`: how many bytes of offers are stored together before a
+  new store is used. Their memory is released together, too. Defaults to 16384.
 """.
 -endif.
 
 -type broker_opt() ::
-    (depends_on_creator
-    | {depends_on_creator, boolean()}
-    | {cells_per_batch, pos_integer()}
-    | {ask_credits, pos_integer()}
+    ({ask_credits, pos_integer()}
     | {ask_max_tries, pos_integer()}
-    | {max_queue_len, pos_integer() | unlimited}
-    | {min_left_balance, neg_integer() | unlimited}
-    | {max_right_balance, pos_integer() | unlimited}
     | {batch_pool, [broker_pool_opt()]}
+    | {cells_per_batch, pos_integer()}
+    | depends_on_creator
+    | {depends_on_creator, boolean()}
+    | {max_queue_len, pos_integer() | unlimited}
+    | {max_right_balance, pos_integer() | unlimited}
+    | {min_left_balance, neg_integer() | unlimited}
     | {request_pool, [broker_pool_opt()]}
+    | {shared_env_budget, pos_integer()}
     | {ticket_pool, [broker_pool_opt()]}).
 -export_type([broker_opt/0]).
 

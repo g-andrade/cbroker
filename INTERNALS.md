@@ -18,6 +18,8 @@ How the NIF (`c_src/cbroker_nif.c`) matches offers without a broker process.
 - **Local state**: per-scheduler view of the broker. Only its scheduler touches
   it, so it takes no lock.
 - **Global state**: the mutex-guarded sequence of live batches.
+- **Shared env**: where a scheduler copies the offers of the requests it
+  enqueues, many requests to one environment.
 - **Credits**: how many cells one NIF call may try before yielding.
 - **Queue balance**: the difference in requests between the left and right
   lanes.
@@ -60,6 +62,7 @@ classDiagram
         right tail ID
         request pool
         ticket pool
+        shared env
     }
     class Batch {
         ID
@@ -103,7 +106,7 @@ drops to 1, and the batch is recycled, once scheduler 2's right tail moves past
 it, or once batch 7 is spent and scheduler 2's left tail advances again (see
 [Dropping](#lifecycle)).
 
-A request holds a copy of the broker term, so a broker with waiting asks stays
+A request holds a reference to its broker, so a broker with waiting asks stays
 alive even if nobody else references it.
 
 ## Cells
@@ -158,9 +161,7 @@ by default), the ask returns `{drop, too_many_tries, _}`.
 An `async_ask` that is dropped (`full_lane`, `too_many_tries`) still returns
 `{await, Tag}`, and gets the drop as a message, like any other reply.
 
-A request is allocated lazily when an ask tries to enqueue. If it then loses the
-cell and matches instead, the counterpart's message is built in that request's
-env, so that the offer isn't copied twice.
+A request is allocated lazily when an ask tries to enqueue.
 
 ### Delivering a match
 
@@ -256,6 +257,7 @@ stateDiagram-v2
 | `batch_pool`         | `[{size, 4}, {initial_count, 1}]` | spare batches kept for reuse                                            |
 | `request_pool`       | `[{size, 8}, {initial_count, 0}]` | spare requests kept for reuse, per scheduler                            |
 | `ticket_pool`        | `[{size, 8}, {initial_count, 0}]` | spare tickets kept for reuse, per scheduler                             |
+| `shared_env_budget`  | 16384                             | how many bytes of offers go into a shared env before a new one is used  |
 
 A pool keeps up to `size` spares, and starts with `initial_count` of them
 preallocated. When options overlap, the last one wins.
@@ -277,5 +279,11 @@ broker closes when that server stops.
 ## Memory
 
 Requests and tickets come from per-scheduler pools, and batches from the global
-pool. With `COUNT_ALLOCS=1`, `cbroker_nif:alloc_perfcounters/0` reports what is
-live; see `AGENTS.md`.
+pool.
+
+Offers are copied into an environment that a scheduler shares among the requests
+it enqueues, as an environment of its own would cost each request a few
+kilobytes. Once `shared_env_budget` bytes have gone into it, the scheduler moves
+on to a new one, and the old one is freed when the last of its requests leaves.
+The price is that an offer's memory is held until then. With `COUNT_ALLOCS=1`,
+`cbroker_nif:alloc_perfcounters/0` reports what is live; see `AGENTS.md`.
