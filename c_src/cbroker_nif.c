@@ -194,6 +194,9 @@ typedef struct {
     //
     ErlNifEnv* env;
     budget_counter_t bytes_left;
+    //
+    size_t copied_bytes;
+    size_t copied_requests;
 } shenv_t;
 
 //
@@ -608,7 +611,8 @@ static void shenv_write(shenv_t** shenv_ptr, request_t* request, ask_ctx_t* ask_
 static void shenv_read(request_t* counter_request, ask_ctx_t* ask_ctx, ERL_NIF_TERM* out_tag,
                        ERL_NIF_TERM* out_counter_offer);
 
-static void shenv_reclaim(shenv_t** shenv_ptr, const broker_opts_t* broker_opts);
+static void shenv_reclaim(shenv_t** shenv_ptr, local_state_t* opt_local_state,
+                          const broker_opts_t* broker_opts);
 
 static void shenv_destroy(shenv_t** shenv_ptr);
 
@@ -2029,7 +2033,7 @@ static void request_reclaim(request_t* request, bool ticket_used, local_state_t*
     assert(broker != NULL);
     request->broker = NULL;
 
-    shenv_reclaim(&request->shenv, broker_opts);
+    shenv_reclaim(&request->shenv, opt_local_state, broker_opts);
     assert(request->shenv == NULL);
 
     if (opt_local_state != NULL) {
@@ -2076,7 +2080,8 @@ static void ticket_dtor(ErlNifEnv* caller_env, void* obj)
     if (request != NULL) {
         broker_t* broker = (broker_t*)request->broker;
         if (broker != NULL) {
-            shenv_reclaim(&request->shenv, &broker->opts);
+            local_state_t* opt_local_state = broker_local_state(broker);
+            shenv_reclaim(&request->shenv, opt_local_state, &broker->opts);
             assert(request->shenv == NULL);
 
             enif_release_resource(broker);
@@ -2294,7 +2299,7 @@ static void broker_cancel_all_batch_cells(ErlNifEnv* env, broker_t* broker,
                     notify_of_cancellation(env, request, DROP_REASON_CLOSED);
                     ticket->request = NULL;
 
-                    shenv_reclaim(&request->shenv, &broker->opts);
+                    shenv_reclaim(&request->shenv, local_state, &broker->opts);
                     assert(request->shenv == NULL);
                     cbroker_free(request);
                     enif_release_resource(broker);
@@ -2876,6 +2881,12 @@ static void shenv_pool_add(shenv_pool_t* pool, shenv_t* shenv)
 {
     assert(pool->count <= pool->size);
 
+    if (pool->count >= 16 && atomic_load(&shenv->ditched_by_writer)) {
+        // FIXME
+        shenv_destroy(&shenv);
+        return;
+    }
+
     if (pool->count == pool->size) {
         pool->size = MAX(4, 2 * pool->size);
 
@@ -2955,6 +2966,7 @@ static void shenv_pool_write(shenv_pool_t* shenv_pool, request_t* request, ask_c
 
 static void shenv_pool_destroy(shenv_pool_t* pool)
 {
+    LOG_UNCOND("shenv pool count: %llu", pool->count);
     assert(pool->count <= pool->size);
 
     for (size_t idx = 0; idx < pool->count; idx++) {
@@ -2993,6 +3005,9 @@ static void shenv_write(shenv_t** shenv_ptr, request_t* request, ask_ctx_t* ask_
         request->reply_ref = enif_make_copy(shenv->env, ask_ctx->reply_ref);
         shenv->bytes_left -= (budget_counter_t)copied_bytes;
 
+        shenv->copied_bytes += copied_bytes;
+        shenv->copied_requests++;
+
         if (shenv->bytes_left > 0) {
             *shenv_ptr = shenv;
         }
@@ -3016,6 +3031,9 @@ static void shenv_write(shenv_t** shenv_ptr, request_t* request, ask_ctx_t* ask_
 
         request->offer = enif_make_copy(shenv->env, ask_ctx->offer);
         request->reply_ref = enif_make_copy(shenv->env, ask_ctx->reply_ref);
+
+        shenv->copied_bytes += copied_bytes;
+        shenv->copied_requests++;
     }
 }
 
@@ -3043,7 +3061,8 @@ static void shenv_read(request_t* counter_request, ask_ctx_t* ask_ctx,
     ask_ctx->copied_bytes += offer_size;
 }
 
-static void shenv_reclaim(shenv_t** shenv_ptr, const broker_opts_t* broker_opts)
+static void shenv_reclaim(shenv_t** shenv_ptr, local_state_t* opt_local_state,
+                          const broker_opts_t* broker_opts)
 {
     shenv_t* shenv = *shenv_ptr;
     assert(shenv != NULL);
@@ -3056,7 +3075,16 @@ static void shenv_reclaim(shenv_t** shenv_ptr, const broker_opts_t* broker_opts)
 
     if (request_count == 0) {
         if (atomic_load(&shenv->ditched_by_writer)) {
-            shenv_destroy(shenv_ptr);
+            // TODO clean this up
+            if (opt_local_state != NULL) {
+                enif_clear_env(shenv->env);
+                shenv->bytes_left = (budget_counter_t)broker_opts->shared_env_budget;
+                shenv_pool_add(&opt_local_state->shenv_pool, shenv);
+                *shenv_ptr = NULL;
+            }
+            else {
+                shenv_destroy(shenv_ptr);
+            }
             return;
         }
 
@@ -3074,6 +3102,9 @@ static void shenv_destroy(shenv_t** shenv_ptr)
     shenv_t* shenv = *shenv_ptr;
     if (shenv != NULL) {
         assert(atomic_load(&shenv->request_count) == 0);
+
+        // LOG("copied_bytes = %llu, copied_requests = %llu",
+        // shenv->copied_bytes, shenv->copied_requests);
 
         cbroker_free_env(shenv->env);
         cbroker_free(shenv);
