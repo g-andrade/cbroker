@@ -199,6 +199,14 @@ typedef struct {
 //
 
 typedef struct {
+    size_t size;
+    size_t count;
+    shenv_t** array;
+} shenv_pool_t;
+
+//
+
+typedef struct {
     shenv_t* shenv;
     //
     ErlNifTime enqueue_ts;
@@ -273,7 +281,7 @@ typedef struct {
     //
     mempool_t request_pool;
     mempool_t ticket_pool;
-    shenv_t* shenv;
+    shenv_pool_t shenv_pool;
 } local_state_t;
 
 //
@@ -586,6 +594,15 @@ static ERL_NIF_TERM mempool_to_term(ErlNifEnv* env, mempool_t* pool);
 
 //
 
+static void shenv_pool_init(shenv_pool_t* pool);
+static shenv_t* shenv_pool_get(shenv_pool_t* pool, size_t* out_idx);
+static void shenv_pool_add(shenv_pool_t* pool, shenv_t* shenv);
+static void shenv_pool_remove(shenv_pool_t* pool, const size_t idx);
+static void shenv_pool_write(shenv_pool_t* shenv_pool, request_t* request, ask_ctx_t* ask_ctx);
+static void shenv_pool_destroy(shenv_pool_t* pool);
+
+//
+
 static void shenv_write(shenv_t** shenv_ptr, request_t* request, ask_ctx_t* ask_ctx);
 
 static void shenv_read(request_t* counter_request, ask_ctx_t* ask_ctx, ERL_NIF_TERM* out_tag,
@@ -711,6 +728,14 @@ static void* cbroker_alloc(size_t size)
     return enif_alloc(size);
 }
 
+static void* cbroker_realloc(void* ptr, size_t size)
+{
+    if (ptr == NULL) {
+        atomic_fetch_add_explicit(&nr_of_live_blocks, 1, memory_order_relaxed);
+    }
+    return enif_realloc(ptr, size);
+}
+
 static void cbroker_free(void* ptr)
 {
     atomic_fetch_sub_explicit(&nr_of_live_blocks, 1, memory_order_relaxed);
@@ -744,6 +769,7 @@ static void cbroker_count_dtor(_Atomic(int64_t)* counter)
 #else
 
 #define cbroker_alloc(size) enif_alloc((size))
+#define cbroker_realloc(ptr, size) enif_realloc((ptr), (size))
 #define cbroker_free(ptr) enif_free((ptr))
 #define cbroker_alloc_env() enif_alloc_env()
 #define cbroker_free_env(env) enif_free_env((env))
@@ -1296,6 +1322,7 @@ static void local_states_init(local_state_t local_states[], const size_t schedul
 
         request_pool_init(&local_state->request_pool, &opts->request_pool);
         ticket_pool_init(&local_state->ticket_pool, &opts->ticket_pool);
+        shenv_pool_init(&local_state->shenv_pool);
     }
 }
 
@@ -1746,7 +1773,7 @@ static void ask_loop_request_new(ask_ctx_t* ctx)
     request->pid = ctx->self;
     request->offer_size = ask_loop_request_ensure_offer_size(ctx);
 
-    shenv_write(&ctx->local_state->shenv, request, ctx);
+    shenv_pool_write(&ctx->local_state->shenv_pool, request, ctx);
 
     request->broker = (void*)ctx->broker;
     enif_keep_resource(request->broker);
@@ -2071,7 +2098,6 @@ static void ticket_dtor(ErlNifEnv* caller_env, void* obj)
 static void ticket_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon)
 {
     // ERL_NIF_TERM pid_term = enif_make_pid(caller_env, pid);
-
     ticket_t* ticket = (ticket_t*)obj;
 
     request_t* request = ticket->request;
@@ -2359,7 +2385,7 @@ static void broker_dtor(ErlNifEnv* caller_env, void* obj)
 
         mempool_destroy(&local_state->request_pool);
         mempool_destroy(&local_state->ticket_pool);
-        shenv_destroy(&local_state->shenv);
+        shenv_pool_destroy(&local_state->shenv_pool);
     }
 
     //
@@ -2807,6 +2833,145 @@ static ERL_NIF_TERM mempool_to_term(ErlNifEnv* env, mempool_t* pool)
 
 /*********************************************************************/
 
+static void shenv_pool_init(shenv_pool_t* pool) { memset(pool, 0, sizeof(shenv_pool_t)); }
+
+//
+
+static shenv_t* shenv_pool_get(shenv_pool_t* pool, size_t* out_idx)
+{
+    assert(pool->count <= pool->size);
+    size_t idx = 0;
+
+    for (; idx < pool->count; idx++) {
+        shenv_t* shenv = pool->array[idx];
+        assert(shenv != NULL);
+
+        ref_count_t request_count =
+            1 + atomic_fetch_add_explicit(&shenv->request_count, 1, memory_order_relaxed);
+        assert(request_count >= 0);
+
+        if (request_count == 1) {
+            if (!atomic_load(&shenv->env_cleared)) {
+                // Another thread is still clearing the env
+                request_count =
+                    (atomic_fetch_sub_explicit(&shenv->request_count, 1, memory_order_acq_rel) - 1);
+                assert(request_count == 0);
+
+                continue;
+            }
+
+            atomic_store(&shenv->env_cleared, false);
+        }
+
+        *out_idx = idx;
+        return shenv;
+    }
+
+    return NULL;
+}
+
+//
+
+static void shenv_pool_add(shenv_pool_t* pool, shenv_t* shenv)
+{
+    assert(pool->count <= pool->size);
+
+    if (pool->count == pool->size) {
+        pool->size = MAX(4, 2 * pool->size);
+
+        if (pool->array == NULL) {
+            pool->array = cbroker_alloc(pool->size * sizeof(shenv_t*));
+        }
+        else {
+            pool->array = cbroker_realloc(pool->array, pool->size * sizeof(shenv_t*));
+        }
+    }
+
+    pool->array[pool->count++] = shenv;
+}
+
+//
+
+static void shenv_pool_remove(shenv_pool_t* pool, const size_t idx)
+{
+    assert(idx < pool->count);
+
+    const size_t new_count = --pool->count;
+
+    if (new_count < (pool->size >> 1)) {
+        const size_t new_size = pool->size >> 1;
+        shenv_t** new_array = cbroker_alloc(new_size * sizeof(shenv_t*));
+
+        const size_t copy_before = idx * sizeof(shenv_t*);
+        const size_t copy_after = (new_count - idx) * sizeof(shenv_t*);
+
+        if (copy_before) {
+            memcpy(new_array, pool->array, copy_before);
+        }
+
+        if (copy_after) {
+            memcpy(&new_array[idx], &pool->array[idx + 1], copy_after);
+        }
+
+        cbroker_free(pool->array);
+
+        pool->size = new_size;
+        pool->array = new_array;
+    }
+    else {
+        const size_t move_amount = (new_count - idx) * sizeof(shenv_t*);
+
+        if (move_amount) {
+            memmove(&pool->array[idx], &pool->array[idx + 1], move_amount);
+        }
+    }
+}
+
+//
+
+static void shenv_pool_write(shenv_pool_t* shenv_pool, request_t* request, ask_ctx_t* ask_ctx)
+{
+    size_t shenv_idx = 0;
+    shenv_t* shenv = NULL;
+
+    if ((shenv = shenv_pool_get(shenv_pool, &shenv_idx))) {
+        shenv_write(&shenv, request, ask_ctx);
+
+        if (shenv == NULL) {
+            // ditched
+            shenv_pool_remove(shenv_pool, shenv_idx);
+        }
+    }
+    else {
+        shenv_write(&shenv, request, ask_ctx);
+
+        if (shenv != NULL) {
+            shenv_pool_add(shenv_pool, shenv);
+        }
+    }
+}
+
+//
+
+static void shenv_pool_destroy(shenv_pool_t* pool)
+{
+    assert(pool->count <= pool->size);
+
+    for (size_t idx = 0; idx < pool->count; idx++) {
+        shenv_t** shenv_ptr = &pool->array[idx];
+        shenv_destroy(shenv_ptr);
+        assert(*shenv_ptr == NULL);
+    }
+
+    if (pool->array != NULL) {
+        cbroker_free(pool->array);
+    }
+
+    memset(pool, 0, sizeof(shenv_pool_t));
+}
+
+/*********************************************************************/
+
 static void shenv_write(shenv_t** shenv_ptr, request_t* request, ask_ctx_t* ask_ctx)
 {
     shenv_t* shenv = *shenv_ptr;
@@ -2838,20 +3003,9 @@ static void shenv_write(shenv_t** shenv_ptr, request_t* request, ask_ctx_t* ask_
     else {
         request->shenv = shenv;
 
-        const ref_count_t request_count =
-            1 + atomic_fetch_add_explicit(&shenv->request_count, 1, memory_order_relaxed);
-        assert(request_count >= 0);
-
-        if (request_count == 1) {
-            /* Concurrent thread is clearing the env after it
-             * saw itself being the last request for this shared env.
-             * Spin until that is done.
-             */
-            while (!atomic_load(&shenv->env_cleared)) {
-            }
-
-            atomic_store(&shenv->env_cleared, false);
-        }
+        // We already set this when checking out of the pool.
+        const ref_count_t request_count = atomic_load(&shenv->request_count);
+        assert(request_count >= 1);
 
         shenv->bytes_left -= (budget_counter_t)copied_bytes;
 
