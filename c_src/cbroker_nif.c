@@ -309,6 +309,8 @@ typedef struct {
 
 typedef struct {
     broker_opts_t opts;
+    ErlNifPid creator_pid;
+    ErlNifMonitor creator_mon;
     //
     global_state_t global_state;
     stats_t stats;
@@ -316,14 +318,6 @@ typedef struct {
     size_t schedulers;
     local_state_t local_states[];
 } broker_t;
-
-//
-
-typedef struct {
-    broker_t* broker;
-    ErlNifPid creator_pid;
-    ErlNifMonitor creator_mon;
-} handle_t;
 
 //
 
@@ -430,9 +424,8 @@ typedef struct {
 static int on_load(ErlNifEnv* caller_env, void** priv_data, ERL_NIF_TERM load_info);
 static void init_atoms(ErlNifEnv* caller_env);
 static void load_broker_resource(ErlNifEnv* caller_env);
-static void load_handle_resource(ErlNifEnv* caller_env);
-static void load_retry_resource(ErlNifEnv* caller_env);
 static void load_ticket_resource(ErlNifEnv* caller_env);
+static void load_retry_resource(ErlNifEnv* caller_env);
 
 //
 
@@ -447,6 +440,7 @@ static ERL_NIF_TERM nif_alloc_perfcounters(ErlNifEnv* env, int argc, const ERL_N
 static void broker_opts_init(broker_opts_t* opts, const size_t schedulers);
 static size_t new_broker_size(const size_t schedulers);
 static batch_t* global_state_init(global_state_t* global_state, const broker_opts_t* opts);
+static void global_state_close(global_state_t* global_state);
 static ERL_NIF_TERM global_state_to_term(ErlNifEnv* env, global_state_t* global_state);
 
 //
@@ -519,8 +513,8 @@ static bool broker_checkout_batch(broker_t* broker, local_state_t* opt_local_sta
                                   batch_id_t batch_id, lease_t* out_lease);
 
 static void broker_cancel_all_batch_cells(ErlNifEnv* env, broker_t* broker,
-                                          local_state_t* local_state, batch_t* batch,
-                                          bool did_broker_close);
+                                          ERL_NIF_TERM broker_term, local_state_t* local_state,
+                                          batch_t* batch, bool did_broker_close);
 
 static void broker_checkout_all_batches(broker_t* broker, local_state_t* opt_local_state,
                                         lease_t** out_array, size_t* out_nr_of_batches);
@@ -528,16 +522,11 @@ static void broker_checkout_all_batches(broker_t* broker, local_state_t* opt_loc
 static void broker_checkin_many_batches(broker_t* broker, lease_t** array_ptr,
                                         const size_t nr_of_batches);
 
-static void broker_close(ErlNifEnv* caller_env, broker_t* broker);
-
 static void broker_dtor(ErlNifEnv* caller_env, void* obj);
 static void broker_dtor_cb_local_batch(batch_id_t key, void* obj, void* ctx);
 static void broker_dtor_cb_global_batch(batch_id_t key, void* obj, void* ctx);
 
-//
-
-static void handle_dtor(ErlNifEnv* caller_env, void* obj);
-static void handle_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon);
+static void broker_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon);
 
 //
 
@@ -609,6 +598,7 @@ static ERL_NIF_TERM stats_to_term(ErlNifEnv* env, stats_t* stats);
 //
 
 static int get_boolean(ERL_NIF_TERM term, bool* out);
+static int get_broker(ErlNifEnv* env, ERL_NIF_TERM term, broker_t** out_broker);
 
 static int get_broker_opt(ErlNifEnv* env, ERL_NIF_TERM key, ERL_NIF_TERM value,
                           broker_opts_t* out_opts);
@@ -617,8 +607,6 @@ static ERL_NIF_TERM get_broker_opts(ErlNifEnv* env, ERL_NIF_TERM term, broker_op
 
 static int get_offer_size(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM offer,
                           ptrdiff_t* out_size);
-
-static int get_handle(ErlNifEnv* env, ERL_NIF_TERM term, handle_t** out_handle);
 
 static int get_pool_opts(ErlNifEnv* env, ERL_NIF_TERM term, pool_opts_t* out_opts);
 
@@ -682,9 +670,8 @@ static ErlNifFunc nif_funcs[] = {{"new", 1, nif_new, 0},
 
 static struct {
     ErlNifResourceType* broker;
-    ErlNifResourceType* handle;
-    ErlNifResourceType* retry;
     ErlNifResourceType* ticket;
+    ErlNifResourceType* retry;
 } ResourceTypes;
 
 static _Atomic(thread_id_t) next_thread_id = 0;
@@ -706,7 +693,6 @@ static request_t sentinel_request_matched;
 
 static _Atomic(int64_t) nr_of_live_blocks = 0;
 static _Atomic(int64_t) nr_of_live_envs = 0;
-static _Atomic(int64_t) nr_of_live_handles = 0;
 static _Atomic(int64_t) nr_of_live_brokers = 0;
 static _Atomic(int64_t) nr_of_live_tickets = 0;
 static _Atomic(int64_t) nr_of_live_retries = 0;
@@ -766,9 +752,8 @@ static int on_load(ErlNifEnv* caller_env, void** priv_data, ERL_NIF_TERM load_in
 
     memset(&ResourceTypes, 0, sizeof(ResourceTypes));
     load_broker_resource(caller_env);
-    load_handle_resource(caller_env);
-    load_retry_resource(caller_env);
     load_ticket_resource(caller_env);
+    load_retry_resource(caller_env);
 
     memset(&sentinel_request_cancelled, 0, sizeof(request_t));
     memset(&sentinel_request_matched, 0, sizeof(request_t));
@@ -786,32 +771,12 @@ static void init_atoms(ErlNifEnv* caller_env)
 
 static void load_broker_resource(ErlNifEnv* caller_env)
 {
-    ErlNifResourceTypeInit callbacks = {broker_dtor, NULL, NULL, 1, NULL};
+    ErlNifResourceTypeInit callbacks = {broker_dtor, NULL, broker_down, 3, NULL};
     ErlNifResourceFlags flags = ERL_NIF_RT_CREATE;
 
     ResourceTypes.broker =
         enif_init_resource_type(caller_env, "cbroker", &callbacks, flags, &flags);
     assert(ResourceTypes.broker != NULL);
-}
-
-static void load_handle_resource(ErlNifEnv* caller_env)
-{
-    ErlNifResourceTypeInit callbacks = {handle_dtor, NULL, handle_down, 3, NULL};
-    ErlNifResourceFlags flags = ERL_NIF_RT_CREATE;
-
-    ResourceTypes.handle =
-        enif_init_resource_type(caller_env, "cbroker.handle", &callbacks, flags, &flags);
-    assert(ResourceTypes.handle != NULL);
-}
-
-static void load_retry_resource(ErlNifEnv* caller_env)
-{
-    ErlNifResourceTypeInit callbacks = {retry_dtor, NULL, NULL, 1, NULL};
-    ErlNifResourceFlags flags = ERL_NIF_RT_CREATE;
-
-    ResourceTypes.retry =
-        enif_init_resource_type(caller_env, "cbroker.retry", &callbacks, flags, &flags);
-    assert(ResourceTypes.retry != NULL);
 }
 
 static void load_ticket_resource(ErlNifEnv* caller_env)
@@ -822,6 +787,16 @@ static void load_ticket_resource(ErlNifEnv* caller_env)
     ResourceTypes.ticket =
         enif_init_resource_type(caller_env, "cbroker.ticket", &callbacks, flags, &flags);
     assert(ResourceTypes.ticket != NULL);
+}
+
+static void load_retry_resource(ErlNifEnv* caller_env)
+{
+    ErlNifResourceTypeInit callbacks = {retry_dtor, NULL, NULL, 1, NULL};
+    ErlNifResourceFlags flags = ERL_NIF_RT_CREATE;
+
+    ResourceTypes.retry =
+        enif_init_resource_type(caller_env, "cbroker.retry", &callbacks, flags, &flags);
+    assert(ResourceTypes.retry != NULL);
 }
 
 ERL_NIF_INIT(cbroker_nif, nif_funcs, on_load, NULL, NULL, NULL);
@@ -858,34 +833,24 @@ static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     memset(broker, 0, broker_size);
 
     memcpy(&broker->opts, &opts, sizeof(broker_opts_t));
+    broker->creator_pid = self;
+    int mon_res = enif_monitor_process(env, broker, &broker->creator_pid, &broker->creator_mon);
+    assert(mon_res == 0);
 
     batch_t* first_batch = global_state_init(&broker->global_state, &broker->opts);
 
     broker->schedulers = schedulers;
     local_states_init(broker->local_states, schedulers, &broker->opts, first_batch);
 
-    //
-
-    handle_t* handle =
-        cbroker_alloc_resource(&nr_of_live_handles, ResourceTypes.handle, sizeof(handle_t));
-    memset(handle, 0, sizeof(handle_t));
-
-    handle->broker = broker;
-    handle->creator_pid = self;
-    int mon_res = enif_monitor_process(env, handle, &handle->creator_pid, &handle->creator_mon);
-    assert(mon_res == 0);
-
-    ERL_NIF_TERM handle_term = enif_make_resource(env, handle);
-    enif_release_resource(handle);
-
-    return handle_term;
+    ERL_NIF_TERM broker_term = enif_make_resource(env, broker);
+    enif_release_resource(broker);
+    return broker_term;
 }
 
 //
 
 static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
-    handle_t* handle;
     ask_ctx_t ctx;
     memset(&ctx, 0, sizeof(ask_ctx_t));
     ctx.ticket_term = Atoms._none;
@@ -902,7 +867,7 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     assert(argc == 6);
 
-    ERL_NIF_TERM handle_term = argv[0];
+    ERL_NIF_TERM broker_term = argv[0];
     ERL_NIF_TERM lane = argv[1];
     ctx.offer = argv[2];
 
@@ -916,11 +881,8 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     //
 
-    if (get_handle(env, handle_term, &handle)) {
-        ctx.broker = handle->broker;
-    }
-    else {
-        return make_badarg(env, handle_term);
+    if (!get_broker(env, broker_term, &ctx.broker)) {
+        return make_badarg(env, broker_term);
     }
 
     if (lane == Atoms._left) {
@@ -1151,15 +1113,11 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
 
 static ERL_NIF_TERM nif_debug_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
-    handle_t* handle = NULL;
     broker_t* broker = NULL;
-    ERL_NIF_TERM handle_term = argv[0];
+    ERL_NIF_TERM broker_term = argv[0];
 
-    if (get_handle(env, handle_term, &handle)) {
-        broker = handle->broker;
-    }
-    else {
-        return make_badarg(env, handle_term);
+    if (!get_broker(env, broker_term, &broker)) {
+        return make_badarg(env, broker_term);
     }
 
     local_state_t* local_state = broker_local_state(broker);
@@ -1197,7 +1155,7 @@ static ERL_NIF_TERM nif_debug_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM 
     return enif_make_list7(
         env,
         //
-        enif_make_tuple2(env, Atoms._creator, enif_make_pid(env, &handle->creator_pid)),
+        enif_make_tuple2(env, Atoms._creator, enif_make_pid(env, &broker->creator_pid)),
         //
         enif_make_tuple2(env, Atoms._opts, make_broker_opts(env, &broker->opts)),
         //
@@ -1277,6 +1235,12 @@ static batch_t* global_state_init(global_state_t* global_state, const broker_opt
     return first_batch;
 }
 
+static void global_state_close(global_state_t* global_state)
+{
+    bool prev_value = atomic_exchange(&global_state->is_closed, true);
+    assert(prev_value == false);
+}
+
 static ERL_NIF_TERM global_state_to_term(ErlNifEnv* env, global_state_t* global_state)
 {
     return enif_make_list1(
@@ -1284,7 +1248,6 @@ static ERL_NIF_TERM global_state_to_term(ErlNifEnv* env, global_state_t* global_
         //
         enif_make_tuple2(env, Atoms._batch_pool, mempool_to_term(env, &global_state->batch_pool)));
 }
-
 /*********************************************************************/
 
 static void local_states_init(local_state_t local_states[], const size_t schedulers,
@@ -2216,8 +2179,8 @@ static bool broker_checkout_batch(broker_t* broker, local_state_t* opt_local_sta
 //
 
 static void broker_cancel_all_batch_cells(ErlNifEnv* env, broker_t* broker,
-                                          local_state_t* local_state, batch_t* batch,
-                                          bool did_broker_close)
+                                          ERL_NIF_TERM broker_term, local_state_t* local_state,
+                                          batch_t* batch, bool did_broker_close)
 {
     size_t consumed_count = atomic_load(&batch->consumed_count);
     if (consumed_count >= batch->nr_of_cells) {
@@ -2320,45 +2283,6 @@ static void broker_checkin_many_batches(broker_t* broker, lease_t** array_ptr,
 
 //
 
-static void broker_close(ErlNifEnv* caller_env, broker_t* broker)
-{
-    global_state_t* global_state = &broker->global_state;
-    bool is_closed = false;
-
-    if (!atomic_compare_exchange_strong(&global_state->is_closed, &is_closed, true)) {
-        // Closed somewhere else
-        return;
-    }
-
-    local_states_dirty_close(broker->local_states, broker->schedulers);
-
-    local_state_t* local_state = broker_local_state(broker);
-    lease_t* leases = NULL;
-    size_t nr_of_batches = 0;
-    broker_checkout_all_batches(broker, local_state, &leases, &nr_of_batches);
-
-    for (size_t i = 0; i < nr_of_batches; i++) {
-        lease_t* lease = &leases[i];
-        batch_t* batch = lease->batch;
-        broker_cancel_all_batch_cells(caller_env, broker, local_state, batch, true);
-
-        if (lease->found_locally) {
-            batch_t* taken_batch = NULL;
-            cbroker_omap_take(local_state->batches, batch->id, (void**)&taken_batch);
-            assert(taken_batch != NULL);
-            assert(taken_batch == batch);
-            lease->found_locally = false;
-        }
-    }
-
-    //
-
-    broker_checkin_many_batches(broker, &leases, nr_of_batches);
-    assert(leases == NULL);
-}
-
-//
-
 static void broker_dtor(ErlNifEnv* caller_env, void* obj)
 {
     cbroker_count_dtor(&nr_of_live_brokers);
@@ -2418,24 +2342,44 @@ static void broker_dtor_cb_global_batch(batch_id_t key, void* obj, void* ctx)
 
 //
 
-static void handle_dtor(ErlNifEnv* caller_env, void* obj)
+static void broker_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon)
 {
-    cbroker_count_dtor(&nr_of_live_handles);
-    handle_t* handle = (handle_t*)obj;
-    broker_t* broker = handle->broker;
-    broker_close(caller_env, broker);
-    handle->broker = NULL;
-    enif_release_resource(broker);
-}
+    broker_t* broker = (broker_t*)obj;
 
-static void handle_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon)
-{
-    handle_t* handle = (handle_t*)obj;
-    broker_t* broker = handle->broker;
-
-    if (broker->opts.depends_on_creator) {
-        broker_close(caller_env, broker);
+    if (!broker->opts.depends_on_creator) {
+        return;
     }
+
+    global_state_close(&broker->global_state);
+    local_states_dirty_close(broker->local_states, broker->schedulers);
+
+    local_state_t* local_state = broker_local_state(broker);
+    lease_t* leases = NULL;
+    size_t nr_of_batches = 0;
+    broker_checkout_all_batches(broker, local_state, &leases, &nr_of_batches);
+
+    //
+
+    ERL_NIF_TERM broker_term = enif_make_resource(caller_env, broker);
+
+    for (size_t i = 0; i < nr_of_batches; i++) {
+        lease_t* lease = &leases[i];
+        batch_t* batch = lease->batch;
+        broker_cancel_all_batch_cells(caller_env, broker, broker_term, local_state, batch, true);
+
+        if (lease->found_locally) {
+            batch_t* taken_batch = NULL;
+            cbroker_omap_take(local_state->batches, batch->id, (void**)&taken_batch);
+            assert(taken_batch != NULL);
+            assert(taken_batch == batch);
+            lease->found_locally = false;
+        }
+    }
+
+    //
+
+    broker_checkin_many_batches(broker, &leases, nr_of_batches);
+    assert(leases == NULL);
 }
 
 /*********************************************************************/
@@ -2986,6 +2930,11 @@ static int get_boolean(ERL_NIF_TERM term, bool* out)
     return 0;
 }
 
+static int get_broker(ErlNifEnv* env, ERL_NIF_TERM term, broker_t** out_broker)
+{
+    return enif_get_resource(env, term, ResourceTypes.broker, (void**)out_broker);
+}
+
 static int get_broker_opt(ErlNifEnv* env, ERL_NIF_TERM key, ERL_NIF_TERM value,
                           broker_opts_t* out_opts)
 {
@@ -3099,13 +3048,6 @@ static ERL_NIF_TERM get_broker_opts(ErlNifEnv* env, ERL_NIF_TERM term, broker_op
     }
 
     return make_badopts(env, term);
-}
-
-//
-
-static int get_handle(ErlNifEnv* env, ERL_NIF_TERM term, handle_t** out_handle)
-{
-    return enif_get_resource(env, term, ResourceTypes.handle, (void**)out_handle);
 }
 
 //
