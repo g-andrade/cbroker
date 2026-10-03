@@ -188,9 +188,9 @@ typedef ptrdiff_t budget_counter_t;
 //
 
 typedef struct {
-    ErlNifMutex* lock;
-    ref_count_t request_count;
-    bool ditched_by_writer;
+    _Atomic(ref_count_t) request_count;
+    _Atomic(bool) ditched_by_writer;
+    _Atomic(bool) env_cleared;
     //
     ErlNifEnv* env;
     budget_counter_t bytes_left;
@@ -591,7 +591,7 @@ static void shenv_write(shenv_t** shenv_ptr, request_t* request, ask_ctx_t* ask_
 static void shenv_read(request_t* counter_request, ask_ctx_t* ask_ctx, ERL_NIF_TERM* out_tag,
                        ERL_NIF_TERM* out_counter_offer);
 
-static void shenv_reclaim(shenv_t** shenv_ptr, const broker_opts_t* opt_broker_opts);
+static void shenv_reclaim(shenv_t** shenv_ptr, const broker_opts_t* broker_opts);
 
 static void shenv_destroy(shenv_t** shenv_ptr);
 
@@ -2049,7 +2049,7 @@ static void ticket_dtor(ErlNifEnv* caller_env, void* obj)
     if (request != NULL) {
         broker_t* broker = (broker_t*)request->broker;
         if (broker != NULL) {
-            shenv_reclaim(&request->shenv, NULL);
+            shenv_reclaim(&request->shenv, &broker->opts);
             assert(request->shenv == NULL);
 
             enif_release_resource(broker);
@@ -2268,7 +2268,7 @@ static void broker_cancel_all_batch_cells(ErlNifEnv* env, broker_t* broker,
                     notify_of_cancellation(env, request, DROP_REASON_CLOSED);
                     ticket->request = NULL;
 
-                    shenv_reclaim(&request->shenv, NULL);
+                    shenv_reclaim(&request->shenv, &broker->opts);
                     assert(request->shenv == NULL);
                     cbroker_free(request);
                     enif_release_resource(broker);
@@ -2817,8 +2817,9 @@ static void shenv_write(shenv_t** shenv_ptr, request_t* request, ask_ctx_t* ask_
     if (shenv == NULL) {
         shenv = cbroker_alloc(sizeof(shenv_t));
         memset(shenv, 0, sizeof(shenv_t));
-        shenv->lock = enif_mutex_create("--");
-        shenv->request_count = 1;
+
+        atomic_store(&shenv->request_count, 1);
+
         shenv->env = cbroker_alloc_env();
         shenv->bytes_left = (budget_counter_t)ask_ctx->broker->opts.shared_env_budget;
 
@@ -2831,24 +2832,33 @@ static void shenv_write(shenv_t** shenv_ptr, request_t* request, ask_ctx_t* ask_
             *shenv_ptr = shenv;
         }
         else {
-            shenv->ditched_by_writer = true;
+            atomic_store(&shenv->ditched_by_writer, true);
         }
     }
     else {
         request->shenv = shenv;
-        enif_mutex_lock(shenv->lock);
 
-        ref_count_t request_count = ++shenv->request_count;
-        assert(request_count >= 1);
+        const ref_count_t request_count =
+            1 + atomic_fetch_add_explicit(&shenv->request_count, 1, memory_order_relaxed);
+        assert(request_count >= 0);
+
+        if (request_count == 1) {
+            /* Concurrent thread is clearing the env after it
+             * saw itself being the last request for this shared env.
+             * Spin until that is done.
+             */
+            while (!atomic_load(&shenv->env_cleared)) {
+            }
+
+            atomic_store(&shenv->env_cleared, false);
+        }
 
         shenv->bytes_left -= (budget_counter_t)copied_bytes;
 
         if (shenv->bytes_left <= 0) {
-            shenv->ditched_by_writer = true;
+            atomic_store(&shenv->ditched_by_writer, true);
             *shenv_ptr = NULL;
         }
-
-        enif_mutex_unlock(shenv->lock);
 
         request->offer = enif_make_copy(shenv->env, ask_ctx->offer);
         request->reply_ref = enif_make_copy(shenv->env, ask_ctx->reply_ref);
@@ -2861,7 +2871,7 @@ static void shenv_read(request_t* counter_request, ask_ctx_t* ask_ctx,
     const size_t offer_size = counter_request->offer_size;
     shenv_t* shenv = counter_request->shenv;
     assert(shenv != NULL);
-    assert(shenv->request_count >= 1);
+    assert(atomic_load(&shenv->request_count) >= 1);
 
     //
 
@@ -2879,46 +2889,38 @@ static void shenv_read(request_t* counter_request, ask_ctx_t* ask_ctx,
     ask_ctx->copied_bytes += offer_size;
 }
 
-static void shenv_reclaim(shenv_t** shenv_ptr, const broker_opts_t* opt_broker_opts)
+static void shenv_reclaim(shenv_t** shenv_ptr, const broker_opts_t* broker_opts)
 {
     shenv_t* shenv = *shenv_ptr;
     assert(shenv != NULL);
-    bool destroy = false;
 
     //
 
-    enif_mutex_lock(shenv->lock);
-
-    ref_count_t request_count = --shenv->request_count;
+    ref_count_t request_count =
+        (atomic_fetch_sub_explicit(&shenv->request_count, 1, memory_order_acq_rel) - 1);
     assert(request_count >= 0);
 
     if (request_count == 0) {
-        if (shenv->ditched_by_writer) {
-            destroy = true;
+        if (atomic_load(&shenv->ditched_by_writer)) {
+            shenv_destroy(shenv_ptr);
+            return;
         }
-        else if (opt_broker_opts != NULL) {
-            enif_clear_env(shenv->env);
-            shenv->bytes_left = (budget_counter_t)opt_broker_opts->shared_env_budget;
-        }
+
+        enif_clear_env(shenv->env);
+
+        shenv->bytes_left = (budget_counter_t)broker_opts->shared_env_budget;
+        atomic_store(&shenv->env_cleared, true);
     }
 
-    enif_mutex_unlock(shenv->lock);
-
-    //
-
-    if (destroy) {
-        shenv_destroy(shenv_ptr);
-    }
-    else {
-        *shenv_ptr = NULL;
-    }
+    *shenv_ptr = NULL;
 }
 
 static void shenv_destroy(shenv_t** shenv_ptr)
 {
     shenv_t* shenv = *shenv_ptr;
     if (shenv != NULL) {
-        enif_mutex_unlock(shenv->lock);
+        assert(atomic_load(&shenv->request_count) == 0);
+
         cbroker_free_env(shenv->env);
         cbroker_free(shenv);
         *shenv_ptr = NULL;
