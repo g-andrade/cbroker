@@ -102,7 +102,7 @@ Asynchronous replies arrive as `{Tag, Reply}`, where `Tag` is either the
 General drop reasons are:
 
 - `cancelled`: a concurrent process cancelled the request
-- `closed`: the broker closed while you waited
+- `closed`: the broker [closed](#closing) while you waited
 - `full_lane`: the lane already has as many waiters as the
   [queue limits](#queue-limits) allow
 - `too_many_tries`: too many cells were attempted without managing to match or
@@ -151,6 +151,15 @@ Names take the same forms as OTP process names:
 - `{local, atom()}`,
 - `{global, term()}`,
 - or `{via, module(), term()}`.
+
+## Closing
+
+`cbroker:close(Broker)` closes a broker for good: whoever is waiting is dropped
+with reason `closed`, and asking again raises `error:closed`. Any process may
+close a broker.
+
+With the `depends_on_creator` option, a broker also closes when the process that
+created it dies.
 
 ## Queue limits
 

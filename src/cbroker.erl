@@ -53,6 +53,8 @@ The ask functions differ in what they do when there is no match yet:
     %
     cancel/1,
     %
+    close/1,
+    %
     child_spec/1,
     child_spec/2,
     %
@@ -85,6 +87,8 @@ The ask functions differ in what they do when there is no match yet:
     async_ask/4,
     %
     cancel/1,
+    %
+    close/1,
     %
     child_spec/1,
     child_spec/2,
@@ -150,8 +154,8 @@ The ask functions differ in what they do when there is no match yet:
   each kind are kept for reuse.
 - `cells_per_batch`: how many cells each batch has. Defaults to 32 per
   scheduler.
-- `depends_on_creator`: close the broker when the process that created it dies.
-  Defaults to `false`.
+- `depends_on_creator`: close the broker when the process that created it dies,
+  as `close/1` would. Defaults to `false`.
 - `max_queue_len`: how many more asks one lane may have waiting than the other.
   Defaults to `unlimited`.
 - `min_left_balance`, `max_right_balance`: the same limit, set for each lane
@@ -438,6 +442,27 @@ cancel(Ticket) ->
         too_late ->
             too_late
     end.
+
+%%
+
+-ifdef(E48).
+-doc """
+Closes a broker, for good.
+
+Every enqueued ask gets a `{drop, closed, _}` reply, and asking fails with
+`closed` from then on. Any process may close a broker, and closing one that is
+already closed does nothing.
+
+A named broker keeps its name once closed: restart its child to get a new one.
+""".
+-endif.
+
+-spec close(Broker) -> ok when
+    Broker :: broker().
+
+close(Broker) ->
+    BrokerRef = resolve_broker(Broker),
+    cbroker_nif:close(BrokerRef).
 
 %%
 

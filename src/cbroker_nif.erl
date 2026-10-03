@@ -38,6 +38,7 @@
     alloc_perfcounters/0,
     ask/5,
     cancel/1,
+    close/1,
     debug_info/1,
     new/1
 ]).
@@ -65,6 +66,7 @@
     {unnecessary_function_arguments, [
         ask,
         cancel,
+        close,
         debug_info,
         new
     ]}
@@ -109,6 +111,14 @@ ask(BrokerRef, Lane, Offer, ReplyRef, AskType) ->
     SojournTime :: non_neg_integer().
 
 cancel(_Ticket) ->
+    not_loaded(?LINE).
+
+%%
+
+-spec close(BrokerRef) -> ok when
+    BrokerRef :: reference().
+
+close(_BrokerRef) ->
     not_loaded(?LINE).
 
 %%

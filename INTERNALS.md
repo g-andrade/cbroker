@@ -183,7 +183,7 @@ Four parties may race for a waiting request:
 - the matcher on the opposite lane;
 - `cancel/1`;
 - the asker's DOWN callback;
-- the broker's DOWN callback (which closes the broker).
+- whoever closes the broker (`close/1`, or the broker's DOWN callback).
 
 When there's a conflict, two rules settle it:
 
@@ -264,12 +264,13 @@ preallocated. When options overlap, the last one wins.
 
 ## Closing a broker
 
-When using the `depends_on_creator` option, the broker will close when its
-creator dies. The monitor callback will then:
+A broker closes when `close/1` is called on it, by any process, or, when using
+the `depends_on_creator` option, when its creator dies. It only happens once -
+closing again is a no-op. The closing steps are:
 
 1. Mark the global and local states closed. New asks fail with `error(closed)`.
 2. Check out every batch, set all its counters to the end, and CAS each
-   remaining non-cancelled cell to `cancelled`.
+   remaining unconsumed cell to `cancelled`.
 3. Message each waiting asker with `{drop, closed, T}`.
 
 Named brokers (`cbroker_persistent`) are created by a `gen_server` with

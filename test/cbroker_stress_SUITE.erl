@@ -58,6 +58,7 @@
     one_lane_schedulers_release_batches/1,
     lagging_lane_skips_batch_it_dropped/1,
     queue_limit_keeps_its_accounting/1,
+    closing_never_loses_a_reply/1,
     brokers_leave_nothing_allocated/1
 ]).
 
@@ -91,6 +92,7 @@ groups() ->
                 one_lane_schedulers_release_batches,
                 lagging_lane_skips_batch_it_dropped,
                 queue_limit_keeps_its_accounting,
+                closing_never_loses_a_reply,
                 brokers_leave_nothing_allocated
             ]
         }
@@ -257,6 +259,45 @@ queue_limit_keeps_its_accounting(_Config) ->
     ?assertEqual([], pending_cells(Broker)),
     ?assertEqual(0, queue_balance(Broker)).
 
+% The broker is closed under everyone's feet: each worker closes it on reaching
+% the same, randomly picked, iteration, so the closes race each other as well
+% as the asks. Each ask either matches, is dropped for the broker closing, or
+% finds it closed already. One that parked just as the broker closed must still
+% be told, or it would sit there until its timeout
+closing_never_loses_a_reply(_Config) ->
+    lists:foreach(fun(_) -> assert_closing_never_loses_a_reply() end, seq(20)).
+
+assert_closing_never_loses_a_reply() ->
+    Broker = cbroker:new(),
+    CloseAt = rand:uniform(iterations()),
+
+    Samples = run_workers(Broker, fun(Lane, {_, _, N} = Offer) ->
+        N =:= CloseAt andalso (ok = cbroker:close(Broker)),
+        try
+            cbroker:ask(Broker, Lane, Offer, ?ASK_TIMEOUT_MS)
+        catch
+            error:closed -> closed
+        end
+    end),
+
+    UnexpectedReplies = [
+        Sample
+     || {_, _, Reply} = Sample <- Samples,
+        not is_match(Reply),
+        Reply =/= drop_of_reason(Reply, closed),
+        Reply =/= closed
+    ],
+    ct:log("Matched: ~b, dropped for closing: ~b, found it closed: ~b", [
+        length([R || {_, _, R} <- Samples, is_match(R)]),
+        length([R || {_, _, R} <- Samples, R =:= drop_of_reason(R, closed)]),
+        length([R || {_, _, R} <- Samples, R =:= closed])
+    ]),
+
+    ?assertEqual([], UnexpectedReplies),
+    assert_matches_are_paired([Sample || {_, _, Reply} = Sample <- Samples, is_match(Reply)]),
+    ?assertEqual([], pending_cells(Broker)),
+    ?assertEqual(0, queue_balance(Broker)).
+
 % Brokers that have been worked hard enough to roll over batches must leave
 % nothing behind once collected. This is what the cell and pool assertions
 % cannot see: memory that is consistent, just unreachable
@@ -271,14 +312,17 @@ brokers_leave_nothing_allocated(_Config) ->
 
 assert_nothing_stays_allocated(Baseline) ->
     lists:foreach(
-        fun(_) ->
-            {Pid, MonRef} = spawn_monitor(fun churn_through_batches/0),
+        fun(ChurnFun) ->
+            {Pid, MonRef} = spawn_monitor(ChurnFun),
             receive
                 {'DOWN', MonRef, process, Pid, normal} -> ok
             after ?ASK_TIMEOUT_MS -> ct:fail({churn_timed_out, Pid})
             end
         end,
-        seq(3)
+        lists:append([
+            [fun churn_through_batches/0, fun close_over_parked_batches/0]
+         || _ <- seq(3)
+        ])
     ),
 
     ok = wait_until(fun() -> settled(collect_garbage(), Baseline) end),
@@ -304,6 +348,28 @@ churn_through_batches() ->
             end
         end,
         seq(2 * CellsPerBatch)
+    ).
+
+% Batches' worth of parked asks, all of them dropped by closing the broker
+close_over_parked_batches() ->
+    Broker = cbroker:new(),
+    CellsPerBatch = nr_of_cells_per_batch(Broker),
+
+    Tickets = [
+        Ticket
+     || N <- seq(2 * CellsPerBatch),
+        {await, Ticket} <- [cbroker:async_ask(Broker, left, {offer, N})]
+    ],
+    ok = cbroker:close(Broker),
+
+    lists:foreach(
+        fun(Ticket) ->
+            receive
+                {Ticket, {drop, closed, _}} -> ok
+            after ?ASK_TIMEOUT_MS -> exit(no_reply)
+            end
+        end,
+        Tickets
     ).
 
 alloc_perfcounters() ->

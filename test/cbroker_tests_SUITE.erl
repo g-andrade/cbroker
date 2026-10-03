@@ -63,6 +63,12 @@
     request_pool_size_caps_what_it_keeps/1,
     invalid_opts_are_rejected/1,
     %
+    closing_drops_waiters_and_refuses_asks/1,
+    closing_again_changes_nothing/1,
+    any_process_may_close/1,
+    creator_may_die_after_closing/1,
+    cancelling_after_closing_is_too_late/1,
+    %
     queue_limit_opts_are_reported/1,
     queue_balance_follows_waiters/1,
     queue_balance_settles_after_every_outcome/1,
@@ -81,6 +87,7 @@
     named_broker_is_asked_by_name/1,
     named_broker_takes_opts/1,
     stopping_closes_and_forgets_the_name/1,
+    closing_by_name_keeps_the_name/1,
     crashing_keeps_the_name_until_restarted/1,
     unknown_and_invalid_names_are_rejected/1,
     named_server_survives_what_it_does_not_handle/1
@@ -148,6 +155,17 @@ groups() ->
             ]
         },
         {
+            closing,
+            [parallel],
+            [
+                closing_drops_waiters_and_refuses_asks,
+                closing_again_changes_nothing,
+                any_process_may_close,
+                creator_may_die_after_closing,
+                cancelling_after_closing_is_too_late
+            ]
+        },
+        {
             queue_limits,
             [parallel],
             [
@@ -179,6 +197,7 @@ groups() ->
                 named_broker_is_asked_by_name,
                 named_broker_takes_opts,
                 stopping_closes_and_forgets_the_name,
+                closing_by_name_keeps_the_name,
                 crashing_keeps_the_name_until_restarted,
                 unknown_and_invalid_names_are_rejected,
                 named_server_survives_what_it_does_not_handle
@@ -573,6 +592,69 @@ invalid_opts_are_rejected(_Config) ->
 
 %%
 
+closing_drops_waiters_and_refuses_asks(_Config) ->
+    Broker = cbroker:new(),
+    Lefts = park(Broker, left, 3),
+    ?assertEqual(ok, cbroker:close(Broker)),
+
+    lists:foreach(fun(Ticket) -> ?assertMatch({drop, closed, _}, await(Ticket)) end, Lefts),
+    ?assertEqual([], pending_cells(Broker)),
+    ?assertEqual(0, queue_balance(Broker)),
+
+    ?assertError(closed, cbroker:nb_ask(Broker, right, offer_r)),
+    ?assertError(closed, cbroker:async_ask(Broker, left, offer_l)),
+    ?assertError(closed, cbroker:ask(Broker, right, offer_r)).
+
+closing_again_changes_nothing(_Config) ->
+    Broker = cbroker:new(),
+    {await, Ticket} = cbroker:async_ask(Broker, left, offer_l),
+
+    ?assertEqual(ok, cbroker:close(Broker)),
+    ?assertEqual(ok, cbroker:close(Broker)),
+
+    % A single reply: the case ends with an empty mailbox
+    ?assertMatch({drop, closed, _}, await(Ticket)),
+    ?assertError(closed, cbroker:nb_ask(Broker, right, offer_r)).
+
+% Closing is not reserved to the creator, whether the broker depends on it
+% or not
+any_process_may_close(_Config) ->
+    lists:foreach(
+        fun(Opts) ->
+            {Broker, Creator} = broker_with_creator(Opts),
+            {await, Ticket} = cbroker:async_ask(Broker, left, offer_l),
+
+            ?assertEqual(ok, cbroker:close(Broker)),
+
+            ?assertMatch({drop, closed, _}, await(Ticket)),
+            ?assertError(closed, cbroker:nb_ask(Broker, right, offer_r)),
+            stop_creator(Creator)
+        end,
+        [[], [depends_on_creator]]
+    ).
+
+% The creator's death finds the broker closed already, and leaves it be
+creator_may_die_after_closing(_Config) ->
+    {Broker, Creator} = broker_with_creator([depends_on_creator]),
+    {await, Ticket} = cbroker:async_ask(Broker, left, offer_l),
+
+    ?assertEqual(ok, cbroker:close(Broker)),
+    ?assertMatch({drop, closed, _}, await(Ticket)),
+    stop_creator(Creator),
+
+    ?assertError(closed, cbroker:nb_ask(Broker, right, offer_r)),
+    ?assertEqual(ok, cbroker:close(Broker)).
+
+cancelling_after_closing_is_too_late(_Config) ->
+    Broker = cbroker:new(),
+    {await, Ticket} = cbroker:async_ask(Broker, left, offer_l),
+    ?assertEqual(ok, cbroker:close(Broker)),
+
+    ?assertEqual(too_late, cbroker:cancel(Ticket)),
+    ?assertMatch({drop, closed, _}, await(Ticket)).
+
+%%
+
 % `max_queue_len` sets both bounds at once; whichever opt comes last wins
 queue_limit_opts_are_reported(_Config) ->
     PtrdiffMax = (1 bsl 63) - 1,
@@ -879,6 +961,24 @@ stopping_closes_and_forgets_the_name(_Config) ->
         end,
         [normal, shutdown, {shutdown, restarting}]
     ).
+
+% Closing by name leaves the server up and the name in place, so that asks
+% fail as `closed` until the server is restarted
+closing_by_name_keeps_the_name(_Config) ->
+    Name = cbroker_closing_test,
+    Server = start_named({local, Name}, []),
+    Broker = cbroker:resolve_name(Name),
+    {await, Ticket} = cbroker:async_ask(Name, left, offer_l),
+
+    ?assertEqual(ok, cbroker:close(Name)),
+
+    ?assertMatch({drop, closed, _}, await(Ticket)),
+    ?assert(is_process_alive(Server)),
+    ?assertEqual(Broker, cbroker:resolve_name(Name)),
+    ?assertError(closed, cbroker:nb_ask(Name, right, offer_r)),
+
+    ok = gen_server:stop(Server),
+    ?assertError({broker_not_found, Name}, cbroker:close(Name)).
 
 % After a crash the name still points at the closed broker, so that asks fail
 % as `closed` until a restarted server replaces it

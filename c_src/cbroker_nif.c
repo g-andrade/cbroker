@@ -432,6 +432,7 @@ static void load_retry_resource(ErlNifEnv* caller_env);
 static ERL_NIF_TERM nif_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM nif_close(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM nif_debug_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM nif_alloc_perfcounters(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
@@ -440,7 +441,6 @@ static ERL_NIF_TERM nif_alloc_perfcounters(ErlNifEnv* env, int argc, const ERL_N
 static void broker_opts_init(broker_opts_t* opts, const size_t schedulers);
 static size_t new_broker_size(const size_t schedulers);
 static batch_t* global_state_init(global_state_t* global_state, const broker_opts_t* opts);
-static void global_state_close(global_state_t* global_state);
 static ERL_NIF_TERM global_state_to_term(ErlNifEnv* env, global_state_t* global_state);
 
 //
@@ -463,11 +463,11 @@ static thread_id_t get_or_assign_thread_id(const size_t schedulers);
 
 static ask_result_t ask_loop(ask_ctx_t* ctx);
 
-static void ask_loop_tail_get(ask_ctx_t* ctx);
+static bool ask_loop_tail_get(ask_ctx_t* ctx);
 static ask_result_t ask_loop_tail_ask(ask_ctx_t* ctx);
 static ask_result_t ask_loop_tail_offset_ask(ask_ctx_t* ctx, lease_t* lease, const offset_t offset,
                                              _Atomic(offset_t)* offset_counter);
-static void ask_loop_tail_skip(ask_ctx_t* ctx, const batch_id_t batch_id);
+static bool ask_loop_tail_skip(ask_ctx_t* ctx, const batch_id_t batch_id);
 static void ask_loop_tail_skip_consumed_opposite(ask_ctx_t* ctx, batch_id_t next_id);
 
 static request_t* ask_loop_request_prepare(ask_ctx_t* ctx, const batch_id_t batch_id,
@@ -511,6 +511,8 @@ static void retry_dtor(ErlNifEnv* caller_env, void* obj);
 
 static bool broker_checkout_batch(broker_t* broker, local_state_t* opt_local_state,
                                   batch_id_t batch_id, lease_t* out_lease);
+
+static void broker_close(ErlNifEnv* env, broker_t* broker, bool demonitor);
 
 static void broker_cancel_all_batch_cells(ErlNifEnv* env, broker_t* broker,
                                           ERL_NIF_TERM broker_term, local_state_t* local_state,
@@ -665,6 +667,7 @@ static struct {
 static ErlNifFunc nif_funcs[] = {{"new", 1, nif_new, 0},
                                  {"ask", 6, nif_ask, 0},
                                  {"cancel", 1, nif_cancel, 0},
+                                 {"close", 1, nif_close, 0},
                                  {"debug_info", 1, nif_debug_info, 0},
                                  {"alloc_perfcounters", 0, nif_alloc_perfcounters, 0}};
 
@@ -1111,6 +1114,29 @@ static ERL_NIF_TERM nif_cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
 
 //
 
+static ERL_NIF_TERM nif_close(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    ErlNifPid self;
+
+    if (!enif_self(env, &self)) {
+        return enif_make_badarg(env);
+    }
+
+    broker_t* broker = NULL;
+    ERL_NIF_TERM broker_term = argv[0];
+
+    if (!get_broker(env, broker_term, &broker)) {
+        return make_badarg(env, broker_term);
+    }
+
+    // TODO consume slices / yield?
+    broker_close(env, broker, false);
+
+    return Atoms._ok;
+}
+
+//
+
 static ERL_NIF_TERM nif_debug_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     broker_t* broker = NULL;
@@ -1233,12 +1259,6 @@ static batch_t* global_state_init(global_state_t* global_state, const broker_opt
     batch_pool_init(&global_state->batch_pool, &opts->batch_pool, opts->cells_per_batch);
 
     return first_batch;
-}
-
-static void global_state_close(global_state_t* global_state)
-{
-    bool prev_value = atomic_exchange(&global_state->is_closed, true);
-    assert(prev_value == false);
 }
 
 static ERL_NIF_TERM global_state_to_term(ErlNifEnv* env, global_state_t* global_state)
@@ -1372,17 +1392,29 @@ static ask_result_t ask_loop(ask_ctx_t* ctx)
 
     while (ctx->credits > 0) {
         if (lease->batch == NULL) {
-            ask_loop_tail_get(ctx);
-            assert(lease->batch != NULL);
+            if (ask_loop_tail_get(ctx)) {
+                assert(lease->batch != NULL);
+            }
+            else {
+                ask_res = ASK_RESULT_CLOSED;
+                goto ask_loop_closed;
+            }
         }
         assert(lease->found_locally);
+
+        //
 
         ask_res = ask_loop_tail_ask(ctx);
 
         switch (ask_res) {
         case ASK_RESULT_SKIP_BATCH:
-            ask_loop_tail_skip(ctx, ctx->lease.batch->id);
-            continue;
+            if (ask_loop_tail_skip(ctx, ctx->lease.batch->id)) {
+                continue;
+            }
+            else {
+                ask_res = ASK_RESULT_CLOSED;
+                goto ask_loop_closed;
+            }
         //
         case ASK_RESULT_AWAIT:
             ask_reply_await(ctx);
@@ -1403,6 +1435,7 @@ static ask_result_t ask_loop(ask_ctx_t* ctx)
             break;
         //
         case ASK_RESULT_CLOSED:
+        ask_loop_closed:
             stats_queue_balance_sub(stats, ctx->request_weight);
             ask_reply_closed(ctx);
             break;
@@ -1418,7 +1451,7 @@ static ask_result_t ask_loop(ask_ctx_t* ctx)
     return ASK_RESULT_OUT_OF_CREDITS;
 }
 
-static void ask_loop_tail_get(ask_ctx_t* ctx)
+static bool ask_loop_tail_get(ask_ctx_t* ctx)
 {
     lease_t* lease = &ctx->lease;
     local_state_t* local_state = ctx->local_state;
@@ -1430,9 +1463,10 @@ static void ask_loop_tail_get(ask_ctx_t* ctx)
         assert(batch != NULL);
         lease->batch = batch;
         lease->found_locally = true;
+        return true;
     }
     else {
-        ask_loop_tail_skip(ctx, tail_id);
+        return ask_loop_tail_skip(ctx, tail_id);
     }
 }
 
@@ -1529,7 +1563,7 @@ static ask_result_t ask_loop_tail_offset_ask(ask_ctx_t* ctx, lease_t* lease, con
     return ASK_RESULT_NONE;
 }
 
-static void ask_loop_tail_skip(ask_ctx_t* ctx, const batch_id_t batch_id)
+static bool ask_loop_tail_skip(ask_ctx_t* ctx, const batch_id_t batch_id)
 {
     cbroker_omap_result_t map_res = CBROKER_OMAP_NOMEM;
     lease_t* lease = &ctx->lease;
@@ -1541,12 +1575,18 @@ static void ask_loop_tail_skip(ask_ctx_t* ctx, const batch_id_t batch_id)
     assert(lease->batch == NULL || lease->batch->id == batch_id);
 
     batch_t* next_batch = NULL;
-
-    //
+    global_state_t* global_state = ctx->global_state;
 
     if (!cbroker_omap_next(local_state->batches, batch_id, NULL, (void**)&next_batch)) {
-        global_state_t* global_state = ctx->global_state;
         enif_mutex_lock(global_state->lock);
+
+        /* Checked under the lock that closing takes its snapshot of batches
+         * with: either we got here first and the batch we may be about to add
+         * is in that snapshot, or we see the flag. */
+        if (atomic_load(&global_state->is_closed)) {
+            enif_mutex_unlock(global_state->lock);
+            return false;
+        }
 
         batch_t** all_next = NULL;
         batch_t* one_of_next = NULL;
@@ -1615,6 +1655,7 @@ static void ask_loop_tail_skip(ask_ctx_t* ctx, const batch_id_t batch_id)
 
     lease->batch = next_batch;
     lease->found_locally = true;
+    return true;
 }
 
 static void ask_loop_tail_skip_consumed_opposite(ask_ctx_t* ctx, batch_id_t next_id)
@@ -2178,6 +2219,52 @@ static bool broker_checkout_batch(broker_t* broker, local_state_t* opt_local_sta
 
 //
 
+static void broker_close(ErlNifEnv* env, broker_t* broker, bool demonitor)
+{
+    if (demonitor) {
+        enif_demonitor_process(env, broker, &broker->creator_mon);
+    }
+
+    bool is_closed = false;
+
+    if (!atomic_compare_exchange_strong(&broker->global_state.is_closed, &is_closed, true)) {
+        // already closed, or in the process of closing
+        return;
+    }
+
+    local_states_dirty_close(broker->local_states, broker->schedulers);
+
+    local_state_t* local_state = broker_local_state(broker);
+    lease_t* leases = NULL;
+    size_t nr_of_batches = 0;
+    broker_checkout_all_batches(broker, local_state, &leases, &nr_of_batches);
+
+    //
+
+    ERL_NIF_TERM broker_term = enif_make_resource(env, broker);
+
+    for (size_t i = 0; i < nr_of_batches; i++) {
+        lease_t* lease = &leases[i];
+        batch_t* batch = lease->batch;
+        broker_cancel_all_batch_cells(env, broker, broker_term, local_state, batch, true);
+
+        if (lease->found_locally) {
+            batch_t* taken_batch = NULL;
+            cbroker_omap_take(local_state->batches, batch->id, (void**)&taken_batch);
+            assert(taken_batch != NULL);
+            assert(taken_batch == batch);
+            lease->found_locally = false;
+        }
+    }
+
+    //
+
+    broker_checkin_many_batches(broker, &leases, nr_of_batches);
+    assert(leases == NULL);
+}
+
+//
+
 static void broker_cancel_all_batch_cells(ErlNifEnv* env, broker_t* broker,
                                           ERL_NIF_TERM broker_term, local_state_t* local_state,
                                           batch_t* batch, bool did_broker_close)
@@ -2195,12 +2282,19 @@ static void broker_cancel_all_batch_cells(ErlNifEnv* env, broker_t* broker,
     for (offset_t offset = starting_offset; offset < batch->nr_of_cells; offset++) {
         cell_t* cell = &batch->cells[offset];
         request_t* request = atomic_load(cell);
+        bool did_cancel = false;
 
-        if (request == &sentinel_request_cancelled || request == &sentinel_request_matched) {
-            continue;
+        /* An asker that got its offset before the tails moved may still park
+         * here, between our load and our CAS: that fails the CAS with a waiting
+         * request, which is then ours to cancel. */
+        while (request != &sentinel_request_cancelled && request != &sentinel_request_matched) {
+            if (atomic_compare_exchange_strong(cell, &request, &sentinel_request_cancelled)) {
+                did_cancel = true;
+                break;
+            }
         }
 
-        if (atomic_compare_exchange_strong(cell, &request, &sentinel_request_cancelled)) {
+        if (did_cancel) {
             if (request != NULL) {
                 stats_queue_balance_sub(&broker->stats, request->weight);
 
@@ -2214,12 +2308,10 @@ static void broker_cancel_all_batch_cells(ErlNifEnv* env, broker_t* broker,
                     shenv_checkin(&request->shenv);
                     assert(request->shenv == NULL);
                     cbroker_free(request);
+                    enif_release_resource(broker);
                 }
                 enif_release_resource(ticket);
             }
-        }
-        else {
-            assert(request == &sentinel_request_matched);
         }
     }
 }
@@ -2350,36 +2442,7 @@ static void broker_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNif
         return;
     }
 
-    global_state_close(&broker->global_state);
-    local_states_dirty_close(broker->local_states, broker->schedulers);
-
-    local_state_t* local_state = broker_local_state(broker);
-    lease_t* leases = NULL;
-    size_t nr_of_batches = 0;
-    broker_checkout_all_batches(broker, local_state, &leases, &nr_of_batches);
-
-    //
-
-    ERL_NIF_TERM broker_term = enif_make_resource(caller_env, broker);
-
-    for (size_t i = 0; i < nr_of_batches; i++) {
-        lease_t* lease = &leases[i];
-        batch_t* batch = lease->batch;
-        broker_cancel_all_batch_cells(caller_env, broker, broker_term, local_state, batch, true);
-
-        if (lease->found_locally) {
-            batch_t* taken_batch = NULL;
-            cbroker_omap_take(local_state->batches, batch->id, (void**)&taken_batch);
-            assert(taken_batch != NULL);
-            assert(taken_batch == batch);
-            lease->found_locally = false;
-        }
-    }
-
-    //
-
-    broker_checkin_many_batches(broker, &leases, nr_of_batches);
-    assert(leases == NULL);
+    broker_close(caller_env, broker, false);
 }
 
 /*********************************************************************/
