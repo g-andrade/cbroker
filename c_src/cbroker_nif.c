@@ -112,6 +112,7 @@
     X(_right_tail,            "right_tail") \
     X(_schedulers,            "schedulers") \
     X(_shared_env_budget,     "shared_env_budget") \
+    X(_shutdowns,             "shutdowns") \
     X(_size,                  "size") \
     X(_stats,                 "stats") \
     X(_ticket,                "ticket") \
@@ -169,6 +170,7 @@ _Static_assert(ATOMIC_POINTER_LOCK_FREE == 2, "cbroker needs lock-free pointer a
 _Static_assert(sizeof(size_t) <= sizeof(void*) && sizeof(ptrdiff_t) <= sizeof(void*),
                "cbroker needs its atomic integers to be no wider than a pointer");
 
+typedef ptrdiff_t thread_id_t;
 typedef uint_fast64_t batch_id_t;
 typedef size_t offset_t;
 typedef ptrdiff_t ref_count_t;
@@ -342,7 +344,33 @@ typedef struct {
 
 //
 
-typedef ptrdiff_t thread_id_t;
+typedef enum {
+    SHUTDOWN_PHASE_NONE = 0,
+    SHUTDOWN_PHASE_REGULAR = 1,
+    SHUTDOWN_PHASE_BACKUP = 2
+} shutdown_phase_t;
+
+//
+
+typedef enum {
+    SHUTDOWN_CONTINUE = 0,
+    SHUTDOWN_PAUSE_NEXT_PHASE = 1,
+    SHUTDOWN_PAUSE_YIELD = 2
+} shutdown_pause_t;
+
+//
+
+typedef struct {
+    ErlNifPid caller_pid;
+    ErlNifMonitor caller_mon;
+    broker_t* broker;
+    //
+    size_t batch_idx;
+    offset_t cell_offset;
+    //
+    shutdown_phase_t phase;
+    size_t yield_copied_bytes;
+} shutdown_t;
 
 /*********************************************************************/
 
@@ -437,6 +465,7 @@ static void init_atoms(ErlNifEnv* caller_env);
 static void load_broker_resource(ErlNifEnv* caller_env);
 static void load_ticket_resource(ErlNifEnv* caller_env);
 static void load_retry_resource(ErlNifEnv* caller_env);
+static void load_shutdown_pauseource(ErlNifEnv* caller_env);
 
 //
 
@@ -527,12 +556,6 @@ static void retry_dtor(ErlNifEnv* caller_env, void* obj);
 static bool broker_checkout_batch(broker_t* broker, local_state_t* opt_local_state,
                                   batch_id_t batch_id, lease_t* out_lease);
 
-static void broker_close(ErlNifEnv* env, broker_t* broker, bool demonitor);
-
-static void broker_cancel_all_batch_cells(ErlNifEnv* env, broker_t* broker,
-                                          ERL_NIF_TERM broker_term, local_state_t* local_state,
-                                          batch_t* batch);
-
 static void broker_checkout_all_batches(broker_t* broker, local_state_t* opt_local_state,
                                         lease_t** out_array, size_t* out_nr_of_batches);
 
@@ -544,6 +567,19 @@ static void broker_dtor_cb_local_batch(batch_id_t key, void* obj, void* ctx);
 static void broker_dtor_cb_global_batch(batch_id_t key, void* obj, void* ctx);
 
 static void broker_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon);
+
+//
+
+static ERL_NIF_TERM shutdown_start(ErlNifEnv* env, broker_t* broker, ErlNifPid self);
+static ERL_NIF_TERM shutdown_continue(ErlNifEnv* env, shutdown_t* shutdown);
+
+static void shutdown_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon);
+static void shutdown_dtor(ErlNifEnv* caller_env, void* obj);
+
+static shutdown_pause_t shutdown_batch(ErlNifEnv* env, shutdown_t* shutdown, batch_t* batch);
+static shutdown_pause_t shutdown_cell(ErlNifEnv* env, shutdown_t* shutdown, cell_t* cell);
+static shutdown_pause_t shutdown_cell_notify(ErlNifEnv* env, shutdown_t* shutdown,
+                                             request_t* request);
 
 //
 
@@ -641,6 +677,9 @@ static int get_pool_opts(ErlNifEnv* env, ERL_NIF_TERM term, pool_opts_t* out_opt
 static int get_retry(ErlNifEnv* env, ERL_NIF_TERM term, retry_t** out_retry);
 
 static int get_ptrdiff_t(ErlNifEnv* env, ERL_NIF_TERM term, ptrdiff_t* out);
+
+static int get_shutdown(ErlNifEnv* env, ERL_NIF_TERM term, shutdown_t** out_shutdown);
+
 static int get_size_t(ErlNifEnv* env, ERL_NIF_TERM term, size_t* out);
 
 static int get_ticket(ErlNifEnv* env, ERL_NIF_TERM term, ticket_t** out_ticket);
@@ -671,13 +710,15 @@ static ERL_NIF_TERM make_pool_opts(ErlNifEnv* env, const pool_opts_t* opts);
 
 static ERL_NIF_TERM make_reply(ErlNifEnv* env, ERL_NIF_TERM tag, ERL_NIF_TERM reply);
 
+static ERL_NIF_TERM make_reply_drop(ErlNifEnv* env, request_t* request, const drop_reason_t reason);
+
 static ERL_NIF_TERM raise_tuple2(ErlNifEnv* env, ERL_NIF_TERM reason_type,
                                  ERL_NIF_TERM reason_content);
 
 //
 
 static size_t term_size(ErlNifEnv* env, ERL_NIF_TERM term);
-static inline void consume_timeslice(ErlNifEnv* env, const size_t copied_bytes);
+static inline int consume_timeslice(ErlNifEnv* env, const size_t copied_bytes);
 static ErlNifTime monotonic_ts(void);
 
 /*********************************************************************/
@@ -701,6 +742,7 @@ static struct {
     ErlNifResourceType* broker;
     ErlNifResourceType* ticket;
     ErlNifResourceType* retry;
+    ErlNifResourceType* shutdown;
 } ResourceTypes;
 
 static _Atomic(thread_id_t) next_thread_id = 0;
@@ -725,6 +767,7 @@ static _Atomic(int64_t) nr_of_live_envs = 0;
 static _Atomic(int64_t) nr_of_live_brokers = 0;
 static _Atomic(int64_t) nr_of_live_tickets = 0;
 static _Atomic(int64_t) nr_of_live_retries = 0;
+static _Atomic(int64_t) nr_of_live_shutdowns = 0;
 
 static void* cbroker_alloc(size_t size)
 {
@@ -792,6 +835,7 @@ static int on_load(ErlNifEnv* caller_env, void** priv_data, ERL_NIF_TERM load_in
     load_broker_resource(caller_env);
     load_ticket_resource(caller_env);
     load_retry_resource(caller_env);
+    load_shutdown_pauseource(caller_env);
 
     memset(&sentinel_request_cancelled, 0, sizeof(request_t));
     memset(&sentinel_request_matched, 0, sizeof(request_t));
@@ -835,6 +879,16 @@ static void load_retry_resource(ErlNifEnv* caller_env)
     ResourceTypes.retry =
         enif_init_resource_type(caller_env, "cbroker.retry", &callbacks, flags, &flags);
     assert(ResourceTypes.retry != NULL);
+}
+
+static void load_shutdown_pauseource(ErlNifEnv* caller_env)
+{
+    ErlNifResourceTypeInit callbacks = {shutdown_dtor, NULL, shutdown_down, 3, NULL};
+    ErlNifResourceFlags flags = ERL_NIF_RT_CREATE;
+
+    ResourceTypes.shutdown =
+        enif_init_resource_type(caller_env, "cbroker.shutdown", &callbacks, flags, &flags);
+    assert(ResourceTypes.shutdown != NULL);
 }
 
 ERL_NIF_INIT(cbroker_nif, nif_funcs, on_load, NULL, NULL, NULL);
@@ -1158,24 +1212,20 @@ static ERL_NIF_TERM nif_close(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[
     }
 
     broker_t* broker = NULL;
-    ERL_NIF_TERM broker_term = argv[0];
+    shutdown_t* shutdown = NULL;
 
-    if (!get_broker(env, broker_term, &broker)) {
-        return make_badarg(env, broker_term);
+    ERL_NIF_TERM arg0 = argv[0];
+
+    if (!(get_shutdown(env, arg0, &shutdown) || get_broker(env, arg0, &broker))) {
+        return make_badarg(env, arg0);
     }
-
-    /* TODO yield?
-     *
-     * Perhaps not feasible:
-     * * if we use enif_schedule_nif(), the caller may be killed in-between scheduled calls;
-     * * if we use a dirty scheduler, the caller may also be killed while the call is ongoing.
-     *
-     * In either case, we'd stop being able to send messages to the dequeued processes;
-     * namely, to notify they've been dropped.
-     */
-    broker_close(env, broker, true);
-
-    return Atoms._ok;
+    else if (shutdown != NULL) {
+        return shutdown_continue(env, shutdown);
+    }
+    else {
+        assert(broker != NULL);
+        return shutdown_start(env, broker, self);
+    }
 }
 
 //
@@ -1244,13 +1294,14 @@ static ERL_NIF_TERM nif_debug_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM 
 static ERL_NIF_TERM nif_alloc_perfcounters(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
 #ifdef CBROKER_COUNT_ALLOCS
-    return enif_make_list5(env,
+    return enif_make_list6(env,
                            //
                            make_perfcounter(env, Atoms._blocks, &nr_of_live_blocks),
                            make_perfcounter(env, Atoms._envs, &nr_of_live_envs),
                            make_perfcounter(env, Atoms._brokers, &nr_of_live_brokers),
                            make_perfcounter(env, Atoms._tickets, &nr_of_live_tickets),
-                           make_perfcounter(env, Atoms._retries, &nr_of_live_retries));
+                           make_perfcounter(env, Atoms._retries, &nr_of_live_retries),
+                           make_perfcounter(env, Atoms._shutdowns, &nr_of_live_shutdowns));
 #else
     return Atoms._unavailable;
 #endif
@@ -2223,103 +2274,6 @@ static bool broker_checkout_batch(broker_t* broker, local_state_t* opt_local_sta
 
 //
 
-static void broker_close(ErlNifEnv* env, broker_t* broker, bool demonitor)
-{
-    if (demonitor) {
-        enif_demonitor_process(env, broker, &broker->creator_mon);
-    }
-
-    bool is_closed = false;
-
-    if (!atomic_compare_exchange_strong(&broker->global_state.is_closed, &is_closed, true)) {
-        // already closed, or in the process of closing
-        return;
-    }
-
-    local_state_t* local_state = broker_local_state(broker);
-    lease_t* leases = NULL;
-    size_t nr_of_batches = 0;
-    broker_checkout_all_batches(broker, local_state, &leases, &nr_of_batches);
-
-    //
-
-    ERL_NIF_TERM broker_term = enif_make_resource(env, broker);
-
-    for (size_t i = 0; i < nr_of_batches; i++) {
-        lease_t* lease = &leases[i];
-        batch_t* batch = lease->batch;
-        broker_cancel_all_batch_cells(env, broker, broker_term, local_state, batch);
-
-        if (lease->found_locally) {
-            batch_t* taken_batch = NULL;
-            cbroker_omap_take(local_state->batches, batch->id, (void**)&taken_batch);
-            assert(taken_batch != NULL);
-            assert(taken_batch == batch);
-            lease->found_locally = false;
-        }
-    }
-
-    //
-
-    broker_checkin_many_batches(broker, &leases, nr_of_batches);
-    assert(leases == NULL);
-}
-
-//
-
-static void broker_cancel_all_batch_cells(ErlNifEnv* env, broker_t* broker,
-                                          ERL_NIF_TERM broker_term, local_state_t* local_state,
-                                          batch_t* batch)
-{
-    size_t consumed_count = atomic_load(&batch->consumed_count);
-    if (consumed_count >= batch->nr_of_cells) {
-        return;
-    }
-
-    atomic_store(&batch->consumed_count, batch->nr_of_cells);
-    offset_t left_offset = atomic_exchange(&batch->left_tail, batch->nr_of_cells);
-    offset_t right_offset = atomic_exchange(&batch->right_tail, batch->nr_of_cells);
-    offset_t starting_offset = MIN(left_offset, right_offset);
-
-    for (offset_t offset = starting_offset; offset < batch->nr_of_cells; offset++) {
-        cell_t* cell = &batch->cells[offset];
-        request_t* request = atomic_load(cell);
-        bool did_cancel = false;
-
-        /* An asker that got its offset before the tails moved may still park
-         * here, between our load and our CAS: that fails the CAS with a waiting
-         * request, which is then ours to cancel. */
-        while (request != &sentinel_request_cancelled && request != &sentinel_request_matched) {
-            if (atomic_compare_exchange_strong(cell, &request, &sentinel_request_cancelled)) {
-                did_cancel = true;
-                break;
-            }
-        }
-
-        if (did_cancel) {
-            if (request != NULL) {
-                stats_queue_balance_sub(&broker->stats, request->weight);
-
-                ticket_t* ticket = (ticket_t*)request->ticket;
-                assert(ticket != NULL);
-
-                if (enif_demonitor_process(env, ticket, &ticket->mon) == 0) {
-                    notify_of_cancellation(env, request, DROP_REASON_CLOSED);
-                    ticket->request = NULL;
-
-                    shenv_reclaim(&request->shenv, local_state, &broker->opts);
-                    assert(request->shenv == NULL);
-                    cbroker_free(request);
-                    enif_release_resource(broker);
-                }
-                enif_release_resource(ticket);
-            }
-        }
-    }
-}
-
-//
-
 static void broker_checkout_all_batches(broker_t* broker, local_state_t* opt_local_state,
                                         lease_t** out_array, size_t* out_nr_of_batches)
 {
@@ -2444,7 +2398,240 @@ static void broker_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNif
         return;
     }
 
-    broker_close(caller_env, broker, false);
+    ErlNifPid undefined_pid;
+    enif_set_pid_undefined(&undefined_pid);
+
+    shutdown_start(caller_env, broker, undefined_pid);
+}
+
+/*********************************************************************/
+
+static ERL_NIF_TERM shutdown_start(ErlNifEnv* env, broker_t* broker, ErlNifPid self)
+{
+    global_state_t* global_state = &broker->global_state;
+    bool is_closed = false;
+    const bool is_caller_a_down_cb = enif_is_pid_undefined(&self);
+
+    if (!atomic_compare_exchange_strong(&global_state->is_closed, &is_closed, true)) {
+        // already closed, or in the process of closing
+        return Atoms._ok;
+    }
+
+    if (!is_caller_a_down_cb) {
+        enif_demonitor_process(env, broker, &broker->creator_mon);
+    }
+
+    // wait for any locked callers to clear out of the way
+    enif_mutex_lock(global_state->lock);
+    enif_mutex_unlock(global_state->lock);
+
+    // from now on it's safe to access the global batch array
+
+    shutdown_t* shutdown =
+        cbroker_alloc_resource(&nr_of_live_shutdowns, ResourceTypes.shutdown, sizeof(shutdown_t));
+    memset(shutdown, 0, sizeof(shutdown_t));
+
+    shutdown->caller_pid = self;
+    if (!is_caller_a_down_cb) {
+        int mon_res = enif_monitor_process(env, shutdown, &self, &shutdown->caller_mon);
+        assert(mon_res == 0);
+    }
+
+    shutdown->broker = broker;
+    enif_keep_resource(broker); // to be released when we're done
+
+    shutdown->batch_idx = 0;
+    shutdown->cell_offset = 0;
+    shutdown->phase = (is_caller_a_down_cb ? SHUTDOWN_PHASE_BACKUP : SHUTDOWN_PHASE_REGULAR);
+
+    if (!is_caller_a_down_cb) {
+        // Keep an extra reference to ensure that the monitor will be triggered
+        // if the caller is killed in-between calls, since the latter then loses
+        // the reference that was going to get passed.
+        enif_keep_resource(shutdown);
+    }
+
+    return shutdown_continue(env, shutdown);
+}
+
+//
+
+static ERL_NIF_TERM shutdown_continue(ErlNifEnv* env, shutdown_t* shutdown)
+{
+    // this is safe since no other thread will modify the global batch array at this point
+    global_state_t* global_state = &shutdown->broker->global_state;
+    const size_t nr_of_batches = cbroker_omap_size(global_state->batches);
+    batch_t** batches = (batch_t**)cbroker_omap_values(global_state->batches);
+
+    shutdown_pause_t pause = SHUTDOWN_CONTINUE;
+    const bool was_initial_caller_a_down_cb = enif_is_pid_undefined(&shutdown->caller_pid);
+
+    while (shutdown->batch_idx < nr_of_batches && pause == SHUTDOWN_CONTINUE) {
+        batch_t* batch = batches[shutdown->batch_idx];
+        pause = shutdown_batch(env, shutdown, batch);
+    }
+
+    //
+
+    if (shutdown->batch_idx >= nr_of_batches) {
+        broker_t* broker = shutdown->broker;
+        memset(shutdown, 0, sizeof(shutdown_t));
+        enif_release_resource(broker);
+
+        enif_release_resource(shutdown);
+
+        if (!was_initial_caller_a_down_cb) {
+            enif_demonitor_process(env, shutdown, &shutdown->caller_mon);
+            enif_release_resource(shutdown); // Extra reference (see shutdown_start)
+        }
+
+        return Atoms._ok;
+    }
+    else if (pause == SHUTDOWN_PAUSE_YIELD) {
+        assert(shutdown->batch_idx < nr_of_batches);
+        assert(shutdown->phase == SHUTDOWN_PHASE_REGULAR);
+        ERL_NIF_TERM shutdown_term = enif_make_resource(env, shutdown);
+        enif_release_resource(shutdown);
+        return enif_schedule_nif(env, "nif_close", 0, nif_close, 1, &shutdown_term);
+    }
+    else {
+        assert(pause == SHUTDOWN_PAUSE_NEXT_PHASE);
+        // we'll resume execution after the monitor triggers
+        assert(shutdown->batch_idx < nr_of_batches);
+        assert(shutdown->phase == SHUTDOWN_PHASE_REGULAR);
+        LOG_UNCOND("OJHHH!");
+        return Atoms._ok;
+    }
+}
+
+//
+
+static void shutdown_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon)
+{
+    shutdown_t* shutdown = (shutdown_t*)obj;
+
+    assert(shutdown->phase == SHUTDOWN_PHASE_REGULAR);
+    shutdown->phase = SHUTDOWN_PHASE_BACKUP;
+
+    ERL_NIF_TERM res = shutdown_continue(caller_env, shutdown);
+    assert(res == Atoms._ok);
+}
+
+//
+
+static void shutdown_dtor(ErlNifEnv* caller_env, void* obj)
+{
+    cbroker_count_dtor(&nr_of_live_shutdowns);
+    shutdown_t* shutdown = (shutdown_t*)obj;
+
+    // Assert that the DOWN callback was triggered and finished the job
+    assert(shutdown->broker == NULL);
+    assert(shutdown->batch_idx == 0);
+    assert(shutdown->cell_offset == 0);
+    assert(shutdown->phase == SHUTDOWN_PHASE_NONE);
+    assert(shutdown->yield_copied_bytes == 0);
+}
+
+//
+
+static shutdown_pause_t shutdown_batch(ErlNifEnv* env, shutdown_t* shutdown, batch_t* batch)
+{
+    const size_t nr_of_cells = batch->nr_of_cells;
+    shutdown_pause_t pause = SHUTDOWN_CONTINUE;
+
+    if (shutdown->cell_offset == 0) {
+        size_t consumed_count = atomic_load(&batch->consumed_count);
+        if (consumed_count >= nr_of_cells) {
+            goto shutdown_batch_done;
+        }
+
+        atomic_store(&batch->consumed_count, batch->nr_of_cells);
+        offset_t left_offset = atomic_exchange(&batch->left_tail, batch->nr_of_cells);
+        offset_t right_offset = atomic_exchange(&batch->right_tail, batch->nr_of_cells);
+        shutdown->cell_offset = MIN(left_offset, right_offset);
+    }
+
+    if (shutdown->cell_offset >= nr_of_cells) {
+        goto shutdown_batch_done;
+    }
+
+    while (shutdown->cell_offset < nr_of_cells && pause == SHUTDOWN_CONTINUE) {
+        cell_t* cell = &batch->cells[shutdown->cell_offset];
+        pause = shutdown_cell(env, shutdown, cell);
+        shutdown->cell_offset++;
+    }
+
+    if (shutdown->cell_offset >= nr_of_cells) {
+    shutdown_batch_done:
+        shutdown->batch_idx++;
+        shutdown->cell_offset = 0;
+    }
+
+    return pause;
+}
+
+//
+
+static shutdown_pause_t shutdown_cell(ErlNifEnv* env, shutdown_t* shutdown, cell_t* cell)
+{
+    request_t* request = atomic_load(cell);
+    bool did_cancel = false;
+    shutdown_pause_t pause = SHUTDOWN_CONTINUE;
+
+    while (request != &sentinel_request_cancelled && request != &sentinel_request_matched) {
+        if (atomic_compare_exchange_strong(cell, &request, &sentinel_request_cancelled)) {
+            did_cancel = true;
+            break;
+        }
+    }
+
+    if (did_cancel && request != NULL) {
+        stats_queue_balance_sub(&shutdown->broker->stats, request->weight);
+
+        ticket_t* ticket = (ticket_t*)request->ticket;
+        assert(ticket != NULL);
+
+        if (enif_demonitor_process(env, ticket, &ticket->mon) == 0) {
+            pause = shutdown_cell_notify(env, shutdown, request);
+            ticket->request = NULL;
+
+            shenv_reclaim(&request->shenv, NULL, &shutdown->broker->opts);
+            assert(request->shenv == NULL);
+            cbroker_free(request);
+            enif_release_resource(shutdown->broker);
+        }
+        enif_release_resource(ticket);
+    }
+
+    return pause;
+}
+
+//
+
+static shutdown_pause_t shutdown_cell_notify(ErlNifEnv* env, shutdown_t* shutdown,
+                                             request_t* request)
+{
+    ERL_NIF_TERM msg = make_reply_drop(env, request, DROP_REASON_CLOSED);
+
+    if (shutdown->phase == SHUTDOWN_PHASE_REGULAR) {
+        if (!enif_send(env, &request->pid, NULL, msg) && (!enif_is_current_process_alive(env))) {
+            // backup notification using NULL env
+            either_notify_or_assert_not_alive(NULL, &request->pid, NULL, msg);
+            return SHUTDOWN_PAUSE_NEXT_PHASE;
+        }
+
+        shutdown->yield_copied_bytes += term_size(env, msg);
+
+        if (consume_timeslice(env, shutdown->yield_copied_bytes)) {
+            shutdown->yield_copied_bytes = 0;
+            return SHUTDOWN_PAUSE_YIELD;
+        }
+    }
+    else {
+        assert(shutdown->phase == SHUTDOWN_PHASE_BACKUP);
+        either_notify_or_assert_not_alive(env, &request->pid, NULL, msg);
+    }
+    return SHUTDOWN_CONTINUE;
 }
 
 /*********************************************************************/
@@ -2492,7 +2679,10 @@ static void lease_ref_count_dec(lease_t* lease)
         global_state_t* global_state = &broker->global_state;
         enif_mutex_lock(global_state->lock);
 
-        if (cbroker_omap_lookup(global_state->batches, batch_id, (void**)&batch)) {
+        if (atomic_load(&global_state->is_closed)) {
+            // broker is either closed or being shutdown, we can't write to the global batch array
+        }
+        else if (cbroker_omap_lookup(global_state->batches, batch_id, (void**)&batch)) {
             ref_count = atomic_load_explicit(&batch->ref_count, memory_order_acquire);
             assert(ref_count >= 1);
 
@@ -2549,15 +2739,7 @@ static bool lease_consume_slot(lease_t* lease)
 
 static void notify_of_cancellation(ErlNifEnv* env, request_t* request, const drop_reason_t reason)
 {
-    assert(request->ticket != NULL);
-    int64_t sojourn_time = monotonic_ts() - request->enqueue_ts;
-
-    ERL_NIF_TERM tag =
-        (request->reply_ref == Atoms._ticket ? enif_make_resource(env, request->ticket)
-                                             : enif_make_copy(env, request->reply_ref));
-
-    ERL_NIF_TERM cancelled = make_drop(env, reason, sojourn_time);
-    ERL_NIF_TERM msg = make_reply(env, tag, cancelled);
+    ERL_NIF_TERM msg = make_reply_drop(env, request, reason);
     either_notify_or_assert_not_alive(env, &request->pid, NULL, msg);
 }
 
@@ -3406,6 +3588,13 @@ static int get_ptrdiff_t(ErlNifEnv* env, ERL_NIF_TERM term, ptrdiff_t* out)
 
 //
 
+static int get_shutdown(ErlNifEnv* env, ERL_NIF_TERM term, shutdown_t** out_shutdown)
+{
+    return enif_get_resource(env, term, ResourceTypes.shutdown, (void**)out_shutdown);
+}
+
+//
+
 static int get_size_t(ErlNifEnv* env, ERL_NIF_TERM term, size_t* out)
 {
     uint64_t value;
@@ -3557,6 +3746,19 @@ static ERL_NIF_TERM make_reply(ErlNifEnv* env, ERL_NIF_TERM tag, ERL_NIF_TERM re
     return enif_make_tuple2(env, tag, reply);
 }
 
+static ERL_NIF_TERM make_reply_drop(ErlNifEnv* env, request_t* request, const drop_reason_t reason)
+{
+    assert(request->ticket != NULL);
+    int64_t sojourn_time = monotonic_ts() - request->enqueue_ts;
+
+    ERL_NIF_TERM tag =
+        (request->reply_ref == Atoms._ticket ? enif_make_resource(env, request->ticket)
+                                             : enif_make_copy(env, request->reply_ref));
+
+    ERL_NIF_TERM cancelled = make_drop(env, reason, sojourn_time);
+    return make_reply(env, tag, cancelled);
+}
+
 static ERL_NIF_TERM raise_tuple2(ErlNifEnv* env, ERL_NIF_TERM reason_type,
                                  ERL_NIF_TERM reason_content)
 {
@@ -3582,10 +3784,10 @@ static size_t term_size(ErlNifEnv* env, ERL_NIF_TERM term)
 
 //
 
-static inline void consume_timeslice(ErlNifEnv* env, const size_t copied_bytes)
+static inline int consume_timeslice(ErlNifEnv* env, const size_t copied_bytes)
 {
     if (copied_bytes == 0) {
-        return;
+        return 0;
     }
 
     // in memory words
@@ -3600,8 +3802,9 @@ static inline void consume_timeslice(ErlNifEnv* env, const size_t copied_bytes)
     int percent = (int)MAX(1, MIN(100, (100 * msg_copy_reds) / magic_v2));
 
     if (percent != 0) {
-        enif_consume_timeslice(env, percent);
+        return enif_consume_timeslice(env, percent);
     }
+    return 0;
 }
 
 static ErlNifTime monotonic_ts() { return enif_monotonic_time(ERL_NIF_NSEC); }
