@@ -2194,30 +2194,36 @@ static bool broker_checkout_batch(broker_t* broker, local_state_t* opt_local_sta
 {
     batch_t* batch = NULL;
 
-    if (opt_local_state != NULL && (batch = local_state_get_batch(opt_local_state, batch_id))) {
+    if (opt_local_state != NULL) {
+        if (opt_local_state->left_tail_id > batch_id && opt_local_state->right_tail_id > batch_id) {
+            // both local tails have moved past batch_id, that batch is gone
+            return false;
+        }
+
+        if ((batch = local_state_get_batch(opt_local_state, batch_id))) {
+            out_lease->batch = batch;
+            out_lease->found_locally = true;
+            out_lease->broker = broker;
+            out_lease->opt_local_state = opt_local_state;
+            return true;
+        }
+    }
+
+    global_state_t* global_state = &broker->global_state;
+    enif_mutex_lock(global_state->lock);
+
+    if (cbroker_omap_lookup(global_state->batches, batch_id, (void**)&batch)) {
+        atomic_fetch_add_explicit(&batch->ref_count, 1, memory_order_relaxed);
+        enif_mutex_unlock(global_state->lock);
         out_lease->batch = batch;
-        out_lease->found_locally = true;
+        out_lease->found_locally = false;
         out_lease->broker = broker;
         out_lease->opt_local_state = opt_local_state;
         return true;
     }
     else {
-        global_state_t* global_state = &broker->global_state;
-        enif_mutex_lock(global_state->lock);
-
-        if (cbroker_omap_lookup(global_state->batches, batch_id, (void**)&batch)) {
-            atomic_fetch_add_explicit(&batch->ref_count, 1, memory_order_relaxed);
-            enif_mutex_unlock(global_state->lock);
-            out_lease->batch = batch;
-            out_lease->found_locally = false;
-            out_lease->broker = broker;
-            out_lease->opt_local_state = opt_local_state;
-            return true;
-        }
-        else {
-            enif_mutex_unlock(global_state->lock);
-            return false;
-        }
+        enif_mutex_unlock(global_state->lock);
+        return false;
     }
 }
 
