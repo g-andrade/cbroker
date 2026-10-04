@@ -279,7 +279,6 @@ typedef struct {
 //
 
 typedef struct {
-    bool is_closed;
     cbroker_omap_t* batches;
     batch_id_t left_tail_id;
     batch_id_t right_tail_id;
@@ -453,14 +452,13 @@ static ERL_NIF_TERM nif_alloc_perfcounters(ErlNifEnv* env, int argc, const ERL_N
 static void broker_opts_init(broker_opts_t* opts, const size_t schedulers);
 static size_t new_broker_size(const size_t schedulers);
 static batch_t* global_state_init(global_state_t* global_state, const broker_opts_t* opts);
+static bool global_state_is_closed_relaxed(global_state_t* global_state);
 static ERL_NIF_TERM global_state_to_term(ErlNifEnv* env, global_state_t* global_state);
 
 //
 
 static void local_states_init(local_state_t local_states[], const size_t schedulers,
                               const broker_opts_t* opts, batch_t* first_batch);
-
-static void local_states_dirty_close(local_state_t local_states[], const size_t schedulers);
 
 static local_state_t* broker_local_state(broker_t* broker);
 
@@ -970,13 +968,13 @@ static ERL_NIF_TERM nif_ask(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     ctx.global_state = &ctx.broker->global_state;
 
+    if (global_state_is_closed_relaxed(ctx.global_state)) {
+        return make_error(env, Atoms._closed);
+    }
+
     LOG("[ask] Getting local state");
     ctx.local_state = broker_local_state(ctx.broker);
     assert(ctx.local_state != NULL);
-
-    if (ctx.local_state->is_closed) {
-        return make_error(env, Atoms._closed);
-    }
 
     if (ctx.is_left) {
         ctx.tail_id_ptr = &ctx.local_state->left_tail_id;
@@ -1175,7 +1173,7 @@ static ERL_NIF_TERM nif_close(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[
      * In either case, we'd stop being able to send messages to the dequeued processes;
      * namely, to notify they've been dropped.
      */
-    broker_close(env, broker, false);
+    broker_close(env, broker, true);
 
     return Atoms._ok;
 }
@@ -1306,6 +1304,11 @@ static batch_t* global_state_init(global_state_t* global_state, const broker_opt
     return first_batch;
 }
 
+static bool global_state_is_closed_relaxed(global_state_t* global_state)
+{
+    return atomic_load_explicit(&global_state->is_closed, memory_order_relaxed);
+}
+
 static ERL_NIF_TERM global_state_to_term(ErlNifEnv* env, global_state_t* global_state)
 {
     return enif_make_list1(
@@ -1323,7 +1326,6 @@ static void local_states_init(local_state_t local_states[], const size_t schedul
 
     for (size_t thread_id = 0; thread_id < schedulers; thread_id++) {
         local_state_t* local_state = &local_states[thread_id];
-        local_state->is_closed = false;
         local_state->batches = cbroker_omap_new();
 
         map_res = cbroker_omap_insert(local_state->batches, first_batch->id, first_batch);
@@ -1337,14 +1339,6 @@ static void local_states_init(local_state_t local_states[], const size_t schedul
         request_pool_init(&local_state->request_pool, &opts->request_pool);
         ticket_pool_init(&local_state->ticket_pool, &opts->ticket_pool);
         shenv_pool_init(&local_state->shenv_pool);
-    }
-}
-
-static void local_states_dirty_close(local_state_t local_states[], const size_t schedulers)
-{
-    for (size_t thread_id = 0; thread_id < schedulers; thread_id++) {
-        local_state_t* local_state = &local_states[thread_id];
-        local_state->is_closed = true; // dirty write
     }
 }
 
@@ -1533,7 +1527,7 @@ static ask_result_t ask_loop_tail_ask(ask_ctx_t* ctx)
         if (ask_res) {
             return ask_res;
         }
-        else if (ctx->local_state->is_closed) {
+        else if (global_state_is_closed_relaxed(ctx->global_state)) {
             return ASK_RESULT_CLOSED;
         }
     }
@@ -2241,8 +2235,6 @@ static void broker_close(ErlNifEnv* env, broker_t* broker, bool demonitor)
         // already closed, or in the process of closing
         return;
     }
-
-    local_states_dirty_close(broker->local_states, broker->schedulers);
 
     local_state_t* local_state = broker_local_state(broker);
     lease_t* leases = NULL;
