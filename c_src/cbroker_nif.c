@@ -54,6 +54,9 @@
 
 #define SHENV_POOL_MAX_COUNT 16
 
+#define SHUTDOWN_YIELD_CHECK_WALKED_CELLS 256
+#define SHUTDOWN_YIELD_ANYWAY_WALKED_CELLS 2048
+
 // in bytes
 #define SHARED_ENV_DEFAULT_BUDGET (16 * 1024)
 
@@ -370,6 +373,7 @@ typedef struct {
     //
     shutdown_phase_t phase;
     size_t yield_copied_bytes;
+    size_t yield_walked_cells;
 } shutdown_t;
 
 /*********************************************************************/
@@ -2474,6 +2478,10 @@ static ERL_NIF_TERM shutdown_continue(ErlNifEnv* env, shutdown_t* shutdown)
     //
 
     if (shutdown->batch_idx >= nr_of_batches) {
+        if (!was_initial_caller_a_down_cb) {
+            enif_demonitor_process(env, shutdown, &shutdown->caller_mon);
+        }
+
         broker_t* broker = shutdown->broker;
         memset(shutdown, 0, sizeof(shutdown_t));
         enif_release_resource(broker);
@@ -2481,7 +2489,6 @@ static ERL_NIF_TERM shutdown_continue(ErlNifEnv* env, shutdown_t* shutdown)
         enif_release_resource(shutdown);
 
         if (!was_initial_caller_a_down_cb) {
-            enif_demonitor_process(env, shutdown, &shutdown->caller_mon);
             enif_release_resource(shutdown); // Extra reference (see shutdown_start)
         }
 
@@ -2491,7 +2498,6 @@ static ERL_NIF_TERM shutdown_continue(ErlNifEnv* env, shutdown_t* shutdown)
         assert(shutdown->batch_idx < nr_of_batches);
         assert(shutdown->phase == SHUTDOWN_PHASE_REGULAR);
         ERL_NIF_TERM shutdown_term = enif_make_resource(env, shutdown);
-        enif_release_resource(shutdown);
         return enif_schedule_nif(env, "nif_close", 0, nif_close, 1, &shutdown_term);
     }
     else {
@@ -2499,7 +2505,6 @@ static ERL_NIF_TERM shutdown_continue(ErlNifEnv* env, shutdown_t* shutdown)
         // we'll resume execution after the monitor triggers
         assert(shutdown->batch_idx < nr_of_batches);
         assert(shutdown->phase == SHUTDOWN_PHASE_REGULAR);
-        LOG_UNCOND("OJHHH!");
         return Atoms._ok;
     }
 }
@@ -2603,6 +2608,23 @@ static shutdown_pause_t shutdown_cell(ErlNifEnv* env, shutdown_t* shutdown, cell
         enif_release_resource(ticket);
     }
 
+    //
+
+    if (shutdown->phase == SHUTDOWN_PHASE_REGULAR && pause == SHUTDOWN_CONTINUE) {
+        const size_t walked_cells = shutdown->yield_walked_cells++;
+
+        if (walked_cells >= SHUTDOWN_YIELD_CHECK_WALKED_CELLS) {
+            bool should_yield = (consume_timeslice(env, shutdown->yield_copied_bytes) ||
+                                 walked_cells >= SHUTDOWN_YIELD_ANYWAY_WALKED_CELLS);
+
+            if (should_yield) {
+                shutdown->yield_copied_bytes = 0;
+                shutdown->yield_walked_cells = 0;
+                pause = SHUTDOWN_PAUSE_YIELD;
+            }
+        }
+    }
+
     return pause;
 }
 
@@ -2621,11 +2643,6 @@ static shutdown_pause_t shutdown_cell_notify(ErlNifEnv* env, shutdown_t* shutdow
         }
 
         shutdown->yield_copied_bytes += term_size(env, msg);
-
-        if (consume_timeslice(env, shutdown->yield_copied_bytes)) {
-            shutdown->yield_copied_bytes = 0;
-            return SHUTDOWN_PAUSE_YIELD;
-        }
     }
     else {
         assert(shutdown->phase == SHUTDOWN_PHASE_BACKUP);
