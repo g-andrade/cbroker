@@ -2461,7 +2461,7 @@ static ERL_NIF_TERM shutdown_continue(ErlNifEnv* env, shutdown_t* shutdown)
     //
 
     if (shutdown->batch_idx >= nr_of_batches) {
-        if (!was_initial_caller_a_down_cb) {
+        if (!was_initial_caller_a_down_cb && shutdown->can_yield) {
             enif_demonitor_process(env, shutdown, &shutdown->caller_mon);
         }
 
