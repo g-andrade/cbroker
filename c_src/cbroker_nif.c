@@ -531,7 +531,7 @@ static void broker_close(ErlNifEnv* env, broker_t* broker, bool demonitor);
 
 static void broker_cancel_all_batch_cells(ErlNifEnv* env, broker_t* broker,
                                           ERL_NIF_TERM broker_term, local_state_t* local_state,
-                                          batch_t* batch, bool did_broker_close);
+                                          batch_t* batch);
 
 static void broker_checkout_all_batches(broker_t* broker, local_state_t* opt_local_state,
                                         lease_t** out_array, size_t* out_nr_of_batches);
@@ -2248,7 +2248,7 @@ static void broker_close(ErlNifEnv* env, broker_t* broker, bool demonitor)
     for (size_t i = 0; i < nr_of_batches; i++) {
         lease_t* lease = &leases[i];
         batch_t* batch = lease->batch;
-        broker_cancel_all_batch_cells(env, broker, broker_term, local_state, batch, true);
+        broker_cancel_all_batch_cells(env, broker, broker_term, local_state, batch);
 
         if (lease->found_locally) {
             batch_t* taken_batch = NULL;
@@ -2269,7 +2269,7 @@ static void broker_close(ErlNifEnv* env, broker_t* broker, bool demonitor)
 
 static void broker_cancel_all_batch_cells(ErlNifEnv* env, broker_t* broker,
                                           ERL_NIF_TERM broker_term, local_state_t* local_state,
-                                          batch_t* batch, bool did_broker_close)
+                                          batch_t* batch)
 {
     size_t consumed_count = atomic_load(&batch->consumed_count);
     if (consumed_count >= batch->nr_of_cells) {
