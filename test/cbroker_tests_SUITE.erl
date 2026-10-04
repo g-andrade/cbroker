@@ -69,6 +69,10 @@
     creator_may_die_after_closing/1,
     cancelling_after_closing_is_too_late/1,
     %
+    offers_survive_any_shared_env_budget/1,
+    offers_survive_leaving_out_of_order/1,
+    offers_survive_their_env_being_reused/1,
+    %
     queue_limit_opts_are_reported/1,
     queue_balance_follows_waiters/1,
     queue_balance_settles_after_every_outcome/1,
@@ -163,6 +167,15 @@ groups() ->
                 any_process_may_close,
                 creator_may_die_after_closing,
                 cancelling_after_closing_is_too_late
+            ]
+        },
+        {
+            shared_envs,
+            [parallel],
+            [
+                offers_survive_any_shared_env_budget,
+                offers_survive_leaving_out_of_order,
+                offers_survive_their_env_being_reused
             ]
         },
         {
@@ -524,7 +537,8 @@ invalid_opts_are_rejected(_Config) ->
         max_right_balance,
         ask_credits,
         ask_max_tries,
-        batch_pool
+        batch_pool,
+        shared_env_budget
     ],
     BadValue = [
         {depends_on_creator, sometimes},
@@ -556,7 +570,12 @@ invalid_opts_are_rejected(_Config) ->
         {ask_credits, 1 bsl 31},
         {ask_max_tries, 0},
         {ask_max_tries, -1},
-        {ask_max_tries, many}
+        {ask_max_tries, many},
+        {shared_env_budget, 0},
+        {shared_env_budget, -1},
+        {shared_env_budget, 1.0},
+        {shared_env_budget, many},
+        {shared_env_budget, 1 bsl 64}
     ],
     BadPoolOpts = [
         not_a_list,
@@ -652,6 +671,80 @@ cancelling_after_closing_is_too_late(_Config) ->
 
     ?assertEqual(too_late, cbroker:cancel(Ticket)),
     ?assertMatch({drop, closed, _}, await(Ticket)).
+
+%%
+
+% A budget of one byte gives every offer an env of its own, small ones make
+% them roll over mid-queue, and the default fits them all in one
+offers_survive_any_shared_env_budget(_Config) ->
+    lists:foreach(
+        fun(Budget) ->
+            Broker = cbroker:new([{shared_env_budget, Budget}]),
+            Parked = [{Offer, park_offer(Broker, Offer)} || Offer <- offers()],
+
+            lists:foreach(
+                fun({Offer, Ticket}) ->
+                    ?assertMatch({match, _, Offer, _}, cbroker:nb_ask(Broker, right, Offer)),
+                    ?assertMatch({match, _, Offer, _}, await(Ticket))
+                end,
+                Parked
+            )
+        end,
+        shared_env_budgets()
+    ).
+
+% Every other ask is cancelled, newest first, so the envs lose their offers
+% in an order other than the one they got them in
+offers_survive_leaving_out_of_order(_Config) ->
+    lists:foreach(
+        fun(Budget) ->
+            Broker = cbroker:new([{shared_env_budget, Budget}]),
+            Parked = [{Offer, park_offer(Broker, Offer)} || Offer <- offers() ++ offers()],
+            {Kept, Cancelled} = alternate(Parked),
+
+            lists:foreach(
+                fun({_, Ticket}) -> ?assertMatch({cancelled, _}, cbroker:cancel(Ticket)) end,
+                lists:reverse(Cancelled)
+            ),
+            lists:foreach(
+                fun({Offer, Ticket}) ->
+                    ?assertMatch({match, _, Offer, _}, cbroker:nb_ask(Broker, right, x)),
+                    ?assertMatch({match, _, x, _}, await(Ticket))
+                end,
+                Kept
+            )
+        end,
+        shared_env_budgets()
+    ).
+
+% An env is cleared once its last offer leaves, and then written to again. What
+% it held before must not show through, whether it emptied or kept an offer
+offers_survive_their_env_being_reused(_Config) ->
+    Broker = cbroker:new(),
+    [A, B, C, D | _] = Offers = lists:reverse(offers()),
+
+    lists:foreach(
+        fun(Offer) ->
+            Ticket = park_offer(Broker, Offer),
+            ?assertMatch({match, _, Offer, _}, cbroker:nb_ask(Broker, right, x)),
+            ?assertMatch({match, _, x, _}, await(Ticket))
+        end,
+        Offers ++ Offers
+    ),
+
+    TicketA = park_offer(Broker, A),
+    TicketB = park_offer(Broker, B),
+    ?assertMatch({match, _, A, _}, cbroker:nb_ask(Broker, right, x)),
+    TicketC = park_offer(Broker, C),
+    ?assertMatch({match, _, B, _}, cbroker:nb_ask(Broker, right, x)),
+    ?assertMatch({match, _, C, _}, cbroker:nb_ask(Broker, right, x)),
+    TicketD = park_offer(Broker, D),
+    ?assertMatch({match, _, D, _}, cbroker:nb_ask(Broker, right, x)),
+
+    lists:foreach(
+        fun(Ticket) -> ?assertMatch({match, _, x, _}, await(Ticket)) end,
+        [TicketA, TicketB, TicketC, TicketD]
+    ).
 
 %%
 
@@ -1048,6 +1141,20 @@ await(Ticket) ->
     after 5_000 ->
         ct:fail({no_reply_for, Ticket})
     end.
+
+shared_env_budgets() ->
+    [1, 64, 1_024, 16_384].
+
+park_offer(Broker, Offer) ->
+    {await, Ticket} = cbroker:async_ask(Broker, left, Offer),
+    Ticket.
+
+% Splits a list into its odd-positioned and its even-positioned elements
+alternate([Odd, Even | Rest]) ->
+    {Odds, Evens} = alternate(Rest),
+    {[Odd | Odds], [Even | Evens]};
+alternate(Rest) ->
+    {Rest, []}.
 
 % Offers of assorted shapes and sizes: immediates, heap binaries, refc
 % binaries, and terms large enough to matter to the offer-size accounting

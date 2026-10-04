@@ -52,6 +52,8 @@
 #define TICKET_POOL_DEFAULT_SIZE 8
 #define TICKET_POOL_DEFAULT_INITIAL_COUNT 0
 
+#define SHENV_POOL_MAX_COUNT 16
+
 // in bytes
 #define SHARED_ENV_DEFAULT_BUDGET (16 * 1024)
 
@@ -1164,7 +1166,15 @@ static ERL_NIF_TERM nif_close(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[
         return make_badarg(env, broker_term);
     }
 
-    // TODO consume slices / yield?
+    /* TODO yield?
+     *
+     * Perhaps not feasible:
+     * * if we use enif_schedule_nif(), the caller may be killed in-between scheduled calls;
+     * * if we use a dirty scheduler, the caller may also be killed while the call is ongoing.
+     *
+     * In either case, we'd stop being able to send messages to the dequeued processes;
+     * namely, to notify they've been dropped.
+     */
     broker_close(env, broker, false);
 
     return Atoms._ok;
@@ -2846,18 +2856,27 @@ static shenv_t* shenv_pool_get(shenv_pool_t* pool, size_t* out_idx)
 {
     assert(pool->count <= pool->size);
     size_t idx = 0;
+    ref_count_t request_count = 0;
 
     for (; idx < pool->count; idx++) {
         shenv_t* shenv = pool->array[idx];
         assert(shenv != NULL);
 
-        ref_count_t request_count =
+        request_count = atomic_load(&shenv->request_count);
+        assert(request_count >= 0);
+
+        if (request_count == 0 && !atomic_load(&shenv->env_cleared)) {
+            // Another thread is still clearing the env (read-only variant)
+            continue;
+        }
+
+        request_count =
             1 + atomic_fetch_add_explicit(&shenv->request_count, 1, memory_order_relaxed);
         assert(request_count >= 0);
 
         if (request_count == 1) {
             if (!atomic_load(&shenv->env_cleared)) {
-                // Another thread is still clearing the env
+                // Another thread is still clearing the env (revert increment variant)
                 request_count =
                     (atomic_fetch_sub_explicit(&shenv->request_count, 1, memory_order_acq_rel) - 1);
                 assert(request_count == 0);
@@ -2881,8 +2900,7 @@ static void shenv_pool_add(shenv_pool_t* pool, shenv_t* shenv)
 {
     assert(pool->count <= pool->size);
 
-    if (pool->count >= 16 && atomic_load(&shenv->ditched_by_writer)) {
-        // FIXME
+    if (pool->count >= SHENV_POOL_MAX_COUNT && atomic_load(&shenv->ditched_by_writer)) {
         shenv_destroy(&shenv);
         return;
     }
@@ -2966,7 +2984,6 @@ static void shenv_pool_write(shenv_pool_t* shenv_pool, request_t* request, ask_c
 
 static void shenv_pool_destroy(shenv_pool_t* pool)
 {
-    LOG_UNCOND("shenv pool count: %llu", pool->count);
     assert(pool->count <= pool->size);
 
     for (size_t idx = 0; idx < pool->count; idx++) {
@@ -3067,34 +3084,38 @@ static void shenv_reclaim(shenv_t** shenv_ptr, local_state_t* opt_local_state,
     shenv_t* shenv = *shenv_ptr;
     assert(shenv != NULL);
 
-    //
-
     ref_count_t request_count =
         (atomic_fetch_sub_explicit(&shenv->request_count, 1, memory_order_acq_rel) - 1);
     assert(request_count >= 0);
 
-    if (request_count == 0) {
-        if (atomic_load(&shenv->ditched_by_writer)) {
-            // TODO clean this up
-            if (opt_local_state != NULL) {
-                enif_clear_env(shenv->env);
-                shenv->bytes_left = (budget_counter_t)broker_opts->shared_env_budget;
-                shenv_pool_add(&opt_local_state->shenv_pool, shenv);
-                *shenv_ptr = NULL;
-            }
-            else {
-                shenv_destroy(shenv_ptr);
-            }
-            return;
-        }
+    //
 
-        enif_clear_env(shenv->env);
-
-        shenv->bytes_left = (budget_counter_t)broker_opts->shared_env_budget;
-        atomic_store(&shenv->env_cleared, true);
+    if (request_count > 0) {
+        *shenv_ptr = NULL;
+        return;
     }
 
-    *shenv_ptr = NULL;
+    const bool ditched_by_writer = atomic_load(&shenv->ditched_by_writer);
+    const bool clean_env = (!ditched_by_writer || (opt_local_state != NULL));
+
+    if (clean_env) {
+        enif_clear_env(shenv->env);
+        shenv->bytes_left = (budget_counter_t)broker_opts->shared_env_budget;
+
+        if (ditched_by_writer && opt_local_state != NULL) {
+            shenv_pool_add(&opt_local_state->shenv_pool, shenv);
+        }
+        else if (!ditched_by_writer) {
+            atomic_store(&shenv->env_cleared, true);
+        }
+        *shenv_ptr = NULL;
+    }
+    else if (ditched_by_writer) {
+        shenv_destroy(shenv_ptr);
+    }
+    else {
+        *shenv_ptr = NULL;
+    }
 }
 
 static void shenv_destroy(shenv_t** shenv_ptr)

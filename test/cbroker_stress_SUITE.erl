@@ -59,6 +59,7 @@
     lagging_lane_skips_batch_it_dropped/1,
     queue_limit_keeps_its_accounting/1,
     closing_never_loses_a_reply/1,
+    shared_envs_never_mix_up_offers/1,
     brokers_leave_nothing_allocated/1
 ]).
 
@@ -93,6 +94,7 @@ groups() ->
                 lagging_lane_skips_batch_it_dropped,
                 queue_limit_keeps_its_accounting,
                 closing_never_loses_a_reply,
+                shared_envs_never_mix_up_offers,
                 brokers_leave_nothing_allocated
             ]
         }
@@ -298,6 +300,34 @@ assert_closing_never_loses_a_reply() ->
     ?assertEqual([], pending_cells(Broker)),
     ?assertEqual(0, queue_balance(Broker)).
 
+% Offers of varying sizes go through envs that are being written to by one
+% scheduler while others read from them, and that get cleared as soon as their
+% last offer leaves. A one byte budget retires every env after one offer, a
+% small one has them roll over all the time, and the default has them cleared
+% and written to again. Each offer carries a payload derived from its own key,
+% so one that got mixed up with another, or cleared too soon, shows
+shared_envs_never_mix_up_offers(_Config) ->
+    lists:foreach(fun assert_shared_envs_never_mix_up_offers/1, [1, 256, 16_384]).
+
+assert_shared_envs_never_mix_up_offers(Budget) ->
+    Broker = cbroker:new([{shared_env_budget, Budget}]),
+
+    Samples = run_workers(Broker, fun(Lane, {_, _, N} = Key) ->
+        case cbroker:ask(Broker, Lane, {Key, payload(N)}, ?ASK_TIMEOUT_MS) of
+            {match, MatchRef, {{_, _, CounterN} = CounterKey, CounterPayload}, SojournTime} ->
+                ?assertEqual(payload(CounterN), CounterPayload),
+                {match, MatchRef, CounterKey, SojournTime};
+            %
+            Reply ->
+                Reply
+        end
+    end),
+
+    ?assertEqual([], [Sample || {_, _, Reply} = Sample <- Samples, not is_match(Reply)]),
+    assert_matches_are_paired(Samples),
+    ?assertEqual([], pending_cells(Broker)),
+    ?assertEqual(0, queue_balance(Broker)).
+
 % Brokers that have been worked hard enough to roll over batches must leave
 % nothing behind once collected. This is what the cell and pool assertions
 % cannot see: memory that is consistent, just unreachable
@@ -320,7 +350,11 @@ assert_nothing_stays_allocated(Baseline) ->
             end
         end,
         lists:append([
-            [fun churn_through_batches/0, fun close_over_parked_batches/0]
+            [
+                fun churn_through_batches/0,
+                fun close_over_parked_batches/0,
+                fun offer_brokers_to_themselves/0
+            ]
          || _ <- seq(3)
         ])
     ),
@@ -371,6 +405,38 @@ close_over_parked_batches() ->
         end,
         Tickets
     ).
+
+% An offer holding its own broker makes the env it is copied into keep that
+% broker alive, so every way for a request to leave must let go of the copy.
+% The last two are still parked when this process dies: one is reclaimed for
+% its asker dying, the other for its broker's creator doing so
+offer_brokers_to_themselves() ->
+    Matched = cbroker:new(),
+    {await, MatchedTicket} = cbroker:async_ask(Matched, left, {offered, Matched}),
+    {match, _, {offered, Matched}, _} = cbroker:nb_ask(Matched, right, {offered, Matched}),
+    receive
+        {MatchedTicket, {match, _, {offered, Matched}, _}} -> ok
+    after ?ASK_TIMEOUT_MS -> exit(no_reply)
+    end,
+
+    Cancelled = cbroker:new(),
+    {await, CancelledTicket} = cbroker:async_ask(Cancelled, left, {offered, Cancelled}),
+    {cancelled, _} = cbroker:cancel(CancelledTicket),
+
+    Closed = cbroker:new(),
+    {await, ClosedTicket} = cbroker:async_ask(Closed, left, {offered, Closed}),
+    ok = cbroker:close(Closed),
+    receive
+        {ClosedTicket, {drop, closed, _}} -> ok
+    after ?ASK_TIMEOUT_MS -> exit(no_reply)
+    end,
+
+    Abandoned = cbroker:new(),
+    {await, _} = cbroker:async_ask(Abandoned, left, {offered, Abandoned}),
+
+    Dependent = cbroker:new([depends_on_creator]),
+    {await, _} = cbroker:async_ask(Dependent, left, {offered, Dependent}),
+    ok.
 
 alloc_perfcounters() ->
     cbroker_nif:alloc_perfcounters().
@@ -486,6 +552,10 @@ park_forever(Broker, Lane, Offer) ->
     end.
 
 %%
+
+% Anything from nothing at all to a few hundred bytes, depending on N alone
+payload(N) ->
+    lists:duplicate(N rem 40, N).
 
 is_match({match, _, _, _}) -> true;
 is_match(_Reply) -> false.
