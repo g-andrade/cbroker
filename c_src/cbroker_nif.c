@@ -347,22 +347,6 @@ typedef struct {
 
 //
 
-typedef enum {
-    SHUTDOWN_PHASE_NONE = 0,
-    SHUTDOWN_PHASE_REGULAR = 1,
-    SHUTDOWN_PHASE_BACKUP = 2
-} shutdown_phase_t;
-
-//
-
-typedef enum {
-    SHUTDOWN_CONTINUE = 0,
-    SHUTDOWN_PAUSE_NEXT_PHASE = 1,
-    SHUTDOWN_PAUSE_YIELD = 2
-} shutdown_pause_t;
-
-//
-
 typedef struct {
     ErlNifPid caller_pid;
     ErlNifMonitor caller_mon;
@@ -371,7 +355,7 @@ typedef struct {
     size_t batch_idx;
     offset_t cell_offset;
     //
-    shutdown_phase_t phase;
+    bool can_yield;
     size_t yield_copied_bytes;
     size_t yield_walked_cells;
 } shutdown_t;
@@ -580,10 +564,9 @@ static ERL_NIF_TERM shutdown_continue(ErlNifEnv* env, shutdown_t* shutdown);
 static void shutdown_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon);
 static void shutdown_dtor(ErlNifEnv* caller_env, void* obj);
 
-static shutdown_pause_t shutdown_batch(ErlNifEnv* env, shutdown_t* shutdown, batch_t* batch);
-static shutdown_pause_t shutdown_cell(ErlNifEnv* env, shutdown_t* shutdown, cell_t* cell);
-static shutdown_pause_t shutdown_cell_notify(ErlNifEnv* env, shutdown_t* shutdown,
-                                             request_t* request);
+static bool shutdown_batch(ErlNifEnv* env, shutdown_t* shutdown, batch_t* batch);
+static bool shutdown_cell(ErlNifEnv* env, shutdown_t* shutdown, cell_t* cell);
+static void shutdown_cell_notify(ErlNifEnv* env, shutdown_t* shutdown, request_t* request);
 
 //
 
@@ -2446,7 +2429,7 @@ static ERL_NIF_TERM shutdown_start(ErlNifEnv* env, broker_t* broker, ErlNifPid s
 
     shutdown->batch_idx = 0;
     shutdown->cell_offset = 0;
-    shutdown->phase = (is_caller_a_down_cb ? SHUTDOWN_PHASE_BACKUP : SHUTDOWN_PHASE_REGULAR);
+    shutdown->can_yield = !is_caller_a_down_cb;
 
     if (!is_caller_a_down_cb) {
         // Keep an extra reference to ensure that the monitor will be triggered
@@ -2467,12 +2450,12 @@ static ERL_NIF_TERM shutdown_continue(ErlNifEnv* env, shutdown_t* shutdown)
     const size_t nr_of_batches = cbroker_omap_size(global_state->batches);
     batch_t** batches = (batch_t**)cbroker_omap_values(global_state->batches);
 
-    shutdown_pause_t pause = SHUTDOWN_CONTINUE;
     const bool was_initial_caller_a_down_cb = enif_is_pid_undefined(&shutdown->caller_pid);
+    bool should_yield = false;
 
-    while (shutdown->batch_idx < nr_of_batches && pause == SHUTDOWN_CONTINUE) {
+    while (shutdown->batch_idx < nr_of_batches && !should_yield) {
         batch_t* batch = batches[shutdown->batch_idx];
-        pause = shutdown_batch(env, shutdown, batch);
+        should_yield = shutdown_batch(env, shutdown, batch);
     }
 
     //
@@ -2494,18 +2477,12 @@ static ERL_NIF_TERM shutdown_continue(ErlNifEnv* env, shutdown_t* shutdown)
 
         return Atoms._ok;
     }
-    else if (pause == SHUTDOWN_PAUSE_YIELD) {
+    else {
+        assert(should_yield);
         assert(shutdown->batch_idx < nr_of_batches);
-        assert(shutdown->phase == SHUTDOWN_PHASE_REGULAR);
+        assert(shutdown->can_yield);
         ERL_NIF_TERM shutdown_term = enif_make_resource(env, shutdown);
         return enif_schedule_nif(env, "nif_close", 0, nif_close, 1, &shutdown_term);
-    }
-    else {
-        assert(pause == SHUTDOWN_PAUSE_NEXT_PHASE);
-        // we'll resume execution after the monitor triggers
-        assert(shutdown->batch_idx < nr_of_batches);
-        assert(shutdown->phase == SHUTDOWN_PHASE_REGULAR);
-        return Atoms._ok;
     }
 }
 
@@ -2515,8 +2492,8 @@ static void shutdown_down(ErlNifEnv* caller_env, void* obj, ErlNifPid* pid, ErlN
 {
     shutdown_t* shutdown = (shutdown_t*)obj;
 
-    assert(shutdown->phase == SHUTDOWN_PHASE_REGULAR);
-    shutdown->phase = SHUTDOWN_PHASE_BACKUP;
+    assert(shutdown->can_yield);
+    shutdown->can_yield = false;
 
     ERL_NIF_TERM res = shutdown_continue(caller_env, shutdown);
     assert(res == Atoms._ok);
@@ -2533,16 +2510,16 @@ static void shutdown_dtor(ErlNifEnv* caller_env, void* obj)
     assert(shutdown->broker == NULL);
     assert(shutdown->batch_idx == 0);
     assert(shutdown->cell_offset == 0);
-    assert(shutdown->phase == SHUTDOWN_PHASE_NONE);
+    assert(shutdown->can_yield == false);
     assert(shutdown->yield_copied_bytes == 0);
 }
 
 //
 
-static shutdown_pause_t shutdown_batch(ErlNifEnv* env, shutdown_t* shutdown, batch_t* batch)
+static bool shutdown_batch(ErlNifEnv* env, shutdown_t* shutdown, batch_t* batch)
 {
     const size_t nr_of_cells = batch->nr_of_cells;
-    shutdown_pause_t pause = SHUTDOWN_CONTINUE;
+    bool should_yield = false;
 
     if (shutdown->cell_offset == 0) {
         size_t consumed_count = atomic_load(&batch->consumed_count);
@@ -2560,9 +2537,9 @@ static shutdown_pause_t shutdown_batch(ErlNifEnv* env, shutdown_t* shutdown, bat
         goto shutdown_batch_done;
     }
 
-    while (shutdown->cell_offset < nr_of_cells && pause == SHUTDOWN_CONTINUE) {
+    while (shutdown->cell_offset < nr_of_cells && !should_yield) {
         cell_t* cell = &batch->cells[shutdown->cell_offset];
-        pause = shutdown_cell(env, shutdown, cell);
+        should_yield = shutdown_cell(env, shutdown, cell);
         shutdown->cell_offset++;
     }
 
@@ -2572,16 +2549,15 @@ static shutdown_pause_t shutdown_batch(ErlNifEnv* env, shutdown_t* shutdown, bat
         shutdown->cell_offset = 0;
     }
 
-    return pause;
+    return should_yield;
 }
 
 //
 
-static shutdown_pause_t shutdown_cell(ErlNifEnv* env, shutdown_t* shutdown, cell_t* cell)
+static bool shutdown_cell(ErlNifEnv* env, shutdown_t* shutdown, cell_t* cell)
 {
     request_t* request = atomic_load(cell);
     bool did_cancel = false;
-    shutdown_pause_t pause = SHUTDOWN_CONTINUE;
 
     while (request != &sentinel_request_cancelled && request != &sentinel_request_matched) {
         if (atomic_compare_exchange_strong(cell, &request, &sentinel_request_cancelled)) {
@@ -2597,7 +2573,7 @@ static shutdown_pause_t shutdown_cell(ErlNifEnv* env, shutdown_t* shutdown, cell
         assert(ticket != NULL);
 
         if (enif_demonitor_process(env, ticket, &ticket->mon) == 0) {
-            pause = shutdown_cell_notify(env, shutdown, request);
+            shutdown_cell_notify(env, shutdown, request);
             ticket->request = NULL;
 
             shenv_reclaim(&request->shenv, NULL, &shutdown->broker->opts);
@@ -2610,7 +2586,7 @@ static shutdown_pause_t shutdown_cell(ErlNifEnv* env, shutdown_t* shutdown, cell
 
     //
 
-    if (shutdown->phase == SHUTDOWN_PHASE_REGULAR && pause == SHUTDOWN_CONTINUE) {
+    if (shutdown->can_yield) {
         const size_t walked_cells = shutdown->yield_walked_cells++;
 
         if (walked_cells >= SHUTDOWN_YIELD_CHECK_WALKED_CELLS) {
@@ -2620,35 +2596,25 @@ static shutdown_pause_t shutdown_cell(ErlNifEnv* env, shutdown_t* shutdown, cell
             if (should_yield) {
                 shutdown->yield_copied_bytes = 0;
                 shutdown->yield_walked_cells = 0;
-                pause = SHUTDOWN_PAUSE_YIELD;
+                return true;
             }
         }
     }
 
-    return pause;
+    return false;
 }
 
 //
 
-static shutdown_pause_t shutdown_cell_notify(ErlNifEnv* env, shutdown_t* shutdown,
-                                             request_t* request)
+static void shutdown_cell_notify(ErlNifEnv* env, shutdown_t* shutdown, request_t* request)
 {
     ERL_NIF_TERM msg = make_reply_drop(env, request, DROP_REASON_CLOSED);
 
-    if (shutdown->phase == SHUTDOWN_PHASE_REGULAR) {
-        if (!enif_send(env, &request->pid, NULL, msg) && (!enif_is_current_process_alive(env))) {
-            // backup notification using NULL env
-            either_notify_or_assert_not_alive(NULL, &request->pid, NULL, msg);
-            return SHUTDOWN_PAUSE_NEXT_PHASE;
-        }
+    either_notify_or_assert_not_alive(env, &request->pid, NULL, msg);
 
+    if (shutdown->can_yield) {
         shutdown->yield_copied_bytes += term_size(env, msg);
     }
-    else {
-        assert(shutdown->phase == SHUTDOWN_PHASE_BACKUP);
-        either_notify_or_assert_not_alive(env, &request->pid, NULL, msg);
-    }
-    return SHUTDOWN_CONTINUE;
 }
 
 /*********************************************************************/
